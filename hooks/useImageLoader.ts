@@ -5,9 +5,12 @@ import { cacheManager, IncrementalCacheWriter } from '../services/cacheManager';
 import { thumbnailManager } from '../services/thumbnailManager';
 import { IndexedImage, Directory } from '../types';
 import { useSettingsStore } from '../store/useSettingsStore';
-import { createCacheDebugSnapshot, traceCacheDebug } from '../utils/cacheDebugTrace';
+import { createCacheDebugSnapshot, isCacheDebugEnabled, traceCacheDebug } from '../utils/cacheDebugTrace';
 import { areFilesystemPathsEqual } from '../utils/filesystemPath';
 import { waitForDirectoryActivityToSettle } from '../utils/directoryActivity';
+import { inferMimeTypeFromName, isImageFileName } from '../utils/mediaTypes.js';
+import { normalizeBirthtimeMs } from '../utils/fileTimestamps.js';
+import { buildProvenanceIdentityLookupKey } from '../utils/provenancePath.mjs';
 
 // Configure logging level
 const DEBUG = false;
@@ -64,6 +67,8 @@ type DirectoryFileRecord = {
     contentModifiedMs?: number;
 };
 
+type ProvenanceIdentity = Pick<IndexedImage, 'assetId' | 'revisionId' | 'provenanceLocationId' | 'provenanceRootId'>;
+
 const electronHandleGetFile = async function (this: { name: string; _filePath?: string }) {
     const electronAPI = window.electronAPI;
     if (!getIsElectron() || !electronAPI || !this._filePath) {
@@ -73,11 +78,7 @@ const electronHandleGetFile = async function (this: { name: string; _filePath?: 
     const fileResult = await electronAPI.readFile(this._filePath);
     if (fileResult.success && fileResult.data) {
         const freshData = new Uint8Array(fileResult.data);
-        const type = this.name.toLowerCase().endsWith('.png')
-            ? 'image/png'
-            : this.name.toLowerCase().endsWith('.webp')
-                ? 'image/webp'
-                : 'image/jpeg';
+        const type = inferMimeTypeFromName(this.name, 'application/octet-stream');
         return new File([freshData as any], this.name, { type });
     }
 
@@ -110,9 +111,9 @@ async function getFilesRecursivelyWeb(directoryHandle: FileSystemDirectoryHandle
     for await (const entry of (directoryHandle as any).values()) {
         const entryPath = path ? `${path}/${entry.name}` : entry.name;
         if (entry.kind === 'file') {
-            if (entry.name.endsWith('.png') || entry.name.endsWith('.jpg') || entry.name.endsWith('.jpeg')) {
+            if (isImageFileName(entry.name)) {
                 const file = await entry.getFile();
-                files.push({ name: entryPath, lastModified: file.lastModified, size: file.size, type: file.type || 'image', birthtimeMs: file.lastModified, contentModifiedMs: file.lastModified });
+                files.push({ name: entryPath, lastModified: file.lastModified, size: file.size, type: file.type || inferMimeTypeFromName(entry.name), birthtimeMs: file.lastModified, contentModifiedMs: file.lastModified });
             }
         } else if (entry.kind === 'directory') {
             try {
@@ -126,9 +127,14 @@ async function getFilesRecursivelyWeb(directoryHandle: FileSystemDirectoryHandle
     return files;
 }
 
-async function getDirectoryFiles(directoryHandle: FileSystemDirectoryHandle, directoryPath: string, recursive: boolean): Promise<DirectoryFileRecord[]> {
+async function getDirectoryFiles(
+    directoryHandle: FileSystemDirectoryHandle,
+    directoryPath: string,
+    recursive: boolean,
+    provenanceRootPath: string = directoryPath,
+): Promise<DirectoryFileRecord[]> {
     if (getIsElectron()) {
-        const result = await (window as any).electronAPI.listDirectoryFiles({ dirPath: directoryPath, recursive });
+        const result = await (window as any).electronAPI.listDirectoryFiles({ dirPath: directoryPath, recursive, provenanceRootPath });
         if (result.success && result.files) {
             return result.files;
         }
@@ -139,9 +145,9 @@ async function getDirectoryFiles(directoryHandle: FileSystemDirectoryHandle, dir
         } else {
             const files = [];
             for await (const entry of (directoryHandle as any).values()) {
-                if (entry.kind === 'file' && (entry.name.endsWith('.png') || entry.name.endsWith('.jpg') || entry.name.endsWith('.jpeg'))) {
+                if (entry.kind === 'file' && isImageFileName(entry.name)) {
                     const file = await entry.getFile();
-                    files.push({ name: file.name, lastModified: file.lastModified, size: file.size, type: file.type || 'image', birthtimeMs: file.lastModified, contentModifiedMs: file.lastModified });
+                    files.push({ name: file.name, lastModified: file.lastModified, size: file.size, type: file.type || inferMimeTypeFromName(file.name), birthtimeMs: file.lastModified, contentModifiedMs: file.lastModified });
                 }
             }
             return files;
@@ -263,7 +269,7 @@ export function useImageLoader() {
     const {
         addDirectory, setLoading, setProgress, setError, setSuccess,
         removeImages, addImages, appendImagesRaw, mergeImages, clearImages, replaceDirectoryImagesRaw, setIndexingState, setEnrichmentProgress, setDirectoryRefreshing, setDirectoryProgress,
-        recomputeDerivedState,
+        recomputeDerivedState, hydrateAnnotationsForImages,
         setLineageDirectorySignature, setLineageRebuildSuspended, hydratePersistedLineageSnapshot, scheduleLineageRebuild
     } = useImageStore();
 
@@ -278,6 +284,54 @@ export function useImageLoader() {
     const idleReconcileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const idleReconcileQueueRef = useRef<Directory[]>([]);
     const idleReconcileRunningRef = useRef(false);
+    const provenanceIdentityByLookupKeyRef = useRef(new Map<string, ProvenanceIdentity>());
+    const provenanceIdentityVersionByLookupKeyRef = useRef(new Map<string, number>());
+
+    const provenanceIdentityForPath = useCallback((directoryId: string, relativePath: string) =>
+        provenanceIdentityByLookupKeyRef.current.get(buildProvenanceIdentityLookupKey(directoryId, relativePath)), []);
+
+    useEffect(() => {
+        if (!window.electronAPI?.onProvenanceIdentitiesAssigned) return;
+        return window.electronAPI.onProvenanceIdentitiesAssigned((payload) => {
+            const directory = useImageStore.getState().directories.find((candidate) =>
+                areFilesystemPathsEqual(candidate.path, payload.rootPath)
+            );
+            if (!directory) return;
+
+            const updatedByPathKey = new Map<string, ProvenanceIdentity>();
+            for (const mapping of payload.mappings) {
+                const lookupKey = buildProvenanceIdentityLookupKey(directory.id, mapping.relativePath);
+                const observationVersion = Number(mapping.observationVersion ?? 0);
+                const currentVersion = provenanceIdentityVersionByLookupKeyRef.current.get(lookupKey) ?? -1;
+                if (observationVersion < currentVersion) continue;
+                const identity = {
+                    assetId: mapping.assetId,
+                    revisionId: mapping.revisionId,
+                    provenanceLocationId: mapping.locationId,
+                    provenanceRootId: payload.rootId,
+                };
+                provenanceIdentityByLookupKeyRef.current.set(lookupKey, identity);
+                provenanceIdentityVersionByLookupKeyRef.current.set(lookupKey, observationVersion);
+                updatedByPathKey.set(lookupKey, identity);
+            }
+
+            const updates = useImageStore.getState().images.flatMap((image) => {
+                if (image.directoryId !== directory.id) return [];
+                const idPrefix = `${directory.id}::`;
+                const originalRelativePath = image.id.startsWith(idPrefix)
+                    ? image.id.slice(idPrefix.length)
+                    : image.name;
+                const identity = updatedByPathKey.get(
+                    buildProvenanceIdentityLookupKey(directory.id, originalRelativePath)
+                );
+                return identity ? [{ ...image, ...identity }] : [];
+            });
+            if (updates.length > 0) {
+                mergeImages(updates);
+                void hydrateAnnotationsForImages(updates);
+            }
+        });
+    }, [hydrateAnnotationsForImages, mergeImages]);
 
     // Helper function to check if indexing should be cancelled
     const shouldCancelIndexing = useCallback((allowIdle = false) => {
@@ -570,7 +624,7 @@ export function useImageLoader() {
         await cacheManager.init();
 
         const listStart = performance.now();
-        const allCurrentFiles = await getDirectoryFiles(activeDirectory.handle, activeDirectory.path, shouldScanSubfolders);
+        const allCurrentFiles = await getDirectoryFiles(activeDirectory.handle, activeDirectory.path, shouldScanSubfolders, activeDirectory.path);
         logIndexingPerf('startup-reconcile:list-files', {
             directoryId: activeDirectory.id,
             directoryName: activeDirectory.name,
@@ -584,7 +638,7 @@ export function useImageLoader() {
             allCurrentFiles.map(file => [file.name, {
                 size: file.size,
                 type: file.type,
-                birthtimeMs: file.birthtimeMs ?? file.lastModified,
+                birthtimeMs: normalizeBirthtimeMs(file.birthtimeMs ?? file.lastModified),
                 contentModifiedMs: file.contentModifiedMs ?? file.lastModified,
             }])
         );
@@ -657,7 +711,7 @@ export function useImageLoader() {
                             ...file,
                             size: fileStatsMap.get(file.name)?.size ?? file.size,
                             type: fileStatsMap.get(file.name)?.type ?? file.type,
-                            birthtimeMs: fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified,
+                            birthtimeMs: normalizeBirthtimeMs(fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified),
                             contentModifiedMs: fileStatsMap.get(file.name)?.contentModifiedMs ?? file.contentModifiedMs ?? file.lastModified,
                         }))
                     : [];
@@ -705,6 +759,7 @@ export function useImageLoader() {
                             mergeImages(batch);
                         },
                         hydratePreloadedImages: false,
+                        provenanceIdentityForPath: (relativePath) => provenanceIdentityForPath(activeDirectory.id, relativePath),
                     }
                 );
 
@@ -771,7 +826,7 @@ export function useImageLoader() {
                         ...file,
                         size: fileStatsMap.get(file.name)?.size ?? file.size,
                         type: fileStatsMap.get(file.name)?.type ?? file.type,
-                        birthtimeMs: fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified,
+                        birthtimeMs: normalizeBirthtimeMs(fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified),
                         contentModifiedMs: fileStatsMap.get(file.name)?.contentModifiedMs ?? file.contentModifiedMs ?? file.lastModified,
                     }))
                 : [];
@@ -826,6 +881,7 @@ export function useImageLoader() {
                         mergeImages(batch);
                     },
                     hydratePreloadedImages: false,
+                    provenanceIdentityForPath: (relativePath) => provenanceIdentityForPath(activeDirectory.id, relativePath),
                 }
             );
 
@@ -851,7 +907,7 @@ export function useImageLoader() {
             setEnrichmentProgress(null);
             setProgress(null);
         }
-    }, [addImages, mergeImages, refreshLineageDirectorySignature, removeImages, scheduleLineageRebuild, setDirectoryRefreshing, setEnrichmentProgress, setProgress, waitWhilePaused]);
+    }, [addImages, mergeImages, provenanceIdentityForPath, refreshLineageDirectorySignature, removeImages, scheduleLineageRebuild, setDirectoryRefreshing, setEnrichmentProgress, setProgress, waitWhilePaused]);
 
     const runIdleReconcileQueue = useCallback(async () => {
         if (idleReconcileRunningRef.current) {
@@ -1128,7 +1184,7 @@ export function useImageLoader() {
             
             // Get files from disk (either full directory or specific subfolder)
             const listStart = performance.now();
-            let allCurrentFiles = await getDirectoryFiles(directory.handle, scanPath, shouldScanSubfolders);
+            let allCurrentFiles = await getDirectoryFiles(directory.handle, scanPath, shouldScanSubfolders, directory.path);
             logIndexingPerf('load-directory:list-files', {
                 directoryId: directory.id,
                 directoryName: directory.name,
@@ -1155,7 +1211,7 @@ export function useImageLoader() {
                 allCurrentFiles.map(file => [file.name, {
                     size: file.size,
                     type: file.type,
-                    birthtimeMs: file.birthtimeMs ?? file.lastModified,
+                    birthtimeMs: normalizeBirthtimeMs(file.birthtimeMs ?? file.lastModified),
                     contentModifiedMs: file.contentModifiedMs ?? file.lastModified,
                 }])
             );
@@ -1276,7 +1332,7 @@ export function useImageLoader() {
                 ...file,
                 size: fileStatsMap.get(file.name)?.size ?? file.size,
                 type: fileStatsMap.get(file.name)?.type ?? file.type,
-                birthtimeMs: fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified,
+                birthtimeMs: normalizeBirthtimeMs(fileStatsMap.get(file.name)?.birthtimeMs ?? file.birthtimeMs ?? file.lastModified),
                 contentModifiedMs: fileStatsMap.get(file.name)?.contentModifiedMs ?? file.contentModifiedMs ?? file.lastModified,
             }));
 
@@ -1411,6 +1467,7 @@ export function useImageLoader() {
                         onEnrichmentBatch: handleEnrichmentBatch,
                         onEnrichmentProgress: handleEnrichmentProgress,
                         hydratePreloadedImages: shouldHydratePreloadedImages,
+                        provenanceIdentityForPath: (relativePath) => provenanceIdentityForPath(directory.id, relativePath),
                     }
                 );
                 logIndexingPerf('load-directory:phase-a-returned', {
@@ -1529,7 +1586,7 @@ export function useImageLoader() {
                 setProgress(null);
             }
         }
-    }, [addImages, mergeImages, removeImages, clearImages, setLoading, setProgress, setError, setSuccess, setDirectoryRefreshing, finalizeDirectoryLoad, scheduleDirectoryThumbnailWarmup, setDirectoryProgress]);
+    }, [addImages, mergeImages, provenanceIdentityForPath, removeImages, clearImages, setLoading, setProgress, setError, setSuccess, setDirectoryRefreshing, finalizeDirectoryLoad, scheduleDirectoryThumbnailWarmup, setDirectoryProgress]);
 
 
     // Helper function to detect if a path is a root disk
@@ -1831,7 +1888,7 @@ export function useImageLoader() {
                 contentModifiedMs: file.contentModifiedMs ?? file.lastModified,
                 size: file.size,
                 type: file.normalizedType,
-                birthtimeMs: file.lastModified
+                birthtimeMs: normalizeBirthtimeMs(file.lastModified)
             }));
 
             // Criar file stats map
@@ -1839,7 +1896,7 @@ export function useImageLoader() {
                 newFiles.map(f => [f.relativePath || f.normalizedName, {
                     size: f.size,
                     type: f.normalizedType,
-                    birthtimeMs: f.lastModified,
+                    birthtimeMs: normalizeBirthtimeMs(f.lastModified),
                     contentModifiedMs: f.contentModifiedMs ?? f.lastModified,
                 }])
             );
@@ -1849,7 +1906,9 @@ export function useImageLoader() {
 
             // Callback para processar batches de imagens
             const handleBatchProcessed = (batch: IndexedImage[]) => {
-                console.log('[auto-watch] Phase A processed', batch.length, 'images (not adding yet, waiting for Phase B)');
+                if (isCacheDebugEnabled()) {
+                    console.log('[auto-watch] Phase A processed', batch.length, 'images (not adding yet, waiting for Phase B)');
+                }
             };
 
             // Processar novos arquivos usando o pipeline existente
@@ -1868,11 +1927,16 @@ export function useImageLoader() {
                     fileStats: fileStatsMap,
                     onEnrichmentBatch: (enrichedBatch) => {
                         // Phase B: Enriquecimento completo - adicionar as imagens agora
-                        console.log('[auto-watch] Phase B enriched', enrichedBatch.length, 'images - adding to store');
+                        if (isCacheDebugEnabled()) {
+                            console.log('[auto-watch] Phase B enriched', enrichedBatch.length, 'images - adding to store');
+                        }
                         const refreshedBatch = enrichedBatch.filter(image => forceReindexExistingIds.has(image.id));
                         const newBatch = enrichedBatch.filter(image => !forceReindexExistingIds.has(image.id));
                         const addStart = performance.now();
                         if (newBatch.length > 0) {
+                            // addImages coalesces into a single _updateState via its own
+                            // ~100ms flush timer — no need to force an immediate flush here,
+                            // which used to pay a full _updateState per enrichment batch.
                             addImages(newBatch);
                             enrichedForCache.push(...newBatch);
                         }
@@ -1881,46 +1945,72 @@ export function useImageLoader() {
                             refreshedForCache.push(...refreshedBatch);
                         }
                         const addDurationMs = performance.now() - addStart;
-                        // Force flush imediatamente
-                        const flushPendingImages = useImageStore.getState().flushPendingImages;
-                        setTimeout(() => {
-                            console.log('[auto-watch] Flushing enriched images');
-                            const flushStart = performance.now();
-                            flushPendingImages();
-                            const flushDurationMs = performance.now() - flushStart;
-                            traceCacheDebug('loader:autoWatch:flushPendingImages', () => ({
-                                directoryId: directory.id,
-                                batchCount: enrichedBatch.length,
-                                details: {
-                                    addDurationMs: Number(addDurationMs.toFixed(2)),
-                                    flushDurationMs: Number(flushDurationMs.toFixed(2)),
-                                },
-                                snapshot: createCacheDebugSnapshot(useImageStore.getState()),
-                            }));
-                        }, 0);
+                        traceCacheDebug('loader:autoWatch:enrichmentBatchQueued', () => ({
+                            directoryId: directory.id,
+                            batchCount: enrichedBatch.length,
+                            details: {
+                                addDurationMs: Number(addDurationMs.toFixed(2)),
+                            },
+                            snapshot: createCacheDebugSnapshot(useImageStore.getState()),
+                        }));
                     },
                 }
             );
 
             // Aguardar Phase B completar
-            console.log('[auto-watch] Waiting for Phase B to complete...');
             await phaseB;
-            console.log('[auto-watch] Phase B completed!');
 
             if (getIsElectron() && (enrichedForCache.length > 0 || refreshedForCache.length > 0)) {
                 try {
-                    const directoryImages = useImageStore.getState().images.filter(
-                        image => image.directoryId === directory.id
-                    );
-                    await cacheManager.applyChunkedCacheDelta(
-                        directory.path,
-                        directory.name,
-                        [...enrichedForCache, ...refreshedForCache],
-                        [],
-                        [],
-                        shouldScanSubfolders,
-                        { fallbackImages: directoryImages }
-                    );
+                    const fallbackToFullDelta = async (imagesToUpsert: IndexedImage[]) => {
+                        const directoryImages = useImageStore.getState().images.filter(
+                            image => image.directoryId === directory.id
+                        );
+                        await cacheManager.applyChunkedCacheDelta(
+                            directory.path,
+                            directory.name,
+                            imagesToUpsert,
+                            [],
+                            [],
+                            shouldScanSubfolders,
+                            { fallbackImages: directoryImages }
+                        );
+                    };
+
+                    // Existing entries: patch only the chunk(s) that hold them.
+                    if (refreshedForCache.length > 0) {
+                        const patched = await cacheManager.patchCachedImages(
+                            directory.path,
+                            directory.name,
+                            refreshedForCache,
+                            shouldScanSubfolders
+                        );
+                        if (!patched) {
+                            await fallbackToFullDelta(refreshedForCache);
+                        }
+                    }
+
+                    // New entries: append to the last chunk / new chunks instead of
+                    // rewriting the whole directory cache. If there's no cache yet,
+                    // appendToCache falls back to a full cacheData write — pass the
+                    // full in-memory directory image list so that fallback doesn't
+                    // regress to a cache containing only this batch's new files.
+                    // Computed lazily: appendToCache only needs this when it hits the
+                    // no-cache-yet branch, which isn't the common case once a
+                    // directory's cache already exists.
+                    if (enrichedForCache.length > 0) {
+                        await cacheManager.appendToCache(
+                            directory.path,
+                            directory.name,
+                            enrichedForCache,
+                            shouldScanSubfolders,
+                            {
+                                getFallbackImages: () => useImageStore.getState().images.filter(
+                                    image => image.directoryId === directory.id
+                                ),
+                            }
+                        );
+                    }
                 } catch (err) {
                     console.error('Failed to upsert auto-watch cache entries:', err);
                 }

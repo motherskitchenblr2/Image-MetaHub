@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const isDevelopment = process.env.NODE_ENV === 'development' || process.defaultApp === true;
 const pendingDeepLinkFiles = [];
@@ -171,6 +171,44 @@ const electronAPI = {
     };
   },
 
+  // Resolves the absolute path of a dropped OS file. `File.path` was removed in
+  // Electron 32+, so this is the only way to identify a drop by its real origin.
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file) || '';
+    } catch {
+      return '';
+    }
+  },
+
+  onSettingsUpdated: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('settings-updated', handler);
+    return () => ipcRenderer.removeListener('settings-updated', handler);
+  },
+
+  onLicenseStatusChanged: (callback) => {
+    const handler = (_event, status) => callback(status);
+    ipcRenderer.on('license-status-changed', handler);
+    return () => ipcRenderer.removeListener('license-status-changed', handler);
+  },
+
+  onImageViewerSnapshot: (callback) => {
+    const handler = (_event, snapshot) => callback(snapshot);
+    ipcRenderer.on('image-viewer-snapshot', handler);
+    return () => ipcRenderer.removeListener('image-viewer-snapshot', handler);
+  },
+  onImageViewerEvent: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('image-viewer-event', handler);
+    return () => ipcRenderer.removeListener('image-viewer-event', handler);
+  },
+  onImageViewerCommand: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('image-viewer-command', handler);
+    return () => ipcRenderer.removeListener('image-viewer-command', handler);
+  },
+
   onZoomFactorChanged: (callback) => {
     const handler = (event, ...args) => callback(...args);
     ipcRenderer.on('zoom-factor-changed', handler);
@@ -182,25 +220,59 @@ const electronAPI = {
   // --- Invokable renderer-to-main functions ---
   getTheme: () => ipcRenderer.invoke('get-theme'),
   getZoomFactor: () => ipcRenderer.invoke('get-zoom-factor'),
-  trashFile: (filePath) => ipcRenderer.invoke('trash-file', filePath),
-  renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
+  trashFile: (filePath, userDataContext) => ipcRenderer.invoke('trash-file', filePath, userDataContext),
+  confirmPermanentDelete: (args) => ipcRenderer.invoke('confirm-permanent-delete', args),
+  renameFile: (oldPath, newPath, userDataContext) => ipcRenderer.invoke('rename-file', oldPath, newPath, userDataContext),
   setCurrentDirectory: (dirPath) => ipcRenderer.invoke('set-current-directory', dirPath),
   updateAllowedPaths: (paths) => ipcRenderer.invoke('update-allowed-paths', paths),
   showDirectoryDialog: () => ipcRenderer.invoke('show-directory-dialog'),
   showSaveDialog: (options) => ipcRenderer.invoke('show-save-dialog', options),
   showItemInFolder: (filePath) => ipcRenderer.invoke('show-item-in-folder', filePath),
-  openCacheLocation: (cachePath) => ipcRenderer.invoke('open-cache-location', cachePath),
+  openCacheLocation: () => ipcRenderer.invoke('open-cache-location'),
   listSubfolders: (folderPath) => ipcRenderer.invoke('list-subfolders', folderPath),
+  createSubfolder: (parentPath, folderName) => ipcRenderer.invoke('create-subfolder', { parentPath, folderName }),
   listDirectoryFiles: (args) => ipcRenderer.invoke('list-directory-files', args),
+  provenanceBackfillControl: (action) => ipcRenderer.invoke('provenance-backfill-control', action),
+  onProvenanceIdentitiesAssigned: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('provenance-identities-assigned', handler);
+    return () => ipcRenderer.removeListener('provenance-identities-assigned', handler);
+  },
+  stableUserDataStatus: () => ipcRenderer.invoke('stable-user-data-status'),
+  stableUserDataSync: (args) => ipcRenderer.invoke('stable-user-data-sync', args),
+  stableUserDataMutate: (input) => ipcRenderer.invoke('stable-user-data-mutate', input),
+  stableUserDataReserveLegacyMutation: (input) => ipcRenderer.invoke('stable-user-data-reserve-legacy-mutation', input),
+  stableUserDataFinalizeLegacyMutation: (input) => ipcRenderer.invoke('stable-user-data-finalize-legacy-mutation', input),
+  stableUserDataCompleteLegacyScan: () => ipcRenderer.invoke('stable-user-data-complete-legacy-scan'),
+  stableUserDataGlobalTagMutation: (input) => ipcRenderer.invoke('stable-user-data-global-tag-mutation', input),
+  stableUserDataTagCounts: () => ipcRenderer.invoke('stable-user-data-tag-counts'),
+  onStableUserDataChanged: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('stable-user-data-changed', handler);
+    return () => ipcRenderer.removeListener('stable-user-data-changed', handler);
+  },
+  savedPromptsList: () => ipcRenderer.invoke('saved-prompts:list'),
+  savedPromptsSave: (input) => ipcRenderer.invoke('saved-prompts:save', input),
+  savedPromptsRemove: (id) => ipcRenderer.invoke('saved-prompts:remove', id),
+  savedPromptsResolveSource: (id) => ipcRenderer.invoke('saved-prompts:resolve-source', id),
+  onSavedPromptsChanged: (callback) => {
+    const subscription = () => callback();
+    ipcRenderer.on('saved-prompts:changed', subscription);
+    return () => ipcRenderer.removeListener('saved-prompts:changed', subscription);
+  },
   resolveMediaUrl: (filePath) => ipcRenderer.invoke('resolve-media-url', filePath),
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
+  hashFileSha256: (filePath, requestId) => ipcRenderer.invoke('hash-file-sha256', { filePath, requestId }),
+  cancelFileSha256: (requestId) => ipcRenderer.send('cancel-hash-file-sha256', requestId),
   readFilesBatch: (filePaths) => ipcRenderer.invoke('read-files-batch', filePaths),
   readFilesHeadBatch: (args) => ipcRenderer.invoke('read-files-head-batch', args),
   readFilesTailBatch: (args) => ipcRenderer.invoke('read-files-tail-batch', args),
   readMediaMetadata: (args) => ipcRenderer.invoke('read-media-metadata', args),
+  readModel3DMetadata: (args) => ipcRenderer.invoke('read-model3d-metadata', args),
   readVideoMetadata: (args) => ipcRenderer.invoke('read-video-metadata', args),
   getFileStats: (filePath) => ipcRenderer.invoke('get-file-stats', filePath),
-  writeFile: (filePath, data) => ipcRenderer.invoke('write-file', filePath, data),
+  writeFile: (filePath, data, provenanceContext) => ipcRenderer.invoke('write-file', filePath, data, provenanceContext),
+  writeModel3DExport: (args) => ipcRenderer.invoke('write-model3d-export', args),
   exportBatchToFolder: (args) => ipcRenderer.invoke('export-images-batch', args),
   exportBatchToZip: (args) => ipcRenderer.invoke('export-images-zip', args),
   cancelBatchExport: (args) => ipcRenderer.invoke('cancel-export-batch', args),
@@ -208,14 +280,21 @@ const electronAPI = {
   deleteFile: (filePath) => ipcRenderer.invoke('delete-file', filePath),
   ensureDirectory: (dirPath) => ipcRenderer.invoke('ensure-directory', dirPath),
   getUserDataPath: () => ipcRenderer.invoke('get-user-data-path'),
+  getRuntimeInfo: () => ipcRenderer.invoke('get-runtime-info'),
   getSettings: () => ipcRenderer.invoke('get-settings'),
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+  activateTrial: () => ipcRenderer.invoke('trial:activate'),
+  getLicenseStatus: () => ipcRenderer.invoke('license:get-status'),
+  activateLicense: (key, email) => ipcRenderer.invoke('license:activate', { key, email }),
+  refreshLicense: () => ipcRenderer.invoke('license:refresh'),
+  deactivateLicense: () => ipcRenderer.invoke('license:deactivate'),
   markChangelogViewed: (version) => ipcRenderer.invoke('mark-changelog-viewed', version),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
   skipUpdateVersion: (version) => ipcRenderer.invoke('skip-version', version),
   launchGenerator: (payload) => ipcRenderer.invoke('launch-generator', payload),
   openExternalUrl: (url) => ipcRenderer.invoke('open-external-url', url),
+  civitaiLookup: (query) => ipcRenderer.invoke('civitai-lookup', query),
   openPath: (filePath) => ipcRenderer.invoke('open-path', filePath),
   comfyUIViewOpen: (payload) => ipcRenderer.invoke('comfy-view-open', payload),
   comfyUIViewShow: (payload) => ipcRenderer.invoke('comfy-view-show', payload),
@@ -227,6 +306,7 @@ const electronAPI = {
   comfyUIViewGoForward: () => ipcRenderer.invoke('comfy-view-go-forward'),
   comfyUIViewGetState: () => ipcRenderer.invoke('comfy-view-get-state'),
   comfyUIViewLoadWorkflow: (payload) => ipcRenderer.invoke('comfy-view-load-workflow', payload),
+  comfyUIViewRunWorkflow: () => ipcRenderer.invoke('comfy-view-run-workflow'),
   onComfyUIViewStateChanged: (callback) => {
     const handler = (event, ...args) => callback(...args);
     ipcRenderer.on('comfy-view-state-changed', handler);
@@ -241,6 +321,13 @@ const electronAPI = {
       ipcRenderer.removeListener('comfy-view-load-failed', handler);
     };
   },
+  onComfyEmbeddedProgress: (callback) => {
+    const handler = (event, message) => callback(message);
+    ipcRenderer.on('comfy-embedded-progress', handler);
+    return () => {
+      ipcRenderer.removeListener('comfy-embedded-progress', handler);
+    };
+  },
   getDefaultCachePath: () => ipcRenderer.invoke('get-default-cache-path'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   joinPaths: (...paths) => ipcRenderer.invoke('join-paths', ...paths),
@@ -249,10 +336,22 @@ const electronAPI = {
   toggleFullscreen: () => ipcRenderer.invoke('toggle-fullscreen'),
   getFullscreenState: () => ipcRenderer.invoke('get-fullscreen-state'),
   setFullscreen: (isFullscreen) => ipcRenderer.invoke('set-fullscreen', isFullscreen),
+  imageViewerOpen: (payload) => ipcRenderer.invoke('image-viewer-open', payload),
+  imageViewerUpdate: (payload) => ipcRenderer.invoke('image-viewer-update', payload),
+  imageViewerReady: (sessionId) => ipcRenderer.invoke('image-viewer-ready', sessionId),
+  imageViewerWindowAction: (payload) => ipcRenderer.invoke('image-viewer-window-action', payload),
+  imageViewerCommand: (payload) => ipcRenderer.invoke('image-viewer-command', payload),
+  imageViewerRespond: (payload) => ipcRenderer.send('image-viewer-command-response', payload),
   startFileDrag: (args) => ipcRenderer.send('start-file-drag', args),
+  onNativeFileDragStarted: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('native-file-drag-started', handler);
+    return () => ipcRenderer.removeListener('native-file-drag-started', handler);
+  },
 
   // --- Caching ---
   copyImageToClipboard: (filePath) => ipcRenderer.invoke('copy-image-to-clipboard', filePath),
+  copyTextToClipboard: (text) => ipcRenderer.invoke('copy-text-to-clipboard', text),
   getCachedData: (cacheId) => ipcRenderer.invoke('get-cached-data', cacheId),
   getJsonCacheData: (cacheId) => ipcRenderer.invoke('get-json-cache-data', cacheId),
   getCacheSummary: (cacheId) => ipcRenderer.invoke('get-cache-summary', cacheId),
@@ -263,6 +362,24 @@ const electronAPI = {
   finalizeCacheWrite: (args) => ipcRenderer.invoke('finalize-cache-write', args),
   clearCacheData: (cacheId) => ipcRenderer.invoke('clear-cache-data', cacheId),
   getCacheChunk: (args) => ipcRenderer.invoke('get-cache-chunk', args),
+  writeCacheIndex: (args) => ipcRenderer.invoke('write-cache-index', args),
+  readCacheIndex: (args) => ipcRenderer.invoke('read-cache-index', args),
+  readCacheTombstones: (args) => ipcRenderer.invoke('read-cache-tombstones', args),
+  getEmbeddingCacheIdentity: () => ipcRenderer.invoke('get-embedding-cache-identity'),
+  readEmbeddingFile: (args) => ipcRenderer.invoke('read-embedding-file', args),
+  writeEmbeddingFile: (args) => ipcRenderer.invoke('write-embedding-file', args),
+  appendEmbeddingSegment: (args) => ipcRenderer.invoke('append-embedding-segment', args),
+  statEmbeddingIndex: (args) => ipcRenderer.invoke('stat-embedding-index', args),
+  deleteEmbeddingIndex: (args) => ipcRenderer.invoke('delete-embedding-index', args),
+  getEmbeddingModelStatus: (args) => ipcRenderer.invoke('get-embedding-model-status', args),
+  downloadEmbeddingModel: (args) => ipcRenderer.invoke('download-embedding-model', args),
+  cancelEmbeddingModelDownload: () => ipcRenderer.invoke('cancel-embedding-model-download'),
+  deleteEmbeddingModel: (args) => ipcRenderer.invoke('delete-embedding-model', args),
+  onEmbeddingModelProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('embedding-model-progress', listener);
+    return () => ipcRenderer.removeListener('embedding-model-progress', listener);
+  },
   resolveThumbnailCacheBatch: (args) => ipcRenderer.invoke('resolve-thumbnail-cache-batch', args),
   getThumbnail: (thumbnailId) => ipcRenderer.invoke('get-thumbnail', thumbnailId),
   cacheThumbnail: (args) => ipcRenderer.invoke('cache-thumbnail', args),

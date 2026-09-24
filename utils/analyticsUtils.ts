@@ -1,5 +1,5 @@
 import { IndexedImage } from '../types';
-import { formatLocalDateKey } from './dateFilterUtils';
+import { DATE_PADDING, formatLocalDateKey, formatLocalMonthKey } from './dateFilterUtils';
 import { getImageAnalytics } from './imageMetadata';
 
 export type PeriodPreset = '7days' | '30days' | '90days' | 'thisMonth' | 'all';
@@ -167,15 +167,24 @@ export function getUniquePeriodCount(
   const periodStart = now - daysBack * 24 * 60 * 60 * 1000;
 
   const uniqueItems = new Set<string>();
-  images
-    .filter((img) => img.lastModified >= periodStart)
-    .forEach((img) => {
-      const items = Array.isArray(img[field]) ? img[field] : [img[field]];
-      items.forEach((item) => {
-        const normalizedItem = normalizeItemName(item);
+
+  // Optimization: Single-pass O(N) loop to avoid intermediate array allocations and GC pressure.
+  // Impact: Improves performance for large libraries by eliminating .filter() and .forEach() overhead.
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    if (img.lastModified >= periodStart) {
+      const items = img[field];
+      if (Array.isArray(items)) {
+        for (let j = 0; j < items.length; j++) {
+          const normalizedItem = normalizeItemName(items[j]);
+          if (normalizedItem) uniqueItems.add(normalizedItem);
+        }
+      } else {
+        const normalizedItem = normalizeItemName(items);
         if (normalizedItem) uniqueItems.add(normalizedItem);
-      });
-    });
+      }
+    }
+  }
 
   return uniqueItems.size;
 }
@@ -239,13 +248,14 @@ export function generateTimelineComparison(
     let key: string;
 
     if (groupBy === 'day') {
-      key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      key = formatLocalDateKey(date);
     } else if (groupBy === 'week') {
       const weekNum = getWeekNumber(date);
-      key = `${date.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
+      // Optimization: Using pre-allocated DATE_PADDING for week number formatting.
+      key = `${date.getFullYear()}-W${DATE_PADDING[weekNum] || String(weekNum).padStart(2, '0')}`;
     } else {
       // month
-      key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      key = formatLocalMonthKey(date);
     }
 
     if (img.lastModified >= currentPeriodStart) {
@@ -718,12 +728,13 @@ export function calculatePerformanceTimeline(
     let key: string;
 
     if (groupBy === 'day') {
-      key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      key = formatLocalDateKey(date);
     } else if (groupBy === 'week') {
       const weekNum = getWeekNumber(date);
-      key = `${date.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
+      // Optimization: Using pre-allocated DATE_PADDING for week number formatting.
+      key = `${date.getFullYear()}-W${DATE_PADDING[weekNum] || String(weekNum).padStart(2, '0')}`;
     } else {
-      key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      key = formatLocalMonthKey(date);
     }
 
     const analytics = getImageAnalytics(img);
@@ -1173,7 +1184,7 @@ const buildCompareCohort = (
 
   return {
     key,
-    label: key === 'present' ? 'Has telemetry' : key === 'missing' ? 'Missing telemetry' : key,
+    label: key === 'present' ? 'Has performance data' : key === 'missing' ? 'Missing performance data' : key,
     count: cohortImages.length,
     favoriteRate: cohortImages.length > 0 ? favoriteCount / cohortImages.length : 0,
     averageRating: ratedCount > 0 ? ratingSum / ratedCount : 0,

@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "image-metahub-license-server",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-13",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "image-metahub-licenses",
+      "database_id": "REPLACE_DURING_DEPLOYMENT",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "LICENSE_SIGNING_PUBLIC_KEY": "REPLACE_DURING_DEPLOYMENT",
+    "STRIPE_LIVEMODE": "true",
+    "STRIPE_ACCOUNT_ID": "REPLACE_DURING_DEPLOYMENT",
+    "STRIPE_SUBSCRIPTION_PRODUCT_ID": "REPLACE_DURING_DEPLOYMENT",
+    "STRIPE_MONTHLY_PRICE_ID": "REPLACE_DURING_DEPLOYMENT",
+    "STRIPE_ANNUAL_PRICE_ID": "REPLACE_DURING_DEPLOYMENT",
+    "STRIPE_LIFETIME_PRICE_ID": "REPLACE_DURING_DEPLOYMENT",
+    "LICENSE_EMAIL_FROM": "REPLACE_DURING_DEPLOYMENT"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}

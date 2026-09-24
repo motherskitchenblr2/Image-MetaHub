@@ -75,6 +75,13 @@ export interface ComfyUIViewLoadFailure {
   url: string;
 }
 
+// Read-only ComfyUI WebSocket event observed inside the embedded view and relayed
+// to the renderer. 'json' carries a parsed ComfyUI message (progress/executing/…);
+// 'binary' carries a preview-image frame as raw bytes.
+export type ComfyEmbeddedWsMessage =
+  | { kind: 'json'; payload: { type?: string; data?: Record<string, unknown> } }
+  | { kind: 'binary'; buffer: ArrayBuffer | Uint8Array };
+
 export interface ExportFileDescriptor {
   imageId?: string;
   directoryPath: string;
@@ -272,7 +279,28 @@ export interface IndexedImageTransferResultItem {
   fileName: string;
   size?: number;
   lastModified?: number;
+  birthtimeMs?: number;
   type?: string;
+  provenance?: {
+    enabled: boolean;
+    available?: boolean;
+    pending?: boolean;
+    error?: string;
+    operation?: {
+      operationId: string;
+      kind: IndexedImageTransferMode;
+      state: string;
+      result?: {
+        mapping?: {
+          assetId: string;
+          revisionId: string;
+          locationId: string;
+          rootId: string;
+          relativePath: string;
+        } | null;
+      } | null;
+    };
+  };
 }
 
 export interface UpdateReleaseNote {
@@ -379,32 +407,150 @@ export interface ThumbnailGenerateToCacheRequest extends ThumbnailCacheCandidate
   quality?: number;
 }
 
+export type CivitaiLookupResult =
+  | { status: 'found'; modelId: number; versionId: number }
+  | { status: 'notFound' }
+  | { status: 'unavailable' };
+
+export interface CivitaiLookupQuery {
+  hash?: string;
+  versionId?: number;
+}
+
+export interface DesktopRuntimeInfo {
+  isPortable: boolean;
+  userDataPath: string;
+  autoUpdateSupported: boolean;
+}
+
+export type LicensePlan = 'lifetime' | 'monthly' | 'annual';
+
+export interface LicenseClientStatus {
+  authorized: boolean;
+  licenseStatus: 'free' | 'pro' | 'lifetime';
+  plan: LicensePlan | null;
+  licenseEmail: string | null;
+  expiresAt: string | null;
+  refreshAfter: string | null;
+  migrationRequired: boolean;
+  message: string | null;
+}
+
+export interface LicenseActivationResult {
+  activated: boolean;
+  status: LicenseClientStatus;
+}
+
+export interface TrialActivationResult {
+  success: boolean;
+  activated: boolean;
+  trialStartDate: number | null;
+  error?: string;
+}
+
 export interface ElectronAPI {
-  trashFile: (filename: string) => Promise<{ success: boolean; error?: string }>;
-  renameFile: (oldName: string, newName: string) => Promise<{ success: boolean; error?: string }>;
+  trashFile: (filename: string, userDataContext?: StableUserDataOperationContext) => Promise<{
+    success: boolean;
+    error?: string;
+    permanentDeleteToken?: string;
+    primaryDeleted?: boolean;
+    remainingFileCount?: number;
+  }>;
+  confirmPermanentDelete: (args: { tokens: string[] }) => Promise<{
+    success: boolean;
+    cancelled: boolean;
+    deletedTokens: string[];
+    failedTokens: string[];
+    error?: string;
+  }>;
+  renameFile: (
+    oldName: string,
+    newName: string,
+    userDataContext?: StableUserDataOperationContext,
+  ) => Promise<{ success: boolean; error?: string }>;
   setCurrentDirectory: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
   updateAllowedPaths: (paths: string[]) => Promise<{ success: boolean; error?: string }>;
   showDirectoryDialog: () => Promise<{ success: boolean; path?: string; name?: string; canceled?: boolean; error?: string }>;
   showSaveDialog: (options: { title?: string; defaultPath?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
   showItemInFolder: (filePath: string) => Promise<{ success: boolean; error?: string }>;
-  openCacheLocation: (cachePath: string) => Promise<{ success: boolean; error?: string }>;
+  openCacheLocation: () => Promise<{ success: boolean; error?: string }>;
   listSubfolders: (folderPath: string) => Promise<{ success: boolean; subfolders?: { name: string; path: string; realPath?: string }[]; error?: string }>;
-  listDirectoryFiles: (args: { dirPath: string; recursive?: boolean }) => Promise<{
+  createSubfolder: (parentPath: string, folderName: string) => Promise<{ success: boolean; folder?: { name: string; path: string; realPath?: string }; error?: string }>;
+  listDirectoryFiles: (args: { dirPath: string; recursive?: boolean; provenanceRootPath?: string }) => Promise<{
     success: boolean;
     files?: { name: string; lastModified: number; size: number; type: string; birthtimeMs?: number; contentModifiedMs?: number }[];
     error?: string;
   }>;
+  provenanceBackfillControl: (action: 'pause' | 'resume') => Promise<{ success: boolean; enabled: boolean; paused?: boolean; error?: string }>;
+  onProvenanceIdentitiesAssigned: (callback: (payload: {
+    rootId: string;
+    rootPath: string;
+    mappings: Array<{
+      relativePath: string;
+      relativePathKey: string;
+      assetId: string;
+      revisionId: string;
+      locationId: string;
+      observationVersion?: number;
+    }>;
+  }) => void) => () => void;
+  stableUserDataStatus: () => Promise<StableUserDataStatus>;
+  stableUserDataSync: (args: { entries: StableUserDataSyncEntry[] }) => Promise<StableUserDataIpcResult<StableUserDataSyncResult[]>>;
+  stableUserDataMutate: (input: StableUserDataMutationInput) => Promise<StableUserDataIpcResult<StableUserDataRecord>>;
+  stableUserDataReserveLegacyMutation: (input: {
+    mutationId: string;
+    domain: StableUserDataDomain;
+    legacyImageId: string;
+    patch: UserDataSemanticPatch;
+  }) => Promise<StableUserDataIpcResult<{ mutationId: string; sequence: number; state: string }>>;
+  stableUserDataFinalizeLegacyMutation: (input: {
+    mutationId: string;
+    sourceVersion: number;
+    payload: Record<string, unknown> | null;
+    tombstone: boolean;
+  }) => Promise<StableUserDataIpcResult<{ mutationId: string; sequence: number; state: string; record?: StableUserDataRecord | null }>>;
+  stableUserDataCompleteLegacyScan: () => Promise<StableUserDataIpcResult<StableUserDataStatus>>;
+  stableUserDataGlobalTagMutation: (input: {
+    action: 'rename' | 'remove';
+    sourceTag: string;
+    targetTag?: string;
+    updatedAt: number;
+  }) => Promise<StableUserDataIpcResult<StableUserDataRecord[]>>;
+  stableUserDataTagCounts: () => Promise<StableUserDataIpcResult<TagInfo[]>>;
+  onStableUserDataChanged: (callback: (payload: { records: StableUserDataRecord[] }) => void) => () => void;
+  savedPromptsList: () => Promise<SavedPromptIpcResult<SavedPrompt[]>>;
+  savedPromptsSave: (input: SavePromptInput) => Promise<SavedPromptIpcResult<SavedPromptSaveResult>>;
+  savedPromptsRemove: (id: string) => Promise<SavedPromptIpcResult<{ id: string; removed: boolean }>>;
+  savedPromptsResolveSource: (id: string) => Promise<SavedPromptIpcResult<SavedPromptSourceResolution>>;
+  onSavedPromptsChanged: (callback: () => void) => () => void;
   readFile: (filePath: string) => Promise<{ success: boolean; data?: Buffer; error?: string; errorType?: string; errorCode?: string }>;
+  hashFileSha256: (filePath: string, requestId: string) => Promise<{ success: boolean; sha256?: string; error?: string; errorType?: string; errorCode?: string }>;
+  cancelFileSha256: (requestId: string) => void;
   readFilesBatch: (args: string[] | ElectronReadFilesBatchArgs) => Promise<{ success: boolean; files?: ElectronReadFilesBatchItem[]; error?: string }>;
   readMediaMetadata: (args: { filePath: string }) => Promise<{ success: boolean; comment?: string; description?: string; title?: string; video?: VideoInfo | null; audio?: AudioInfo | null; error?: string }>;
+  readModel3DMetadata: (args: { filePath: string }) => Promise<{ success: boolean; metadata?: Record<string, unknown> | null; source?: 'sidecar' | 'embedded' | 'none'; error?: string }>;
   readVideoMetadata: (args: { filePath: string }) => Promise<{ success: boolean; comment?: string; description?: string; title?: string; video?: VideoInfo | null; audio?: AudioInfo | null; error?: string }>;
   getFileStats: (filePath: string) => Promise<{ success: boolean; stats?: any; error?: string }>;
-  writeFile: (filePath: string, data: any) => Promise<{ success: boolean; error?: string }>;
+  writeFile: (
+    filePath: string,
+    data: any,
+    provenanceContext?: {
+      kind: 'save_as' | 'overwrite';
+      sourcePath?: string;
+      userDataContext?: StableUserDataOperationContext;
+    },
+  ) => Promise<{ success: boolean; error?: string; provenance?: { enabled: boolean; available?: boolean; pending?: boolean; error?: string } }>;
+  writeModel3DExport: (args: { filePath: string; modelData: Uint8Array; sidecarData?: Uint8Array }) => Promise<{ success: boolean; error?: string }>;
   exportBatchToFolder: (args: ExportBatchRequest & { destDir: string }) => Promise<{ success: boolean; exportedCount: number; failedCount: number; error?: string }>;
   exportBatchToZip: (args: ExportBatchRequest & { destZipPath: string }) => Promise<{ success: boolean; exportedCount: number; failedCount: number; error?: string }>;
   cancelBatchExport: (args: { exportId: string }) => Promise<{ success: boolean; error?: string }>;
   transferIndexedImages: (args: {
-    files: { directoryPath: string; relativePath: string }[];
+    files: {
+      directoryPath: string;
+      relativePath: string;
+      legacyImageId?: string;
+      stableReference?: StableUserDataReference;
+    }[];
     destDir: string;
     mode: IndexedImageTransferMode;
     transferId?: string;
@@ -417,14 +563,21 @@ export interface ElectronAPI {
   deleteFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
   ensureDirectory: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
   getUserDataPath: () => Promise<string>;
+  getRuntimeInfo: () => Promise<DesktopRuntimeInfo>;
   getSettings: () => Promise<any>;
   saveSettings: (settings: any) => Promise<{ success: boolean; error?: string }>;
+  activateTrial: () => Promise<TrialActivationResult>;
+  getLicenseStatus: () => Promise<LicenseClientStatus>;
+  activateLicense: (key: string, email: string) => Promise<LicenseActivationResult>;
+  refreshLicense: () => Promise<LicenseClientStatus>;
+  deactivateLicense: () => Promise<LicenseClientStatus>;
   markChangelogViewed: (version: string) => Promise<{ success: boolean; error?: string }>;
-  downloadUpdate: () => Promise<{ success: boolean; error?: string }>;
-  installUpdate: () => Promise<{ success: boolean; error?: string }>;
+  downloadUpdate: () => Promise<{ success: boolean; error?: string; errorCode?: string }>;
+  installUpdate: () => Promise<{ success: boolean; error?: string; errorCode?: string }>;
   skipUpdateVersion: (version: string) => Promise<{ success: boolean; error?: string }>;
   launchGenerator: (payload: { command: string; workingDirectory?: string }) => Promise<{ success: boolean; error?: string; scriptPath?: string }>;
   openExternalUrl: (url: string) => Promise<{ success: boolean; error?: string }>;
+  civitaiLookup: (query: CivitaiLookupQuery) => Promise<CivitaiLookupResult>;
   openPath: (filePath: string) => Promise<{ success: boolean; error?: string; errorType?: string }>;
   comfyUIViewOpen: (payload: { url: string; bounds?: ComfyUIViewBounds }) => Promise<ComfyUIViewResult>;
   comfyUIViewShow: (payload?: { bounds?: ComfyUIViewBounds }) => Promise<ComfyUIViewResult>;
@@ -442,16 +595,20 @@ export interface ElectronAPI {
     title?: string;
     preferNewTab?: boolean;
   }) => Promise<ComfyUIViewWorkflowLoadResult>;
+  comfyUIViewRunWorkflow: () => Promise<{ success: boolean; error?: string }>;
   onComfyUIViewStateChanged: (callback: (state: ComfyUIViewState) => void) => () => void;
   onComfyUIViewLoadFailed: (callback: (failure: ComfyUIViewLoadFailure) => void) => () => void;
+  onComfyEmbeddedProgress: (callback: (message: ComfyEmbeddedWsMessage) => void) => () => void;
   getDefaultCachePath: () => Promise<{ success: boolean; path?: string; error?: string }>;
   getAppVersion: () => Promise<string>;
   joinPaths: (...paths: string[]) => Promise<{ success: boolean; path?: string; error?: string }>;
   joinPathsBatch: (args: { basePath: string; fileNames: string[] }) => Promise<{ success: boolean; paths?: string[]; error?: string }>;
   dirname: (filePath: string) => Promise<{ success: boolean; path?: string; error?: string }>;
   resolveMediaUrl: (filePath: string) => Promise<{ success: boolean; url?: string; error?: string; errorType?: string; errorCode?: string }>;
-  startFileDrag: (args: { directoryPath: string; relativePath: string }) => void;
+  startFileDrag: (args: { directoryPath: string; relativePath: string; imageId?: string }) => void;
+  onNativeFileDragStarted: (callback: (args: { directoryPath: string; relativePath: string; imageId?: string }) => void) => () => void;
   copyImageToClipboard: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  copyTextToClipboard: (text: string) => Promise<{ success: boolean; error?: string }>;
   
   // --- Caching ---
   getCachedData: (cacheId: string) => Promise<{ success: boolean; data?: any; error?: string }>;
@@ -462,8 +619,43 @@ export interface ElectronAPI {
   writeJsonCacheData: (args: { cacheId: string; data: any }) => Promise<{ success: boolean; error?: string }>;
   prepareCacheWrite: (args: { cacheId: string }) => Promise<{ success: boolean; error?: string }>;
   writeCacheChunk: (args: { cacheId: string; chunkIndex: number; data: any }) => Promise<{ success: boolean; error?: string }>;
-  finalizeCacheWrite: (args: { cacheId: string; record: any; sourceCacheId?: string }) => Promise<{ success: boolean; error?: string }>;
+  finalizeCacheWrite: (args: {
+    cacheId: string;
+    record: any;
+    sourceCacheId?: string;
+    // undefined = full rewrite, drop the removed-ids sidecar; 'preserve' = keep
+    // it as is; an object replaces it. See the electron.mjs handler.
+    tombstones?: 'preserve' | { chunkCount: number; ids: string[] };
+  }) => Promise<{ success: boolean; error?: string }>;
   clearCacheData: (cacheId: string) => Promise<{ success: boolean; error?: string }>;
+  writeCacheIndex: (args: { cacheId: string; data: { lastScan?: number; chunkCount: number; ids: Record<string, number> } }) => Promise<{ success: boolean; error?: string }>;
+  readCacheIndex: (args: { cacheId: string }) => Promise<{ success: boolean; data?: { lastScan?: number; chunkCount: number; ids: Record<string, number> } | null; error?: string }>;
+  readCacheTombstones: (args: { cacheId: string }) => Promise<{ success: boolean; data?: { chunkCount: number; ids: string[] } | null; error?: string }>;
+  // Visual-search vector sidecars. `fileName` must match the whitelist in the
+  // main-process handler; build it with the helpers in embeddingFormat.ts.
+  getEmbeddingCacheIdentity: () => Promise<{ success: boolean; identity?: string; error?: string }>;
+  readEmbeddingFile: (args: { fileName: string; binary?: boolean; cacheRootIdentity: string }) => Promise<{ success: boolean; data?: any; error?: string }>;
+  writeEmbeddingFile: (args: { fileName: string; data: any; binary?: boolean; cacheRootIdentity: string }) => Promise<{ success: boolean; error?: string }>;
+  appendEmbeddingSegment: (args: { fileName: string; data: ArrayBuffer; expectedOffset: number; cacheRootIdentity: string }) => Promise<{ success: boolean; byteLength?: number; error?: string }>;
+  statEmbeddingIndex: (args: { cacheId: string; cacheRootIdentity: string }) => Promise<{ success: boolean; totalBytes?: number; fileCount?: number; error?: string }>;
+  deleteEmbeddingIndex: (args: { cacheId: string; cacheRootIdentity: string }) => Promise<{ success: boolean; removed?: number; error?: string }>;
+  getEmbeddingModelStatus: (args: { modelId: string; files: string[] }) => Promise<{
+    success: boolean;
+    installed?: boolean;
+    modelDir?: string;
+    missing?: string[];
+    totalBytes?: number;
+    error?: string;
+  }>;
+  downloadEmbeddingModel: (args: { modelId: string; revision: string; files: string[]; baseUrl?: string }) => Promise<{
+    success: boolean;
+    modelDir?: string;
+    cancelled?: boolean;
+    error?: string;
+  }>;
+  cancelEmbeddingModelDownload: () => Promise<{ success: boolean; running?: boolean }>;
+  deleteEmbeddingModel: (args: { modelId: string }) => Promise<{ success: boolean; error?: string }>;
+  onEmbeddingModelProgress: (callback: (payload: EmbeddingModelProgress) => void) => () => void;
   resolveThumbnailCacheBatch: (args: {
     candidates: ThumbnailCacheCandidate[];
   }) => Promise<{
@@ -502,6 +694,18 @@ export interface ElectronAPI {
   toggleFullscreen: () => Promise<{ success: boolean; isFullscreen?: boolean; error?: string }>;
   getFullscreenState: () => Promise<{ success: boolean; isFullscreen?: boolean; error?: string }>;
   setFullscreen: (isFullscreen: boolean) => Promise<{ success: boolean; isFullscreen?: boolean; error?: string }>;
+  imageViewerOpen: (payload: { sessionId: string; snapshot: import('./services/imageViewerContracts').ImageViewerSnapshot }) => Promise<{ success: boolean; existing?: boolean; error?: string }>;
+  imageViewerUpdate: (payload: { sessionId: string; snapshot: import('./services/imageViewerContracts').ImageViewerSnapshot }) => Promise<{ success: boolean; ignored?: boolean; error?: string }>;
+  imageViewerReady: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
+  imageViewerWindowAction: (payload: { sessionId: string; action: 'focus' | 'restore' | 'minimize' | 'close' | 'focus-main' | 'toggle-always-on-top' }) => Promise<{ success: boolean; isAlwaysOnTop?: boolean; error?: string }>;
+  imageViewerCommand: (payload: { sessionId: string; command: import('./services/imageViewerContracts').ImageViewerCommand }) => Promise<{ success: boolean; error?: string; [key: string]: unknown }>;
+  imageViewerRespond: (payload: { requestId: string; response: { success: boolean; error?: string; [key: string]: unknown } }) => void;
+  getPathForFile: (file: File) => string;
+  onSettingsUpdated: (callback: () => void) => () => void;
+  onLicenseStatusChanged: (callback: (status: LicenseClientStatus) => void) => () => void;
+  onImageViewerSnapshot: (callback: (snapshot: import('./services/imageViewerContracts').ImageViewerSnapshot) => void) => () => void;
+  onImageViewerEvent: (callback: (event: { sessionId: string; type: string; reason?: string }) => void) => () => void;
+  onImageViewerCommand: (callback: (payload: { sessionId: string; requestId: string; command: import('./services/imageViewerContracts').ImageViewerCommand }) => void) => () => void;
   onFullscreenChanged: (callback: (state: { isFullscreen: boolean }) => void) => () => void;
   onFullscreenStateCheck: (callback: (state: { isFullscreen: boolean }) => void) => () => void;
   onZoomFactorChanged: (callback: (zoomFactor: number) => void) => () => void;
@@ -528,6 +732,60 @@ export interface ElectronAPI {
   onWatchedFilesRemoved: (callback: (data: WatchedFileRemovalPayload) => void) => () => void;
   onWatcherDebug: (callback: (data: { message: string }) => void) => () => void;
 }
+
+export interface SourcePathSnapshot {
+  directoryPath: string;
+  relativePath: string;
+  fileSize: number | null;
+  contentModifiedMs: number | null;
+}
+
+export type SavedPromptSource =
+  | {
+      kind: 'stable';
+      reference: {
+        assetId: string;
+        revisionId: string;
+        locationId: string;
+        rootId: string;
+      };
+      pathAtSave: SourcePathSnapshot;
+    }
+  | {
+      kind: 'path';
+      pathAtSave: SourcePathSnapshot;
+    };
+
+export interface SavedPrompt {
+  id: string;
+  createdAt: number;
+  sourceCreatedAt: number | null;
+  positivePrompt: string;
+  negativePrompt: string;
+  textBasis: 'effective' | 'original';
+  source: SavedPromptSource | null;
+}
+
+export interface SavePromptInput {
+  positivePrompt: string;
+  negativePrompt: string;
+  textBasis: 'effective' | 'original';
+  source: SavedPromptSource | null;
+  sourceCreatedAt?: number | null;
+}
+
+export interface SavedPromptSaveResult {
+  status: 'saved' | 'already-saved';
+  prompt: SavedPrompt;
+}
+
+export type SavedPromptSourceResolution =
+  | { status: 'available'; absolutePath: string; sourceChanged: boolean }
+  | { status: 'unavailable'; reason: string };
+
+export type SavedPromptIpcResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string; errorCode?: string };
 
 declare global {
   interface Window {
@@ -571,6 +829,95 @@ export interface EditableMetadataFields {
 export interface ShadowMetadata extends EditableMetadataFields {
   imageId: string; // Key, links to IndexedImage.id
   updatedAt: number;
+  assetId?: string;
+  persistenceVersion?: number;
+}
+
+export type StableUserDataDomain = 'annotation' | 'shadow';
+
+export interface StableUserDataReference {
+  assetId: string;
+  revisionId: string;
+  locationId: string;
+}
+
+export interface StableUserDataOperationContext {
+  legacyImageId: string;
+  stableReference?: StableUserDataReference;
+  copyUserData?: boolean;
+}
+
+export interface UserDataSemanticPatch {
+  set?: Record<string, unknown>;
+  remove?: string[];
+  deleteRecord?: boolean;
+  addTags?: string[];
+  removeTags?: string[];
+  suppressTags?: string[];
+  unsuppressTags?: string[];
+  importTags?: string[];
+}
+
+export interface StableUserDataRecord {
+  assetId: string;
+  domain: StableUserDataDomain;
+  payload: Record<string, unknown> | null;
+  tombstone: boolean;
+  version: number;
+  authority: 'legacy' | 'sqlite';
+  legacySourceVersion: number;
+  migratedAt: string | null;
+  updatedAt: string;
+}
+
+export interface StableUserDataStatus {
+  initialized: boolean;
+  authority: 'legacy' | 'sqlite';
+  available: boolean;
+  migrationEnabled: boolean;
+  indexingEnabled: boolean;
+  legacyScanComplete?: boolean;
+  legacyScanCompletedAt?: string | null;
+  error?: { code?: string; message?: string } | null;
+}
+
+export interface StableUserDataIpcResult<T> {
+  success: boolean;
+  value?: T;
+  error?: string;
+  code?: string;
+  details?: { current?: StableUserDataRecord } | null;
+}
+
+export interface StableUserDataSyncEntry {
+  domain: StableUserDataDomain;
+  legacyImageId: string;
+  reference?: StableUserDataReference;
+  payload?: Record<string, unknown> | null;
+  tombstone?: boolean;
+  sourceVersion?: number;
+}
+
+export interface StableUserDataSyncResult {
+  domain: StableUserDataDomain;
+  legacyImageId: string;
+  status: 'bound' | 'pending' | 'unmapped' | 'ambiguous' | 'source_ack_required';
+  record: StableUserDataRecord | null;
+  pending?: {
+    domain: StableUserDataDomain;
+    legacyImageId: string;
+    payload: Record<string, unknown> | null;
+    tombstone: boolean;
+    sourceVersion: number;
+  } | null;
+}
+
+export interface StableUserDataMutationInput {
+  domain: StableUserDataDomain;
+  legacyImageId: string;
+  reference: StableUserDataReference;
+  expectedVersion: number;
+  patch: UserDataSemanticPatch;
 }
 
 export interface MetadataClipboardPayload {
@@ -678,7 +1025,7 @@ export interface MotionModelInfo {
   hash?: string | null;
 }
 
-export type GenerationType = 'txt2img' | 'img2img' | 'inpaint' | 'outpaint';
+export type GenerationType = 'txt2img' | 'img2img' | 'inpaint' | 'outpaint' | 'image2model3d';
 
 export interface SourceImageReference {
   fileName?: string | null;
@@ -711,7 +1058,8 @@ export interface MetaHubAttribution {
 
 export interface BaseMetadata extends SharedBaseMetadata {
   clip_skip?: number;
-  media_type?: 'image' | 'video' | 'audio';
+  media_type?: 'image' | 'video' | 'audio' | 'model3d';
+  model_3d?: Model3DMetadata | null;
   video?: VideoInfo | null;
   audio?: AudioInfo | null;
   motion_model?: MotionModelInfo | null;
@@ -730,6 +1078,21 @@ export interface BaseMetadata extends SharedBaseMetadata {
     python_version?: string | null;
     generation_time?: number | null;
   };
+}
+
+export interface Model3DBounds {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+
+export interface Model3DMetadata {
+  format: string;
+  vertexCount?: number;
+  faceCount?: number;
+  materialCount?: number;
+  hasTextures?: boolean;
+  bounds?: Model3DBounds;
+  sourceNodeClass?: string;
 }
 
 // Type guard functions
@@ -772,6 +1135,9 @@ export const isAutomatic1111Metadata = (metadata: ImageMetadata): metadata is Au
 export const isComfyUIMetadata = (metadata: ImageMetadata): metadata is ComfyUIMetadata =>
   sharedCoreTypes.isComfyUIMetadata(metadata as SharedImageMetadata);
 
+export const hasUsableComfyGraphMetadata = (metadata: ImageMetadata): boolean =>
+  sharedCoreTypes.hasUsableComfyGraphMetadata(metadata as SharedImageMetadata);
+
 export type ThumbnailStatus = SharedThumbnailStatus;
 export type ImageRating = SharedImageRating;
 
@@ -792,12 +1158,63 @@ export interface AdvancedFilters {
   cfg?: NumericRangeFilter;
   date?: DateRangeFilter;
   generationModes?: Array<'txt2img' | 'img2img'>;
-  mediaTypes?: Array<'image' | 'video' | 'audio'>;
+  mediaTypes?: Array<'image' | 'video' | 'audio' | 'model3d'>;
   telemetryState?: 'present' | 'missing';
   hasVerifiedTelemetry?: boolean;
   generationTimeMs?: NumericRangeFilter;
   stepsPerSecond?: NumericRangeFilter;
   vramPeakMb?: NumericRangeFilter;
+}
+
+/**
+ * `relevance` only exists while a visual search is active: it reads the score
+ * map produced by the vector search worker rather than a field on the image.
+ */
+export type SortOrder = 'asc' | 'desc' | 'date-asc' | 'date-desc' | 'random' | 'relevance';
+
+export interface EmbeddingModelProgress {
+  phase: 'downloading' | 'complete' | 'error' | 'cancelled';
+  file?: string;
+  completedFiles?: number;
+  totalFiles?: number;
+  receivedBytes?: number;
+  totalBytes?: number;
+  error?: string | null;
+}
+
+export type SemanticIndexPhase =
+  | 'disabled'
+  | 'idle'
+  | 'downloading-model'
+  | 'embedding'
+  | 'paused'
+  | 'error'
+  | 'complete';
+
+export interface SemanticIndexProgress {
+  phase: SemanticIndexPhase;
+  current: number;
+  total: number;
+  message: string;
+  imagesPerSecond?: number;
+  etaMs?: number;
+  error?: string | null;
+}
+
+export interface SemanticIndexCoverage {
+  /** Live vectors in the index for the current library. */
+  embedded: number;
+  /** Images in the current library, embedded or not. */
+  total: number;
+  /** Free-tier ceiling, or null when unlimited. */
+  cap: number | null;
+}
+
+export interface SemanticSearchResult {
+  /** Bumped per query so replies from a superseded query can be dropped. */
+  generation: number;
+  query: string;
+  scoreById: Map<string, number>;
 }
 
 export type SimilarSearchScope = 'current-view' | 'all-images' | 'same-folder';
@@ -956,6 +1373,10 @@ export interface IndexedImage {
   enrichmentState?: 'catalog' | 'enriched';
   fileSize?: number;
   fileType?: string;
+  assetId?: string;
+  revisionId?: string;
+  provenanceLocationId?: string;
+  provenanceRootId?: string;
 
   // User Annotations (loaded from ImageAnnotations table)
   isFavorite?: boolean;          // Quick access to favorite status
@@ -967,6 +1388,13 @@ export interface IndexedImage {
   clusterPosition?: number;      // Position within cluster (0 = cover image)
   autoTags?: string[];           // Auto-generated tags from TF-IDF
   autoTagsGeneratedAt?: number;  // Timestamp of tag generation
+
+  // Internal indexing-pipeline signal only. Set when the embedded metadata was parsed
+  // from a partial ("head read") buffer and the PNG chunk walk had to stop before
+  // reaching IEND because a chunk extended past the bytes we had in memory. Never
+  // persisted to the on-disk cache (see mapIndexedImageToCache) — used only to decide
+  // whether Phase B enrichment should fall back to reading the whole file.
+  _metadataTruncated?: boolean;
 }
 
 /**
@@ -980,6 +1408,9 @@ export interface ImageAnnotations {
   rating?: ImageRating;          // Optional 1-5 user rating
   addedAt: number;               // Timestamp when first annotated
   updatedAt: number;             // Timestamp of last update
+  assetId?: string;
+  persistenceVersion?: number;
+  suppressedMetadataTags?: string[];
 }
 
 /**
@@ -1090,6 +1521,8 @@ export interface ComparisonMetadataPanelProps {
   className?: string;
   compareLabel?: string;
   isHighlighted?: boolean;
+  registerScrollRef?: (element: HTMLDivElement | null) => void;
+  onContentScroll?: (scrollTop: number) => void;
 }
 
 // ===== Smart Clustering & Auto-Tagging Types =====
@@ -1097,6 +1530,22 @@ export interface ComparisonMetadataPanelProps {
 /**
  * Image cluster - groups images with similar prompts
  */
+export type ImageScopeType = 'model' | 'cluster' | 'collection';
+
+/** The active dimension of the Explore surface (unifies Model View / Smart Library / Collections). */
+export type ExploreDimension = 'models' | 'clusters' | 'collections';
+
+/**
+ * A navigation scope: a single drill-in target (a model, cluster, or collection)
+ * that constrains the Library grid to the images belonging to it. Exclusive
+ * (one at a time); cumulative filters continue to apply within the scope.
+ */
+export interface ImageScope {
+  type: ImageScopeType;
+  id: string;
+  label: string;
+}
+
 export interface ImageCluster {
   id: string;                      // Hash-based cluster ID
   promptHash: string;              // Hash of the base prompt

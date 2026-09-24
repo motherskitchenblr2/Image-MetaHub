@@ -1,12 +1,20 @@
 import type { IndexedImage } from '../types';
 import { formatLocalDateKey } from './dateFilterUtils';
 
-export type ImageGroupByMode = 'none' | 'date' | 'name' | 'session';
-export type ImageGroupingSortOrder = 'asc' | 'desc' | 'date-asc' | 'date-desc' | 'random';
+export type ImageGroupByMode = 'none' | 'date' | 'name' | 'session' | 'model' | 'cluster';
+// 'relevance' only appears while a visual search is active; it orders by the
+// search score, so like 'random' it has no groupable buckets.
+export type ImageGroupingSortOrder = 'asc' | 'desc' | 'date-asc' | 'date-desc' | 'random' | 'relevance';
 
 export interface ImageGroupingOptions {
   sortOrder?: ImageGroupingSortOrder;
+  /** Maps imageId → { id, label } of the cluster it belongs to (for groupBy 'cluster'). */
+  clusterByImageId?: Map<string, { id: string; label: string }>;
 }
+
+/** True when the mode sections by an entity (model/cluster) rather than by time/name. */
+export const isEntityGroupBy = (groupBy: ImageGroupByMode): boolean =>
+  groupBy === 'model' || groupBy === 'cluster';
 
 export interface ImageGroup {
   id: string;
@@ -128,10 +136,13 @@ const flattenGroups = (
 
 const groupByDate = (images: IndexedImage[]): GroupedImagesResult => {
   const entries = new Map<string, IndexedImage[]>();
+  const date = new Date();
 
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
-    const key = formatLocalDateKey(image.lastModified);
+    // Optimization: Reuse a single Date object to avoid O(N) allocations in the grouping loop.
+    date.setTime(image.lastModified);
+    const key = formatLocalDateKey(date);
     const bucket = entries.get(key);
     if (bucket) {
       bucket.push(image);
@@ -157,7 +168,8 @@ const groupByDate = (images: IndexedImage[]): GroupedImagesResult => {
 
 const getNameGroupKey = (name: string): string => {
   const first = name.trim().charAt(0).toUpperCase();
-  return /^[A-Z]$/.test(first) ? first : '#';
+  // Optimization: Direct character range check is significantly faster than regex in hot loops.
+  return first >= 'A' && first <= 'Z' ? first : '#';
 };
 
 const groupByName = (images: IndexedImage[]): GroupedImagesResult => {
@@ -251,6 +263,63 @@ const groupBySession = (images: IndexedImage[], options: ImageGroupingOptions = 
   return flattenGroups(groupedEntries);
 };
 
+const getModelGroupKey = (image: IndexedImage): string => {
+  const models = image.models;
+  if (models) {
+    for (let i = 0; i < models.length; i++) {
+      const normalized = typeof models[i] === 'string' ? models[i].trim() : '';
+      if (normalized) {
+        return normalized;
+      }
+    }
+  }
+  return 'Unknown model';
+};
+
+// Buckets images by an entity key, then orders the sections by size (desc) so the
+// biggest models/clusters lead. Membership is 1:1 (an image lands in a single section).
+const groupByEntity = (
+  images: IndexedImage[],
+  keyFor: (image: IndexedImage) => { key: string; label: string },
+  idPrefix: string,
+): GroupedImagesResult => {
+  const entries = new Map<string, { label: string; images: IndexedImage[] }>();
+
+  for (let i = 0; i < images.length; i++) {
+    const image = images[i];
+    const { key, label } = keyFor(image);
+    const bucket = entries.get(key);
+    if (bucket) {
+      bucket.images.push(image);
+    } else {
+      entries.set(key, { label, images: [image] });
+    }
+  }
+
+  const groupedEntries = Array.from(entries.entries())
+    .map(([key, entry]) => ({
+      group: makeGroup(`${idPrefix}-${key}`, entry.label, entry.images),
+      images: entry.images,
+    }))
+    .sort((a, b) => b.images.length - a.images.length || collator.compare(a.group.label, b.group.label));
+
+  return flattenGroups(groupedEntries);
+};
+
+const groupByModel = (images: IndexedImage[]): GroupedImagesResult =>
+  groupByEntity(images, (image) => {
+    const key = getModelGroupKey(image);
+    return { key, label: key };
+  }, 'model');
+
+const groupByCluster = (images: IndexedImage[], options: ImageGroupingOptions): GroupedImagesResult => {
+  const clusterByImageId = options.clusterByImageId ?? new Map();
+  return groupByEntity(images, (image) => {
+    const cluster = clusterByImageId.get(image.id);
+    return cluster ? { key: cluster.id, label: cluster.label } : { key: '__none__', label: 'No cluster' };
+  }, 'cluster');
+};
+
 export const groupImages = (
   images: IndexedImage[],
   groupBy: ImageGroupByMode,
@@ -269,6 +338,14 @@ export const groupImages = (
 
   if (groupBy === 'name') {
     return groupByName(images);
+  }
+
+  if (groupBy === 'model') {
+    return groupByModel(images);
+  }
+
+  if (groupBy === 'cluster') {
+    return groupByCluster(images, options);
   }
 
   return groupBySession(images, options);

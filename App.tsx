@@ -1,11 +1,16 @@
-import React, { startTransition, useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { startTransition, useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useDeferredValue } from 'react';
+import { flushSync } from 'react-dom';
 import { useImageStore } from './store/useImageStore';
 import { useSettingsStore } from './store/useSettingsStore';
+import { useSemanticStore } from './store/useSemanticStore';
 import { useLicenseStore } from './store/useLicenseStore';
+import { initializeSavedPromptSynchronization } from './store/useSavedPromptStore';
 import { useImageLoader } from './hooks/useImageLoader';
 import { useImageSelection } from './hooks/useImageSelection';
+import { useClusterCacheRestore } from './hooks/useClusterCacheRestore';
 import { useHotkeys } from './hooks/useHotkeys';
 import { useFeatureAccess } from './hooks/useFeatureAccess';
+import { useTrialExpiryWatcher } from './hooks/useTrialExpiryWatcher';
 import { Directory } from './types';
 import { Image as ImageIcon, X, Search } from 'lucide-react';
 
@@ -17,6 +22,8 @@ import BrowserCompatibilityWarning from './components/BrowserCompatibilityWarnin
 import Header from './components/Header';
 import Toast from './components/Toast';
 import SettingsModal from './components/SettingsModal';
+import { OPEN_VISUAL_SEARCH_SETTINGS_EVENT } from './components/SemanticSearchBar';
+import VisualSearchOnboarding from './components/VisualSearchOnboarding';
 import ChangelogModal from './components/ChangelogModal';
 import UpdateNotificationModal, { type UpdateNotificationStatus } from './components/UpdateNotificationModal';
 import ComparisonModal from './components/ComparisonModal';
@@ -30,14 +37,15 @@ import CommandPalette from './components/CommandPalette';
 import HotkeyHelp from './components/HotkeyHelp';
 import Analytics from './components/Analytics';
 import ProOnlyModal from './components/ProOnlyModal';
-import SmartLibrary from './components/SmartLibrary';
-import { ModelView } from './components/ModelView';
-import NodeView from './components/NodeView';
+import TrialExpiredBanner from './components/TrialExpiredBanner';
+import ExploreWorkspace from './components/ExploreWorkspace';
+import { buildWorkflowNodeCatalog, filterImagesByWorkflowNodes } from './services/comfyUIWorkflowNodes';
 import FindSimilarModal from './components/FindSimilarModal';
 import ModelPromptPickerModal from './components/ModelPromptPickerModal';
 import CollectionsWorkspace from './components/CollectionsWorkspace';
 import ComfyUIWorkspace from './components/ComfyUIWorkspace';
 import ImageEditorWorkspace from './components/ImageEditorWorkspace';
+import PromptLibrary from './components/PromptLibrary';
 import GridToolbar from './components/GridToolbar';
 import AnalyticsSummaryStrip from './components/AnalyticsSummaryStrip';
 import BatchExportModal from './components/BatchExportModal';
@@ -46,6 +54,7 @@ import { useA1111ProgressContext } from './contexts/A1111ProgressContext';
 import { useGenerationQueueSync } from './hooks/useGenerationQueueSync';
 import { useGenerationQueueRunner } from './hooks/useGenerationQueueRunner';
 import { useComfyUIQueueMonitor } from './hooks/useComfyUIQueueMonitor';
+import { useComfyUIEmbeddedProgress } from './hooks/useComfyUIEmbeddedProgress';
 import {
   beginPerformanceFlow,
   createProfilerOnRender,
@@ -59,12 +68,14 @@ import { A1111GenerateModal, type GenerationParams as A1111GenerationParams } fr
 import { ComfyUIGenerateModal, type GenerationParams as ComfyUIGenerationParams } from './components/ComfyUIGenerateModal';
 import { useGenerateWithA1111 } from './hooks/useGenerateWithA1111';
 import { useGenerateWithComfyUI } from './hooks/useGenerateWithComfyUI';
-import { type IndexedImage, type BaseMetadata, type SimilarSearchCriteria, type UpdateDownloadProgress, type UpdateNotificationPayload } from './types';
+import { type IndexedImage, type BaseMetadata, type SimilarSearchCriteria, type UpdateDownloadProgress, type UpdateNotificationPayload, type ExploreDimension } from './types';
 import { type SettingsFocusSection, type SettingsTab, type SettingsTabInput, resolveSettingsTab } from './components/settings/types';
 import { buildSlideshowPlaylist } from './utils/slideshowPlaylist';
 import { getModelPromptOverlapGroups, type ModelPromptOverlapGroup } from './services/similarImageSearch';
 import { resolveWatchedRemovalIdsForDirectory, type WatchedFilesRemovedPayload } from './utils/watcherRemovalUtils';
-import { groupImages, type ImageGroup, type ImageGroupingSortOrder } from './utils/imageGrouping';
+import { groupImages, isEntityGroupBy, type ImageGroup, type ImageGroupingSortOrder } from './utils/imageGrouping';
+import { limitClustersForAccess } from './utils/smartLibraryClusterState';
+import { resolveScopeImageIds } from './utils/imageScope';
 import { findLatestCreatorAttributionToken } from './utils/creatorAttribution';
 import { indexImageFileAtPath } from './services/fileIndexer';
 import {
@@ -73,12 +84,33 @@ import {
   normalizeFilesystemPath,
 } from './utils/filesystemPath';
 import { waitForDirectoryActivityToSettle } from './utils/directoryActivity';
+import { resolveMediaType } from './utils/mediaTypes.js';
+import { resolveNavigationAfterDeletion } from './utils/viewerNavigation';
+import { FileOperations } from './services/fileOperations';
+import { renameIndexedImage } from './services/imageRenameService';
+import { useReparseMetadata } from './hooks/useReparseMetadata';
+import {
+  indexSavedEditedImageCopy,
+  reindexOverwrittenEditedImage,
+} from './services/editedImageIndexing';
+import {
+  fromImageViewerMaskFileDTO,
+  resolveEffectiveImageViewerHost,
+  toImageModalImageDTO,
+  type DetachedImageViewerStatus,
+  type ImageViewerCommand,
+  type ImageViewerNavigationSource,
+  type ImageViewerSnapshot,
+} from './services/imageViewerContracts';
 
 interface OpenImageModalState {
+  sessionId: string;
   modalId: string;
   imageId: string;
   navigationImageIds: string[];
-  navigationSource: 'filtered' | 'cluster' | 'scope' | 'slideshow' | 'comfyui' | 'find-similar';
+  navigationSource: ImageViewerNavigationSource;
+  host: 'inline' | 'detached';
+  nativeStatus?: DetachedImageViewerStatus;
   zIndex: number;
   initialWindowOffset: number;
   isMinimized: boolean;
@@ -143,6 +175,21 @@ interface PendingWatchedRemovalCacheDelta {
 }
 
 const getImageTimestamp = (image: IndexedImage): number => image.contentModifiedMs ?? image.lastModified ?? 0;
+
+const getDetectedMediaLabel = (
+  files: Array<{ name: string; type: string }>,
+): string => {
+  const mediaTypes = new Set(files.map((file) => resolveMediaType(file.name, file.type)));
+  const plural = files.length !== 1;
+
+  if (mediaTypes.size !== 1) return plural ? 'media files' : 'media file';
+  switch (mediaTypes.values().next().value) {
+    case 'model3d': return plural ? '3D models' : '3D model';
+    case 'video': return plural ? 'videos' : 'video';
+    case 'audio': return plural ? 'audio files' : 'audio file';
+    default: return plural ? 'images' : 'image';
+  }
+};
 
 const areStringArraysEqual = (left: string[] | null, right: string[]): boolean =>
   Array.isArray(left) &&
@@ -224,10 +271,14 @@ export default function App() {
   const { progressState: a1111Progress } = useA1111ProgressContext();
   useGenerationQueueSync();
   useComfyUIQueueMonitor();
+  useComfyUIEmbeddedProgress();
+
+  useEffect(() => initializeSavedPromptSynchronization(), []);
 
   // --- Hooks ---
   const { handleSelectFolder, handleUpdateFolder, handleLoadFromStorage, handleRemoveDirectory, loadDirectory, processNewWatchedFiles } = useImageLoader();
   const { handleImageSelection, handleDeleteSelectedImages } = useImageSelection();
+  useClusterCacheRestore();
   const { generateWithA1111, isGenerating: isGeneratingA1111 } = useGenerateWithA1111();
   const { generateWithComfyUI, isGenerating: isGeneratingComfyUI } = useGenerateWithComfyUI();
 
@@ -243,8 +294,13 @@ export default function App() {
   const selectedImage = useImageStore((state) => state.selectedImage);
   const previewImage = useImageStore((state) => state.previewImage);
   const clustersCount = useImageStore((state) => state.clusters.length);
+  const clusters = useImageStore((state) => state.clusters);
   const clusterNavigationContext = useImageStore((state) => state.clusterNavigationContext);
   const activeImageScope = useImageStore((state) => state.activeImageScope);
+  const validateActiveImageScope = useImageStore((state) => state.validateActiveImageScope);
+  const setExploreDimension = useImageStore((state) => state.setExploreDimension);
+  const selectedNodes = useImageStore((state) => state.selectedNodes);
+  const setSelectedNodes = useImageStore((state) => state.setSelectedNodes);
   const collections = useImageStore((state) => state.collections);
   const activeCollectionId = useImageStore((state) => state.activeCollectionId);
 
@@ -259,6 +315,7 @@ export default function App() {
   const error = useImageStore((state) => state.error);
   const success = useImageStore((state) => state.success);
   const transferProgress = useImageStore((state) => state.transferProgress);
+  const lineageLastBuiltAt = useImageStore((state) => state.lineageBuildState.lastBuiltAt);
 
   // Filter state selectors
   const searchQuery = useImageStore((state) => state.searchQuery);
@@ -346,7 +403,17 @@ export default function App() {
   const safeImages = useMemo(() => Array.isArray(images) ? images : [], [images]);
   const safeFilteredImages = useMemo(() => Array.isArray(filteredImages) ? filteredImages : [], [filteredImages]);
   const safeClusterNavigationContext = useMemo(() => Array.isArray(clusterNavigationContext) ? clusterNavigationContext : [], [clusterNavigationContext]);
-  const safeActiveImageScope = useMemo(() => Array.isArray(activeImageScope) ? activeImageScope : null, [activeImageScope]);
+  // activeImageScope is a descriptor now; resolve it to the displayed scoped image set
+  // (filtered ∩ node filter ∩ scope) so modal Next/Previous stays within the drill-in.
+  const safeActiveImageScope = useMemo(() => {
+    if (!activeImageScope) return null;
+    const resolved = resolveScopeImageIds(activeImageScope, { images: safeImages, clusters, collections });
+    if (!resolved) return null;
+    const base = selectedNodes.length > 0
+      ? filterImagesByWorkflowNodes(safeFilteredImages, selectedNodes)
+      : safeFilteredImages;
+    return base.filter((image) => resolved.ids.has(image.id));
+  }, [activeImageScope, safeImages, clusters, collections, safeFilteredImages, selectedNodes]);
   const safeCollections = useMemo(() => Array.isArray(collections) ? collections : [], [collections]);
   const safeDirectories = useMemo(() => Array.isArray(directories) ? directories : [], [directories]);
   const safeSelectedImages = selectedImages instanceof Set ? selectedImages : new Set<string>();
@@ -390,11 +457,13 @@ export default function App() {
     setGroupBy,
     theme,
     setLastViewedVersion,
+    setHasSeenExploreOnboarding,
     globalAutoWatch,
     generatorLaunchCommand,
     comfyUIWorkspaceAutoOpenSelectedImage,
     creatorAttributionToken,
     setCreatorAttributionToken,
+    imageViewerMode,
   } = useSettingsStore();
 
   useEffect(() => {
@@ -406,7 +475,6 @@ export default function App() {
 
   // --- Local UI State ---
   const [currentPage, setCurrentPage] = useState(1);
-  const [modelViewPage, setModelViewPage] = useState(1);
   const [pendingJumpGroupRequest, setPendingJumpGroupRequest] = useState<{ groupId: string; requestId: number } | null>(null);
   const [searchInputValue, setSearchInputValue] = useState(searchQuery);
   const previousSearchQueryRef = useRef(searchQuery);
@@ -479,9 +547,7 @@ export default function App() {
   const [isAnalyticsOpen, setIsAnalyticsOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState<string>('0.10.0');
   const [isQueueOpen, setIsQueueOpen] = useState(false);
-  const [libraryView, setLibraryView] = useState<'library' | 'smart' | 'model' | 'node' | 'collections' | 'comfyui' | 'editor'>('library');
-  const [nodeViewVisibleImages, setNodeViewVisibleImages] = useState<IndexedImage[]>([]);
-  const [nodeViewResultImages, setNodeViewResultImages] = useState<IndexedImage[]>([]);
+  const [libraryView, setLibraryView] = useState<'library' | 'prompts' | 'explore' | 'collections' | 'comfyui' | 'editor'>('library');
   const [isA1111GenerateModalOpen, setIsA1111GenerateModalOpen] = useState(false);
   const [isComfyUIGenerateModalOpen, setIsComfyUIGenerateModalOpen] = useState(false);
   const [selectedImageForGeneration, setSelectedImageForGeneration] = useState<IndexedImage | null>(null);
@@ -504,6 +570,7 @@ export default function App() {
   const [isSaveFilteredCollectionModalOpen, setIsSaveFilteredCollectionModalOpen] = useState(false);
   const [openImageModals, setOpenImageModals] = useState<OpenImageModalState[]>([]);
   const [activeImageModalId, setActiveImageModalId] = useState<string | null>(null);
+  const comfyUIWorkspaceModalIdRef = useRef<string | null>(null);
   const [findSimilarState, setFindSimilarState] = useState<FindSimilarState | null>(null);
   const [findSimilarGridFilter, setFindSimilarGridFilter] = useState<FindSimilarGridFilterState | null>(null);
   const [modelPromptPickerState, setModelPromptPickerState] = useState<{
@@ -520,11 +587,31 @@ export default function App() {
   const suppressSelectedImageModalOpenRef = useRef<string | null>(null);
   const watchedRemovalCacheDeltaQueueRef = useRef<Map<string, PendingWatchedRemovalCacheDelta>>(new Map());
   const startupHydrationPromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const [isStartupHydrating, setIsStartupHydrating] = useState(true);
   const appProfilerOnRender = useMemo(() => createProfilerOnRender('App'), []);
+  const resolveViewerHost = useCallback(
+    () => resolveEffectiveImageViewerHost(imageViewerMode, Boolean(window.electronAPI?.imageViewerOpen)),
+    [imageViewerMode]
+  );
+  const viewerSettingsSyncToken = useSettingsStore((state) => JSON.stringify({
+    theme: state.theme,
+    enableAnimations: state.enableAnimations,
+    slideshowIntervalSeconds: state.slideshowIntervalSeconds,
+    slideshowShowFilename: state.slideshowShowFilename,
+    autoPlayMedia: state.autoPlayMedia,
+    videoRepeatMode: state.videoRepeatMode,
+    videoShuffle: state.videoShuffle,
+    tagSuggestionLimit: state.tagSuggestionLimit,
+    recentTagChipLimit: state.recentTagChipLimit,
+    a1111Enabled: state.a1111Enabled,
+    comfyUIEnabled: state.comfyUIEnabled,
+  }));
+  const viewerLicenseSyncToken = useLicenseStore((state) => `${state.initialized}:${state.licenseStatus}:${state.trialActivated}:${state.trialStartDate ?? ''}`);
 
   const queueCount = useGenerationQueueStore((state) =>
     state.items.filter((item) => item.status === 'waiting' || item.status === 'processing').length
   );
+  const { reparseImages: reparseViewerImages } = useReparseMetadata();
 
   const resetLibraryGridScrollPosition = useCallback(() => {
     libraryGridScrollTopRef.current = 0;
@@ -567,6 +654,8 @@ export default function App() {
     setFavoriteFilterMode('neutral');
     setSelectedRatings([]);
     setAdvancedFilters({});
+    setSelectedNodes([]);
+    setActiveImageScope(null);
   }, [
     setAdvancedFilters,
     setExcludedAutoTags,
@@ -579,6 +668,8 @@ export default function App() {
     setSelectedFilters,
     setSelectedRatings,
     setSelectedTags,
+    setSelectedNodes,
+    setActiveImageScope,
   ]);
 
   const handleSearchChange = useCallback((query: string) => {
@@ -610,19 +701,23 @@ export default function App() {
     })
   ), []);
 
+  // Scope is a persistent, view-independent drill-in (it renders as a fixed chip in
+  // ActiveFilters), so it is no longer cleared on view changes. Instead, when the scope's
+  // target vanishes (deleted collection, regenerated cluster, missing model after re-index),
+  // it is auto-cleared with a toast. See useImageStore.validateActiveImageScope / D9.
   useEffect(() => {
-    if (libraryView !== 'node' && libraryView !== 'collections' && activeImageScope !== null) {
-      setActiveImageScope(null);
+    if (activeImageScope !== null) {
+      validateActiveImageScope();
     }
-  }, [activeImageScope, libraryView, setActiveImageScope]);
+  }, [activeImageScope, clusters, collections, safeImages, validateActiveImageScope]);
 
-  useEffect(() => {
-    if (libraryView !== 'node' && nodeViewResultImages.length > 0) {
-      setNodeViewResultImages([]);
-    }
-  }, [libraryView, nodeViewResultImages.length]);
-  const hasLeftSidebar = hasDirectories && libraryView !== 'comfyui' && libraryView !== 'editor';
-  const hasRightSidebar = Boolean(isQueueOpen || (previewImage && libraryView !== 'comfyui' && libraryView !== 'editor'));
+  const hasLeftSidebar = hasDirectories && !['prompts', 'comfyui', 'editor'].includes(libraryView);
+  const hasRightSidebar = Boolean(isQueueOpen || (previewImage && !['prompts', 'comfyui', 'editor'].includes(libraryView)));
+  const previousHasRightSidebarRef = useRef(hasRightSidebar);
+  const rightSidebarVisibilityChanged = previousHasRightSidebarRef.current !== hasRightSidebar;
+  useLayoutEffect(() => {
+    previousHasRightSidebarRef.current = hasRightSidebar;
+  }, [hasRightSidebar]);
   const { leftWidth: sidebarWidth, rightWidth: rightSidebarWidth } = useMemo(
     () =>
       resolveSidebarWidths({
@@ -680,6 +775,10 @@ export default function App() {
     setIsHotkeyHelpOpen,
     isSettingsModalOpen,
     setIsSettingsModalOpen,
+    onNavigateToExplore: (dimension) => {
+      setExploreDimension(dimension);
+      setLibraryView('explore');
+    },
   });
 
   // --- License/Trial Hook ---
@@ -696,6 +795,7 @@ export default function App() {
     canUseAnalytics,
     canUseBatchExport,
     canUseImageEditor,
+    canUseFullClustering,
     showProModal,
     startTrial,
   } = useFeatureAccess();
@@ -710,6 +810,25 @@ export default function App() {
     setIsHotkeyHelpOpen(false);
     handleOpenSettings('shortcuts');
   };
+
+  // The visual-search toggle (deep in the sidebar) asks to open Settings for
+  // model setup via a window event, avoiding threading a callback down to it.
+  useEffect(() => {
+    const openVisualSearchSettings = () => handleOpenSettings('visual-search');
+    window.addEventListener(OPEN_VISUAL_SEARCH_SETTINGS_EVENT, openVisualSearchSettings);
+    return () => window.removeEventListener(OPEN_VISUAL_SEARCH_SETTINGS_EVENT, openVisualSearchSettings);
+  }, []);
+
+  // Visual "find similar": reuses the relevance ranking pipeline rather than the
+  // metadata-based FindSimilarModal, so it works on images with no prompt.
+  const semanticSearchEnabled = useSettingsStore((s) => s.semanticSearchEnabled);
+  const semanticModelInstalled = useSemanticStore((s) => s.modelInstalled);
+  const runVisualSimilar = useSemanticStore((s) => s.runVisualSimilar);
+  const semanticSimilarSourceName = useSemanticStore((s) => s.similarSourceName);
+  const semanticQueryRunning = useSemanticStore((s) => s.queryRunning);
+  const semanticResultCount = useSemanticStore((s) => s.queryResultCount);
+  const clearSemanticQuery = useSemanticStore((s) => s.clearQuery);
+  const canFindVisuallySimilar = semanticSearchEnabled && semanticModelInstalled;
 
   const handleOpenLicenseSettings = () => {
     handleOpenSettings('license', 'license');
@@ -791,6 +910,9 @@ export default function App() {
 
     initializeLicense();
   }, []);
+
+  // Flip the status the moment the trial lapses, without waiting for a restart.
+  useTrialExpiryWatcher();
 
   // --- Effects ---
   useEffect(() => {
@@ -1026,8 +1148,12 @@ export default function App() {
 
   // On mount, load directories stored in localStorage
   useEffect(() => {
-    // Only run once on mount
-    startupHydrationPromiseRef.current = handleLoadFromStorage();
+    const hydration = handleLoadFromStorage();
+    startupHydrationPromiseRef.current = hydration;
+    void hydration.then(
+      () => setIsStartupHydrating(false),
+      () => setIsStartupHydrating(false),
+    );
   }, []);
 
   // Listen for directory load events from the main process (e.g., from CLI argument)
@@ -1095,18 +1221,16 @@ export default function App() {
     void (async () => {
       await waitForDirectoryActivityToSettle(pending.directory.id);
       const activeScanSubfolders = useImageStore.getState().scanSubfolders;
-      const cacheModes = Array.from(new Set([activeScanSubfolders, !activeScanSubfolders]));
 
-      for (const scanSubfoldersMode of cacheModes) {
-        await cacheManager.applyChunkedCacheDelta(
-          pending.directory.path,
-          pending.directory.name,
-          [],
-          removedIds,
-          removedNames,
-          scanSubfoldersMode,
-        );
-      }
+      // removeCachedImages already covers both scan-mode variants internally
+      // and only rewrites the chunk(s) that actually hold the removed ids.
+      await cacheManager.removeCachedImages(
+        pending.directory.path,
+        pending.directory.name,
+        removedIds,
+        removedNames,
+        activeScanSubfolders,
+      );
     })().catch((error) => {
       console.error('Failed to update cache after watched file removal:', error);
     });
@@ -1177,7 +1301,7 @@ export default function App() {
 
       // Show toast notification
       setNewImagesToast({
-        message: `${files.length} new image${files.length !== 1 ? 's' : ''} detected in ${directory.name}`,
+        message: `${files.length} new ${getDetectedMediaLabel(files)} detected in ${directory.name}`,
       });
 
       // Processar novos arquivos usando a função do useImageLoader
@@ -1228,7 +1352,9 @@ export default function App() {
   }, [directories, excludedFolders, includeSubfolders, processNewWatchedFiles, resetLibraryGridScrollPosition, selectedFolders, sortOrder]);
 
   useEffect(() => {
-    if (sortOrder === 'random' && groupBy !== 'none') {
+    // Grouping has no meaning under an ordering with no stable buckets: random
+    // and relevance both order by a per-image key rather than a facet.
+    if ((sortOrder === 'random' || sortOrder === 'relevance') && groupBy !== 'none') {
       setGroupBy('none');
     }
   }, [groupBy, setGroupBy, sortOrder]);
@@ -1242,35 +1368,50 @@ export default function App() {
 
       const { removedIds, removedNames } = resolveWatchedRemovalIds(directory, data);
       if (removedIds.length === 0 && removedNames.length === 0) {
+        // Nothing currently indexed matches these paths and there's nothing
+        // name-based to prune either — this watcher event is just the
+        // filesystem catching up with a delete the app already handled itself
+        // (see useImageSelection's handleDeleteSelectedImages, which removes
+        // locally and patches the cache by id immediately). Skip entirely.
         return;
       }
 
-      if (removedIds.length > 0) {
-        removeImages(removedIds);
-        const removedIdSet = new Set(removedIds);
-        setOpenImageModals((current) =>
-          current.flatMap((modal) => {
-            const navigationImageIds = modal.navigationImageIds.filter((id) => !removedIdSet.has(id));
-            if (removedIdSet.has(modal.imageId)) {
-              return [];
-            }
-            return [{ ...modal, navigationImageIds }];
-          })
-        );
-
-        useImageStore.setState((state) => ({
-          selectedImages: new Set(Array.from(state.selectedImages).filter((id) => !removedIdSet.has(id))),
-          previewImage: state.previewImage && removedIdSet.has(state.previewImage.id) ? null : state.previewImage,
-          selectedImage: state.selectedImage && removedIdSet.has(state.selectedImage.id) ? null : state.selectedImage,
-          comparisonImages: state.comparisonImages.filter((image) => !removedIdSet.has(image.id)),
-        }));
+      if (removedIds.length === 0) {
+        // No in-memory images matched (e.g. the active scan mode is flat but
+        // the watcher — which always watches recursively — saw a subfolder
+        // file removed). Nothing to remove from the store, but a stale
+        // recursive-mode cache on disk may still hold these entries by name,
+        // so still queue the name-based cache prune.
+        scheduleWatchedRemovalCacheDelta(directory, removedIds, removedNames);
+        setNewImagesToast({
+          message: `${removedNames.length} file${removedNames.length !== 1 ? 's' : ''} removed from ${directory.name}`,
+        });
+        return;
       }
+
+      removeImages(removedIds);
+      const removedIdSet = new Set(removedIds);
+      setOpenImageModals((current) =>
+        current.flatMap((modal) => {
+          const navigationImageIds = modal.navigationImageIds.filter((id) => !removedIdSet.has(id));
+          if (removedIdSet.has(modal.imageId)) {
+            return [];
+          }
+          return [{ ...modal, navigationImageIds }];
+        })
+      );
+
+      useImageStore.setState((state) => ({
+        selectedImages: new Set(Array.from(state.selectedImages).filter((id) => !removedIdSet.has(id))),
+        previewImage: state.previewImage && removedIdSet.has(state.previewImage.id) ? null : state.previewImage,
+        selectedImage: state.selectedImage && removedIdSet.has(state.selectedImage.id) ? null : state.selectedImage,
+        comparisonImages: state.comparisonImages.filter((image) => !removedIdSet.has(image.id)),
+      }));
 
       scheduleWatchedRemovalCacheDelta(directory, removedIds, removedNames);
 
-      const removedCount = Math.max(removedIds.length, removedNames.length);
       setNewImagesToast({
-        message: `${removedCount} file${removedCount !== 1 ? 's' : ''} removed from ${directory.name}`,
+        message: `${removedIds.length} file${removedIds.length !== 1 ? 's' : ''} removed from ${directory.name}`,
       });
     });
 
@@ -1428,6 +1569,16 @@ export default function App() {
           } catch (error) {
             console.warn('Failed to persist last viewed changelog version:', error);
           }
+        }
+
+        // Navigation-change onboarding: shown once ever to users updating from a previous
+        // version (not on a fresh install), gated by a dedicated flag so it never repeats on
+        // subsequent version bumps.
+        if (currentLastViewed && !useSettingsStore.getState().hasSeenExploreOnboarding) {
+          setHasSeenExploreOnboarding(true);
+          setSuccess(
+            'Navigation updated: Explore now unifies Model View, Smart Library and Collections, and drill-ins appear as a scope chip. Prefer the old tabs? Turn on Classic mode in Settings.',
+          );
         }
       }
     };
@@ -1773,10 +1924,13 @@ export default function App() {
       return [
         ...current,
         {
+          sessionId: selectedModalId,
           modalId: selectedModalId,
           imageId: selectedImage.id,
           navigationImageIds,
           navigationSource: navigationSourceType,
+          host: resolveViewerHost(),
+          nativeStatus: resolveViewerHost() === 'detached' ? 'pending' : undefined,
           zIndex: highestZIndex + 1,
           initialWindowOffset: current.length * 28,
           isMinimized: false,
@@ -1784,7 +1938,7 @@ export default function App() {
         },
       ];
     });
-  }, [beginModalOpenFlow, clusterNavigationContext, openImageModals, safeActiveImageScope, safeClusterNavigationContext, safeFilteredImages, selectedImage]);
+  }, [beginModalOpenFlow, clusterNavigationContext, openImageModals, resolveViewerHost, safeActiveImageScope, safeClusterNavigationContext, safeFilteredImages, selectedImage]);
 
   const filteredNavigationImageIds = useMemo(
     () => safeFilteredImages.map((image) => image.id),
@@ -1947,20 +2101,44 @@ export default function App() {
 
   // --- Memoized Callbacks for UI ---
   const handleImageDeleted = useCallback((imageId: string) => {
-    removeImage(imageId);
-    setOpenImageModals((current) => {
-      return current.flatMap((modal) => {
-        const navigationImageIds = modal.navigationImageIds.filter((id) => id !== imageId);
-        if (modal.imageId === imageId) {
-          return [];
-        }
-        return [{ ...modal, navigationImageIds }];
+    const navigationUpdates = new Map(openImageModals.map((modal) => [
+      modal.modalId,
+      resolveNavigationAfterDeletion(
+        resolveModalNavigationImageIds(modal),
+        imageId,
+        modal.navigationImageIds.filter((navigationImageId) => getImageByIdFromStore(navigationImageId)),
+      ),
+    ]));
+    const replacementModal = openImageModals.find((modal) =>
+      modal.imageId === imageId && modal.modalId === activeImageModalId
+    ) ?? openImageModals.find((modal) => modal.imageId === imageId);
+    const replacementId = replacementModal
+      ? navigationUpdates.get(replacementModal.modalId)?.nextImageId ?? null
+      : null;
+    const replacementImage = replacementId ? getImageByIdFromStore(replacementId) ?? null : null;
+
+    // Keep detached sessions alive while deleting their current image. If the
+    // store removes it first, reconciliation briefly sees no image for the
+    // session, closes the native window, then opens it again on the next item.
+    flushSync(() => {
+      setOpenImageModals((current) => {
+        return current.flatMap((modal) => {
+          const update = navigationUpdates.get(modal.modalId)
+            ?? resolveNavigationAfterDeletion(modal.navigationImageIds, imageId);
+          if (modal.imageId === imageId) {
+            return update.nextImageId
+              ? [{ ...modal, imageId: update.nextImageId, navigationImageIds: update.navigationImageIds }]
+              : [];
+          }
+          return [{ ...modal, navigationImageIds: update.navigationImageIds }];
+        });
       });
+      if (useImageStore.getState().selectedImage?.id === imageId) {
+        setSelectedImage(replacementImage);
+      }
     });
-    if (useImageStore.getState().selectedImage?.id === imageId) {
-      setSelectedImage(null);
-    }
-  }, [removeImage, setSelectedImage]);
+    removeImage(imageId);
+  }, [activeImageModalId, getImageByIdFromStore, openImageModals, removeImage, resolveModalNavigationImageIds, setSelectedImage]);
 
   const handleImageRenamed = useCallback((oldImageId: string, newImageId: string) => {
     if (oldImageId === newImageId) {
@@ -1977,6 +2155,10 @@ export default function App() {
   }, []);
 
   const handleActivateImageModal = useCallback((modalId: string) => {
+    const requestedModal = openImageModals.find((modal) => modal.modalId === modalId);
+    if (requestedModal?.host === 'detached') {
+      void window.electronAPI?.imageViewerWindowAction({ sessionId: requestedModal.sessionId, action: 'restore' });
+    }
     setOpenImageModals((current) => {
       const targetModal = current.find((modal) => modal.modalId === modalId);
       if (!targetModal) {
@@ -1985,7 +2167,9 @@ export default function App() {
 
       const nextZIndex = Math.max(...current.map((modal) => modal.zIndex)) + 1;
       return current.map((modal) =>
-        modal.modalId === modalId ? { ...modal, zIndex: nextZIndex, isMinimized: false } : modal
+        modal.modalId === modalId
+          ? { ...modal, zIndex: nextZIndex, isMinimized: false, nativeStatus: modal.host === 'detached' ? 'open' : modal.nativeStatus }
+          : modal
       );
     });
     setActiveImageModalId(modalId);
@@ -1998,11 +2182,20 @@ export default function App() {
   }, [getImageByIdFromStore, openImageModals, setSelectedImage]);
 
   const handleMinimizeImageModal = useCallback((modalId: string) => {
-    setOpenImageModals((current) =>
-      current.map((modal) =>
-        modal.modalId === modalId ? { ...modal, isMinimized: true } : modal
-      )
-    );
+    setOpenImageModals((current) => {
+      const target = current.find((modal) => modal.modalId === modalId);
+      // Native minimize events can arrive for a window we already consider
+      // minimized; returning the same array keeps the sync effect quiet.
+      if (!target || target.isMinimized) {
+        return current;
+      }
+
+      return current.map((modal) =>
+        modal.modalId === modalId
+          ? { ...modal, isMinimized: true, nativeStatus: modal.host === 'detached' ? 'minimized' : modal.nativeStatus }
+          : modal
+      );
+    });
   }, []);
 
   const handleImageModalWindowStateChange = useCallback((
@@ -2054,6 +2247,10 @@ export default function App() {
       return;
     }
 
+    // Detached sessions are closed by pruning them from state: the reconciliation
+    // pass then closes the OS window. Firing the IPC and waiting for the `closed`
+    // event instead would strand the footer entry whenever the window is not
+    // registered yet (or already gone without the event reaching us).
     handleCloseImageModal(targetModal.modalId, targetModal.imageId);
   }, [handleCloseImageModal, openImageModals]);
 
@@ -2065,7 +2262,11 @@ export default function App() {
     );
   }, []);
 
-  const handleImageModalNavigate = useCallback((modalId: string, direction: 'next' | 'previous') => {
+  const handleImageModalNavigate = useCallback((
+    modalId: string,
+    direction: 'next' | 'previous' | 'random',
+    options?: { wrap?: boolean }
+  ) => {
     const targetModal = openImageModals.find((modal) => modal.modalId === modalId);
     if (!targetModal) {
       return;
@@ -2078,10 +2279,31 @@ export default function App() {
       return;
     }
 
-    const nextImageId =
-      direction === 'next'
-        ? availableImageIds[currentIndex + 1]
-        : availableImageIds[currentIndex - 1];
+    const resolveNextIndex = () => {
+      const total = availableImageIds.length;
+
+      if (direction === 'random') {
+        if (total <= 1) {
+          return -1;
+        }
+
+        // Draw from the other entries only, so shuffle never replays the current item.
+        const offset = 1 + Math.floor(Math.random() * (total - 1));
+        return (currentIndex + offset) % total;
+      }
+
+      const step = direction === 'next' ? 1 : -1;
+      const rawIndex = currentIndex + step;
+
+      if (options?.wrap && total > 0) {
+        return (rawIndex + total) % total;
+      }
+
+      return rawIndex;
+    };
+
+    const nextIndex = resolveNextIndex();
+    const nextImageId = nextIndex >= 0 ? availableImageIds[nextIndex] : undefined;
 
     if (!nextImageId) {
       return;
@@ -2142,13 +2364,18 @@ export default function App() {
         });
       }
 
+      const modalId = `image-modal-${Date.now()}-${image.id}`;
+      const host = resolveViewerHost();
       return [
         ...current,
         {
-          modalId: `image-modal-${Date.now()}-${image.id}`,
+          sessionId: modalId,
+          modalId,
           imageId: image.id,
           navigationImageIds,
           navigationSource: navigationSourceType,
+          host,
+          nativeStatus: host === 'detached' ? 'minimized' : undefined,
           zIndex: nextZIndex,
           initialWindowOffset: current.length * 28,
           isMinimized: true,
@@ -2156,7 +2383,7 @@ export default function App() {
         },
       ];
     });
-  }, [beginModalOpenFlow, safeActiveImageScope, safeClusterNavigationContext, safeFilteredImages]);
+  }, [beginModalOpenFlow, resolveViewerHost, safeActiveImageScope, safeClusterNavigationContext, safeFilteredImages]);
 
   const handleOpenImageModalFromGeneratedOutput = useCallback((imageId: string) => {
     const image = getImageByIdFromStore(imageId);
@@ -2192,10 +2419,13 @@ export default function App() {
       return [
         ...current,
         {
+          sessionId: modalId,
           modalId,
           imageId: image.id,
           navigationImageIds,
           navigationSource: safeActiveImageScope ? 'scope' : 'filtered',
+          host: resolveViewerHost(),
+          nativeStatus: resolveViewerHost() === 'detached' ? 'pending' : undefined,
           zIndex: nextZIndex,
           initialWindowOffset: current.length * 28,
           isMinimized: false,
@@ -2206,11 +2436,12 @@ export default function App() {
 
     setActiveImageModalId(activeModalId);
     setSelectedImage(image);
-    if (libraryView === 'comfyui') {
+    const openingHost = existingModalForImage?.host ?? resolveViewerHost();
+    if (libraryView === 'comfyui' && openingHost === 'inline') {
       setLibraryView('library');
     }
     setGeneratedOutputPreview(null);
-  }, [beginModalOpenFlow, getImageByIdFromStore, libraryView, openImageModals, safeActiveImageScope, safeFilteredImages, setSelectedImage]);
+  }, [beginModalOpenFlow, getImageByIdFromStore, libraryView, openImageModals, resolveViewerHost, safeActiveImageScope, safeFilteredImages, setSelectedImage]);
 
   const resolveGeneratedOutputImageId = useCallback((output: GeneratedQueueOutput): string | undefined => {
     if (output.imageId && getImageByIdFromStore(output.imageId)) {
@@ -2344,13 +2575,16 @@ export default function App() {
   useEffect(() => {
     if (libraryView !== 'comfyui') {
       setComfyUIWorkspaceNavigationImageIds(null);
+      comfyUIWorkspaceModalIdRef.current = null;
       return;
     }
 
     setOpenImageModals((current) => {
       let changed = false;
       const next = current.map((modal) => {
-        if (modal.isMinimized) {
+        // Detached viewers are independent OS windows: they do not overlap the
+        // workspace, so switching views must leave them alone.
+        if (modal.isMinimized || modal.host === 'detached') {
           return modal;
         }
 
@@ -2370,7 +2604,9 @@ export default function App() {
     setOpenImageModals((current) => {
       let changed = false;
       const next = current.map((modal) => {
-        if (modal.isMinimized) {
+        // See the ComfyUI branch above: detached viewers are not part of the
+        // workspace layout and must keep their OS window state.
+        if (modal.isMinimized || modal.host === 'detached') {
           return modal;
         }
         changed = true;
@@ -2436,31 +2672,59 @@ export default function App() {
     return dirSet.size;
   }, [collectionFilteredImages]);
 
-  const handleNodeViewResultImagesChange = useCallback(
-    (images: IndexedImage[]) => {
-      setNodeViewResultImages(images);
-      setActiveImageScope(images);
-    },
-    [setActiveImageScope],
+  const findSimilarIdSet = useMemo(
+    () => (findSimilarGridFilter ? new Set(findSimilarGridFilter.imageIds) : null),
+    [findSimilarGridFilter],
   );
 
-  const findSimilarFilteredImages = useMemo(() => {
-    if (!findSimilarGridFilter) {
-      return null;
+  // ComfyUI workflow-node filter (OR), applied as a post-filter on the filtered library.
+  const nodeFilteredImages = useMemo(
+    () => (selectedNodes.length > 0 ? filterImagesByWorkflowNodes(safeFilteredImages, selectedNodes) : safeFilteredImages),
+    [safeFilteredImages, selectedNodes],
+  );
+
+  // Deferred: buildWorkflowNodeCatalog scans every image's workflowNodes and is
+  // only used to populate the node-filter dropdown, not the displayed grid, so
+  // it's safe to lag a render or two behind rapid library changes (auto-watch
+  // adds, bulk deletes) instead of recomputing synchronously on every one.
+  const deferredSafeImages = useDeferredValue(safeImages);
+  const availableNodeCatalog = useMemo(() => buildWorkflowNodeCatalog(deferredSafeImages), [deferredSafeImages]);
+  const availableNodes = useMemo(() => availableNodeCatalog.map((node) => node.name), [availableNodeCatalog]);
+  const nodeFacetCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const node of availableNodeCatalog) {
+      map.set(node.name, node.count);
     }
+    return map;
+  }, [availableNodeCatalog]);
 
-    const filteredIds = new Set(findSimilarGridFilter.imageIds);
-    return safeFilteredImages.filter((image) => filteredIds.has(image.id));
-  }, [findSimilarGridFilter, safeFilteredImages]);
+  // Resolve the active scope (model/cluster/collection) to the set of image IDs it targets.
+  const scopedImageIds = useMemo(() => {
+    const resolved = resolveScopeImageIds(activeImageScope, { images: safeImages, clusters, collections });
+    return resolved ? resolved.ids : null;
+  }, [activeImageScope, safeImages, clusters, collections]);
 
-  const displayImages =
-    libraryView === 'collections'
-      ? collectionFilteredImages
-      : libraryView === 'node'
-      ? nodeViewResultImages
-      : libraryView === 'library' && findSimilarFilteredImages
-      ? findSimilarFilteredImages
-      : safeFilteredImages;
+  // Displayed base: node filter, then scope. Find Similar layers on top so it always applies
+  // within an active scope instead of replacing it. Filters remain cumulative.
+  const scopedBaseImages = useMemo(
+    () => (activeImageScope && scopedImageIds
+      ? nodeFilteredImages.filter((image) => scopedImageIds.has(image.id))
+      : nodeFilteredImages),
+    [activeImageScope, scopedImageIds, nodeFilteredImages],
+  );
+
+  // Memoized so the grid (and paginatedImages / libraryGridSignature / currentImageGroups) get a
+  // stable array identity and don't re-render on every unrelated App render while a scope is active.
+  const displayImages = useMemo(
+    () =>
+      // Collections still owns its in-view display during coexistence (removed in a later phase).
+      libraryView === 'collections'
+        ? collectionFilteredImages
+        : libraryView === 'library' && findSimilarIdSet
+        ? scopedBaseImages.filter((image) => findSimilarIdSet.has(image.id))
+        : scopedBaseImages,
+    [libraryView, collectionFilteredImages, findSimilarIdSet, scopedBaseImages],
+  );
   const comfyUIWorkspaceSourceImages = comfyUIWorkspaceApplyLibraryFilters ? displayImages : safeImages;
 
   const libraryGridSignature = useMemo(() => {
@@ -2740,10 +3004,13 @@ export default function App() {
       return [
         ...current,
         {
+          sessionId: modalId,
           modalId,
           imageId: image.id,
           navigationImageIds,
           navigationSource: 'find-similar',
+          host: resolveViewerHost(),
+          nativeStatus: resolveViewerHost() === 'detached' ? 'pending' : undefined,
           zIndex: nextZIndex,
           initialWindowOffset: current.length * 28,
           isMinimized: false,
@@ -2755,7 +3022,7 @@ export default function App() {
     setActiveImageModalId(modalId);
     suppressSelectedImageModalOpenRef.current = image.id;
     setSelectedImage(image);
-  }, [beginModalOpenFlow, openImageModals, setSelectedImage]);
+  }, [beginModalOpenFlow, openImageModals, resolveViewerHost, setSelectedImage]);
 
   const openModelPromptPicker = useCallback((modelName: string) => {
     setModelPromptPickerState({
@@ -2773,7 +3040,7 @@ export default function App() {
     openFindSimilar(group.sourceImage, safeImages);
   }, [openFindSimilar, safeImages]);
 
-  const canSaveCurrentFilteredAsCollection = libraryView !== 'smart' && displayImages.length > 0;
+  const canSaveCurrentFilteredAsCollection = displayImages.length > 0;
   const comfyUIWorkspaceImage = useMemo(() => {
     if (comfyUIWorkspaceImageId) {
       return imageLookup.get(comfyUIWorkspaceImageId) ?? null;
@@ -2803,6 +3070,29 @@ export default function App() {
 
     return sortImagesNewestFirst(nextImages);
   }, [comfyUIWorkspaceImage, comfyUIWorkspaceNavigationImageIds, imageLookup]);
+  useEffect(() => {
+    if (libraryView !== 'comfyui' || !comfyUIWorkspaceModalIdRef.current) {
+      return;
+    }
+
+    const modalId = comfyUIWorkspaceModalIdRef.current;
+    const navigationImageIds = comfyUIWorkspaceNavigationImages.map((image) => image.id);
+    setOpenImageModals((current) => {
+      const targetModal = current.find((modal) => modal.modalId === modalId);
+      if (
+        !targetModal ||
+        targetModal.navigationSource !== 'comfyui' ||
+        !navigationImageIds.includes(targetModal.imageId) ||
+        areStringArraysEqual(targetModal.navigationImageIds, navigationImageIds)
+      ) {
+        return current;
+      }
+
+      return current.map((modal) =>
+        modal.modalId === modalId ? { ...modal, navigationImageIds } : modal
+      );
+    });
+  }, [comfyUIWorkspaceNavigationImages, libraryView]);
   const comfyUIWorkspaceCurrentIndex = useMemo(() => {
     if (!comfyUIWorkspaceImage) {
       return -1;
@@ -2830,9 +3120,50 @@ export default function App() {
   }, []);
   const handleComfyUIWorkspaceViewFullMetadata = useCallback((image: IndexedImage) => {
     setComfyUIWorkspaceImageId(image.id);
+    const navigationImageIds = comfyUIWorkspaceNavigationImages.length > 0
+      ? comfyUIWorkspaceNavigationImages.map((candidate) => candidate.id)
+      : [image.id];
+    const existing = openImageModals.find((modal) => modal.imageId === image.id);
+    if (existing) {
+      comfyUIWorkspaceModalIdRef.current = existing.modalId;
+      setOpenImageModals((current) =>
+        current.map((modal) =>
+          modal.modalId === existing.modalId
+            ? { ...modal, navigationImageIds, navigationSource: 'comfyui' }
+            : modal
+        )
+      );
+      handleActivateImageModal(existing.modalId);
+      return;
+    }
+
+    const modalId = `image-modal-${Date.now()}-${image.id}`;
+    comfyUIWorkspaceModalIdRef.current = modalId;
+    setOpenImageModals((current) => {
+      const highestZIndex = current.length > 0 ? Math.max(...current.map((modal) => modal.zIndex)) : 59;
+      const host = resolveViewerHost();
+      return [
+        ...current,
+        {
+          sessionId: modalId,
+          modalId,
+          imageId: image.id,
+          navigationImageIds,
+          navigationSource: 'comfyui',
+          host,
+          nativeStatus: host === 'detached' ? 'pending' : undefined,
+          zIndex: highestZIndex + 1,
+          initialWindowOffset: current.length * 28,
+          isMinimized: false,
+          diagnosticsFlowId: beginModalOpenFlow(image.id, 'comfyui-workspace'),
+        },
+      ];
+    });
+
+    setActiveImageModalId(modalId);
+    suppressSelectedImageModalOpenRef.current = image.id;
     setSelectedImage(image);
-    setLibraryView('library');
-  }, [setSelectedImage]);
+  }, [beginModalOpenFlow, comfyUIWorkspaceNavigationImages, handleActivateImageModal, openImageModals, resolveViewerHost, setSelectedImage]);
   const handleComfyUIWorkspaceNavigate = useCallback((direction: 'next' | 'previous') => {
     if (comfyUIWorkspaceCurrentIndex === -1) {
       return;
@@ -2911,10 +3242,13 @@ export default function App() {
       return [
         ...current,
         {
+          sessionId: slideshowModalId,
           modalId: slideshowModalId,
           imageId: firstImage.id,
           navigationImageIds,
           navigationSource: 'slideshow',
+          host: resolveViewerHost(),
+          nativeStatus: resolveViewerHost() === 'detached' ? 'pending' : undefined,
           zIndex: highestZIndex + 1,
           initialWindowOffset: current.length * 28,
           isMinimized: false,
@@ -2924,7 +3258,7 @@ export default function App() {
         },
       ];
     });
-  }, [beginModalOpenFlow, openImageModals, setError, setSelectedImage, slideshowPlaylistPreview.images]);
+  }, [beginModalOpenFlow, openImageModals, resolveViewerHost, setError, setSelectedImage, slideshowPlaylistPreview.images]);
 
   useEffect(() => {
     const scopedTotalPages = Math.ceil(displayImages.length / itemsPerPage);
@@ -2940,8 +3274,12 @@ export default function App() {
       return;
     }
 
-    setActiveImageScope(activeCollection ? collectionFilteredImages : null);
-  }, [activeCollection, collectionFilteredImages, libraryView, setActiveImageScope]);
+    // Selecting a collection sets it as the active scope (a descriptor), which persists as a
+    // fixed chip even after leaving the Collections view — the drill-in becomes the scope.
+    setActiveImageScope(
+      activeCollection ? { type: 'collection', id: activeCollection.id, label: activeCollection.name } : null,
+    );
+  }, [activeCollection, libraryView, setActiveImageScope]);
 
   // --- Render Logic ---
   const paginatedImages = useMemo(
@@ -2957,18 +3295,43 @@ export default function App() {
     libraryView === 'library' || (libraryView === 'collections' && Boolean(activeCollection));
   const effectiveImageGroupBy = canGroupCurrentImages && sortOrder !== 'random' ? groupBy : 'none';
   const imageGroupingSortOrder = sortOrder as ImageGroupingSortOrder;
+
+  // Group By model/cluster sections over the WHOLE filtered set (not the current page), so
+  // sections are never split across pages (D8). Pagination is suspended in that mode.
+  const isSectionedByEntity = isEntityGroupBy(effectiveImageGroupBy);
+  const imagesForGrid = isSectionedByEntity ? displayImages : paginatedImages;
+
+  const clusterByImageId = useMemo(() => {
+    if (effectiveImageGroupBy !== 'cluster') {
+      return undefined;
+    }
+    // Respect the free-tier cluster gating (same as Explore): locked-cluster images fall through
+    // to "No cluster" instead of exposing the organization the Pro lock hides.
+    const accessibleClusters = limitClustersForAccess(clusters, safeImages, canUseFullClustering);
+    const map = new Map<string, { id: string; label: string }>();
+    for (const cluster of accessibleClusters) {
+      const label = cluster.basePrompt || 'Untitled cluster';
+      for (const id of cluster.imageIds) {
+        if (!map.has(id)) {
+          map.set(id, { id: cluster.id, label });
+        }
+      }
+    }
+    return map;
+  }, [effectiveImageGroupBy, clusters, safeImages, canUseFullClustering]);
+
   const currentImageGroups = useMemo<ImageGroup[]>(
     () => effectiveImageGroupBy === 'none'
       ? []
-      : groupImages(paginatedImages, effectiveImageGroupBy, { sortOrder: imageGroupingSortOrder }).groups,
-    [effectiveImageGroupBy, imageGroupingSortOrder, paginatedImages]
+      : groupImages(imagesForGrid, effectiveImageGroupBy, { sortOrder: imageGroupingSortOrder, clusterByImageId }).groups,
+    [effectiveImageGroupBy, imageGroupingSortOrder, imagesForGrid, clusterByImageId]
   );
 
   useEffect(() => {
     setPendingJumpGroupRequest(null);
   }, [currentPage, effectiveImageGroupBy, viewMode]);
 
-  const totalPages = itemsPerPage === -1
+  const totalPages = isSectionedByEntity || itemsPerPage === -1
     ? 1
     : Math.ceil(displayImages.length / itemsPerPage);
   const openImageModalEntries = useMemo(() => {
@@ -2986,12 +3349,32 @@ export default function App() {
           return null;
         }
 
+        const resolvePrefetchNeighbor = (index: number) => {
+          if (index < 0 || index >= navigationImageIds.length) {
+            return null;
+          }
+
+          const neighborImage = getImageByIdFromStore(navigationImageIds[index]);
+          if (!neighborImage) {
+            return null;
+          }
+
+          const neighborDirectoryPath = directoryPathById.get(neighborImage.directoryId);
+          return neighborDirectoryPath
+            ? { image: neighborImage, directoryPath: neighborDirectoryPath }
+            : null;
+        };
+        const prefetchPrevious = currentIndex === -1 ? null : resolvePrefetchNeighbor(currentIndex - 1);
+        const prefetchNext = currentIndex === -1 ? null : resolvePrefetchNeighbor(currentIndex + 1);
+
         return {
           ...modal,
           image,
           directoryPath,
           currentIndex: currentIndex === -1 ? 0 : currentIndex,
           totalImages: navigationImageIds.length,
+          prefetchPrevious,
+          prefetchNext,
         };
       })
       .filter(Boolean) as Array<OpenImageModalState & {
@@ -2999,8 +3382,425 @@ export default function App() {
         directoryPath: string;
         currentIndex: number;
         totalImages: number;
+        prefetchPrevious: { image: IndexedImage; directoryPath: string } | null;
+        prefetchNext: { image: IndexedImage; directoryPath: string } | null;
       }>;
   }, [directoryPathById, getImageByIdFromStore, openImageModals, resolveModalNavigationImageIds, resolveModalNavigationIndex]);
+
+  const detachedViewerRevisionRef = useRef(new Map<string, number>());
+  const detachedViewerOpenedRef = useRef(new Set<string>());
+  const detachedViewerMinimizedRef = useRef(new Set<string>());
+
+  /**
+   * Drop every trace of a detached session. Sessions removed from the tracking set
+   * are what the reconciliation pass uses to decide which OS windows to close, so
+   * these three refs must always be cleared together.
+   */
+  const forgetDetachedViewerSession = useCallback((sessionId: string) => {
+    detachedViewerOpenedRef.current.delete(sessionId);
+    detachedViewerMinimizedRef.current.delete(sessionId);
+    detachedViewerRevisionRef.current.delete(sessionId);
+  }, []);
+
+  const buildDetachedViewerSnapshot = useCallback((modal: typeof openImageModalEntries[number]): ImageViewerSnapshot => {
+    const revision = (detachedViewerRevisionRef.current.get(modal.sessionId) ?? 0) + 1;
+    detachedViewerRevisionRef.current.set(modal.sessionId, revision);
+    const imageState = useImageStore.getState();
+    const resolvedLineage = imageState.lineageResolvedByImageId[modal.image.id];
+    const derivedIds = imageState.lineageDerivedIdsBySourceId[modal.image.id]?.slice(0, 4) || [];
+    const relatedImageIds = [resolvedLineage?.sourceImageId, ...derivedIds].filter(
+      (imageId): imageId is string => Boolean(imageId)
+    );
+    const imagesById = new Map(
+      [...imageState.images, ...imageState.filteredImages].map((candidate) => [candidate.id, candidate])
+    );
+    const lineageImages = relatedImageIds
+      .map((imageId) => imagesById.get(imageId))
+      .filter((candidate): candidate is IndexedImage => Boolean(candidate))
+      .map(toImageModalImageDTO);
+    return {
+      sessionId: modal.sessionId,
+      revision,
+      image: toImageModalImageDTO(modal.image),
+      previousImage: modal.prefetchPrevious ? toImageModalImageDTO(modal.prefetchPrevious.image) : null,
+      nextImage: modal.prefetchNext ? toImageModalImageDTO(modal.prefetchNext.image) : null,
+      previousDirectoryPath: modal.prefetchPrevious?.directoryPath ?? null,
+      nextDirectoryPath: modal.prefetchNext?.directoryPath ?? null,
+      currentIndex: modal.currentIndex,
+      totalImages: modal.totalImages,
+      directoryPath: modal.directoryPath,
+      isIndexing: Boolean(progress && progress.total > 0 && progress.current < progress.total),
+      startSlideshow: Boolean(modal.startSlideshow),
+      closeOnSlideshowExit: Boolean(modal.closeOnSlideshowExit),
+      recentTags: imageState.recentTags,
+      comparisonCount: imageState.comparisonImages.length,
+      comparisonImages: imageState.comparisonImages.map(toImageModalImageDTO),
+      collections: imageState.collections,
+      selectedImageIds: Array.from(selectedImages),
+      lineage: {
+        resolvedByImageId: resolvedLineage ? { [modal.image.id]: resolvedLineage } : {},
+        derivedIdsBySourceId: derivedIds.length > 0 ? { [modal.image.id]: derivedIds } : {},
+        images: lineageImages,
+      },
+    };
+  }, [lineageLastBuiltAt, progress, selectedImages, viewerLicenseSyncToken, viewerSettingsSyncToken]);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api?.imageViewerOpen || !api.imageViewerUpdate) return;
+
+    const liveDetachedSessions = new Set<string>();
+
+    for (const modal of openImageModalEntries) {
+      if (modal.host !== 'detached') continue;
+      liveDetachedSessions.add(modal.sessionId);
+
+      if (!detachedViewerOpenedRef.current.has(modal.sessionId)) {
+        // Sessions opened in the background stay dormant until the user activates
+        // them; popping an OS window unasked would defeat "open in background".
+        if (modal.isMinimized) continue;
+
+        const snapshot = buildDetachedViewerSnapshot(modal);
+        detachedViewerOpenedRef.current.add(modal.sessionId);
+        void api.imageViewerOpen({ sessionId: modal.sessionId, snapshot }).then((result) => {
+          if (result.success) {
+            // The session can be closed while the window is still being created,
+            // in which case the reconciliation pass ran too early to catch it.
+            if (!detachedViewerOpenedRef.current.has(modal.sessionId)) {
+              void api.imageViewerWindowAction({ sessionId: modal.sessionId, action: 'close' });
+              return;
+            }
+            setOpenImageModals((current) => current.map((entry) =>
+              entry.sessionId === modal.sessionId
+                ? { ...entry, nativeStatus: 'open', isMinimized: false }
+                : entry
+            ));
+            return;
+          }
+          forgetDetachedViewerSession(modal.sessionId);
+          setOpenImageModals((current) => current.map((entry) =>
+            entry.sessionId === modal.sessionId
+              ? { ...entry, host: 'inline', nativeStatus: undefined, isMinimized: false }
+              : entry
+          ));
+          setError(`Could not open a separate viewer window. Opened it inside Image MetaHub instead.${result.error ? ` ${result.error}` : ''}`);
+        });
+        continue;
+      }
+
+      void api.imageViewerUpdate({ sessionId: modal.sessionId, snapshot: buildDetachedViewerSnapshot(modal) });
+
+      // Mirror the logical minimized state onto the OS window, so state changes that
+      // do not go through the viewer itself (workspace switches, footer actions)
+      // cannot leave a window visible while the app believes it is minimized.
+      const wasMinimized = detachedViewerMinimizedRef.current.has(modal.sessionId);
+      if (modal.isMinimized && !wasMinimized) {
+        detachedViewerMinimizedRef.current.add(modal.sessionId);
+        void api.imageViewerWindowAction({ sessionId: modal.sessionId, action: 'minimize' });
+      } else if (!modal.isMinimized && wasMinimized) {
+        detachedViewerMinimizedRef.current.delete(modal.sessionId);
+        void api.imageViewerWindowAction({ sessionId: modal.sessionId, action: 'restore' });
+      }
+    }
+
+    // Any window whose session was pruned from state (image deleted, directory
+    // removed, footer close) has to be closed too, otherwise it lingers with a
+    // stale snapshot and every action it sends is rejected as an unknown session.
+    for (const sessionId of Array.from(detachedViewerOpenedRef.current)) {
+      if (liveDetachedSessions.has(sessionId)) continue;
+      forgetDetachedViewerSession(sessionId);
+      void api.imageViewerWindowAction({ sessionId, action: 'close' });
+    }
+  }, [buildDetachedViewerSnapshot, forgetDetachedViewerSession, openImageModalEntries, setError]);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api?.onImageViewerEvent) return;
+    return api.onImageViewerEvent((event) => {
+      const target = openImageModals.find((modal) => modal.sessionId === event.sessionId);
+      if (!target) return;
+      if (event.type === 'closed') {
+        forgetDetachedViewerSession(event.sessionId);
+        handleCloseImageModal(target.modalId, target.imageId);
+        return;
+      }
+      if (event.type === 'render-process-gone') {
+        forgetDetachedViewerSession(event.sessionId);
+        setOpenImageModals((current) => current.filter((modal) => modal.sessionId !== event.sessionId));
+        setError('The detached image viewer stopped unexpectedly. Reopen the image to continue.');
+        return;
+      }
+      if (event.type === 'load-failed') {
+        forgetDetachedViewerSession(event.sessionId);
+        setOpenImageModals((current) => current.map((modal) =>
+          modal.sessionId === event.sessionId
+            ? { ...modal, host: 'inline', nativeStatus: undefined, isMinimized: false }
+            : modal
+        ));
+        setError('Could not load the separate viewer window. Opened it inside Image MetaHub instead.');
+        return;
+      }
+      if (event.type === 'focus' || event.type === 'restore') {
+        handleActivateImageModal(target.modalId);
+      } else if (event.type === 'minimize') {
+        handleMinimizeImageModal(target.modalId);
+      }
+    });
+  }, [forgetDetachedViewerSession, handleActivateImageModal, handleCloseImageModal, handleMinimizeImageModal, openImageModals, setError]);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api?.onImageViewerCommand || !api.imageViewerRespond) return;
+    return api.onImageViewerCommand(({ sessionId, requestId, command }) => {
+      const respond = (response: { success: boolean; error?: string; [key: string]: unknown }) =>
+        api.imageViewerRespond({ requestId, response });
+      const session = openImageModals.find((modal) => modal.sessionId === sessionId && modal.host === 'detached');
+      if (!session) {
+        respond({ success: false, error: 'Unknown image viewer session.' });
+        return;
+      }
+
+      void (async () => {
+        const state = useImageStore.getState();
+        const resolveImage = (imageId: string) => state.images.find((image) => image.id === imageId);
+        const requireImage = (imageId: string) => {
+          const image = resolveImage(imageId);
+          if (!image) throw new Error('Image is no longer available in the library.');
+          return image;
+        };
+        const viewerCommand = command as ImageViewerCommand;
+        switch (viewerCommand.type) {
+          case 'start-trial': {
+            const activated = await useLicenseStore.getState().activateTrial();
+            if (!activated) {
+              throw new Error(useLicenseStore.getState().licenseMessage || 'The trial could not be started.');
+            }
+            break;
+          }
+          case 'navigate':
+            handleImageModalNavigate(session.modalId, viewerCommand.direction, { wrap: viewerCommand.wrap });
+            break;
+          case 'close':
+            await api.imageViewerWindowAction({ sessionId, action: 'close' });
+            break;
+          case 'focus-main':
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          case 'find-similar': {
+            const image = requireImage(viewerCommand.imageId);
+            openFindSimilar(image, resolveModalNavigationImages(session));
+            await api.imageViewerWindowAction({ sessionId, action: 'minimize' });
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          }
+          case 'open-comfyui': {
+            const image = requireImage(viewerCommand.imageId);
+            handleOpenComfyUIWorkflowFromImageModal(session.modalId, image, resolveModalNavigationImages(session));
+            await api.imageViewerWindowAction({ sessionId, action: 'close' });
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          }
+          case 'open-editor': {
+            const image = requireImage(viewerCommand.imageId);
+            handleOpenImageEditorFromImageModal(session.modalId, image, resolveModalNavigationImages(session));
+            await api.imageViewerWindowAction({ sessionId, action: 'close' });
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          }
+          case 'image-deleted':
+            requireImage(viewerCommand.imageId);
+            handleImageDeleted(viewerCommand.imageId);
+            break;
+          case 'image-renamed':
+            requireImage(viewerCommand.oldImageId);
+            state.renameImageRecord(viewerCommand.oldImageId, viewerCommand.newRelativePath);
+            handleImageRenamed(viewerCommand.oldImageId, viewerCommand.newImageId);
+            break;
+          case 'delete-image': {
+            const image = requireImage(viewerCommand.imageId);
+            const result = await FileOperations.deleteFile(image);
+            if (!result.success) throw new Error(result.error || 'Failed to delete image.');
+            handleImageDeleted(image.id);
+            respond({ success: true, handledNavigation: true });
+            return;
+          }
+          case 'rename-image': {
+            const image = requireImage(viewerCommand.imageId);
+            const result = await renameIndexedImage(image, viewerCommand.newName);
+            if (!result.success) throw new Error(result.error || 'Failed to rename image.');
+            handleImageRenamed(image.id, result.newImageId || image.id);
+            respond({
+              success: true,
+              newImageId: result.newImageId || image.id,
+              newRelativePath: result.newRelativePath || image.name,
+            });
+            return;
+          }
+          case 'reparse-image':
+            await reparseViewerImages([requireImage(viewerCommand.imageId)]);
+            break;
+          case 'add-comparison': {
+            const image = requireImage(viewerCommand.imageId);
+            const beforeCount = state.comparisonImages.length;
+            state.addImageToComparison(image);
+            if (beforeCount + 1 >= 2) {
+              state.openComparisonModal();
+              await api.imageViewerWindowAction({ sessionId, action: 'close' });
+              await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            }
+            break;
+          }
+          case 'add-to-collection': {
+            viewerCommand.imageIds.forEach(requireImage);
+            const collection = await state.addImagesToCollection(viewerCommand.collectionId, viewerCommand.imageIds);
+            respond({ success: true, collection });
+            return;
+          }
+          case 'create-collection': {
+            const collection = await state.createCollection(viewerCommand.collection as never);
+            respond({ success: true, collection });
+            return;
+          }
+          case 'generate': {
+            // Run the real hook here: the queue runner is mounted by App only, so a
+            // job enqueued inside the detached window would never be executed.
+            const request = viewerCommand.request;
+            const image = requireImage(request.imageId);
+            // The hooks report validation failures through their own status state,
+            // which the detached window cannot see. A job that never reached the
+            // queue is the observable signal that the request was rejected.
+            // Compare job identities, not the queue length: the queue is capped at
+            // MAX_ITEMS and drops its oldest entry, so a full queue keeps its size.
+            const queuedIdsBefore = new Set(useGenerationQueueStore.getState().items.map((item) => item.id));
+            if (request.provider === 'a1111') {
+              await generateWithA1111(image, request.customMetadata, request.numberOfImages);
+            } else {
+              await generateWithComfyUI(image, {
+                customMetadata: request.customMetadata,
+                overrides: request.overrides,
+                workflowMode: request.workflowMode,
+                sourceImagePolicy: request.sourceImagePolicy,
+                advancedPromptJson: request.advancedPromptJson,
+                advancedWorkflowJson: request.advancedWorkflowJson,
+                maskFile: fromImageViewerMaskFileDTO(request.maskFile),
+                directoryPath: image.directoryId ? directoryPathById.get(image.directoryId) : undefined,
+              });
+            }
+            const queued = useGenerationQueueStore.getState().items
+              .some((item) => !queuedIdsBefore.has(item.id));
+            if (!queued) {
+              throw new Error(
+                `Could not queue the ${request.provider === 'a1111' ? 'A1111' : 'ComfyUI'} job. Check the provider settings and the image metadata in Image MetaHub.`
+              );
+            }
+            break;
+          }
+          case 'open-batch-export': {
+            // The viewer cannot describe the export scope from its three-image
+            // slice, so the export runs here against the real library.
+            const image = requireImage(viewerCommand.imageId);
+            const selection = state.selectedImages;
+            openBatchExportModal({
+              imageIds: selection.has(image.id) ? Array.from(selection) : [image.id],
+              preferredSource: 'selected',
+            });
+            await api.imageViewerWindowAction({ sessionId, action: 'minimize' });
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          }
+          case 'image-saved': {
+            // The detached window wrote the file; the library store and the folder
+            // cache only exist here, so the bookkeeping runs against the real data.
+            const request = viewerCommand.request;
+            const sourceImage = requireImage(request.sourceImageId);
+            const sourceMetadata = request.sourceMetadata ?? undefined;
+            const scanSubfolders = useSettingsStore.getState().scanSubfolders;
+            const allDirectories = state.directories;
+
+            if (request.mode === 'overwrite') {
+              const sourceDirectory = allDirectories.find((directory) => directory.id === sourceImage.directoryId);
+              if (!sourceDirectory) throw new Error('The source directory is no longer available.');
+              await reindexOverwrittenEditedImage({
+                sourceImage,
+                sourceDirectory,
+                sourceMetadata,
+                scanSubfolders,
+                mergeImages: state.mergeImages,
+                setImageThumbnail: state.setImageThumbnail,
+              });
+              respond({ success: true });
+              return;
+            }
+
+            // Platform-aware matching: on a case-sensitive filesystem /library/A and
+            // /library/a are different roots, and picking the wrong one makes
+            // indexImageFileAtPath reject the path further down.
+            const targetDirectory = allDirectories.find((directory) =>
+              isFilesystemPathWithinDirectory(request.savedPath, directory.path)
+            );
+            if (!targetDirectory) {
+              // Saved outside every indexed folder: nothing to index, and that is fine.
+              respond({ success: true });
+              return;
+            }
+
+            const savedImage = await indexSavedEditedImageCopy({
+              savedPath: request.savedPath,
+              targetDirectory,
+              sourceImage,
+              sourceMetadata,
+              scanSubfolders,
+              allImages: state.images,
+              addImages: state.addImages,
+              mergeImages: state.mergeImages,
+            });
+            if (!savedImage) {
+              // Indexing rejected the path, so the image is not in the library:
+              // reporting success here would hide that from the viewer.
+              throw new Error('The image was saved, but it could not be added to the library.');
+            }
+            respond({ success: true, savedImageName: savedImage.name });
+            return;
+          }
+          case 'get-tag-suggestions': {
+            const query = viewerCommand.query.trim().toLowerCase();
+            const limit = useSettingsStore.getState().tagSuggestionLimit;
+            const suggestions = state.availableTags
+              .filter((tag) => !query || tag.name.toLowerCase().includes(query))
+              .slice(0, limit);
+            respond({ success: true, suggestions });
+            return;
+          }
+          case 'toggle-favorite':
+            await state.toggleFavorite(requireImage(viewerCommand.imageId).id);
+            break;
+          case 'set-rating':
+            await state.setImageRating(requireImage(viewerCommand.imageId).id, viewerCommand.rating);
+            break;
+          case 'add-tag':
+            await state.addTagToImage(requireImage(viewerCommand.imageId).id, viewerCommand.tag);
+            break;
+          case 'remove-tag':
+            await state.removeTagFromImage(requireImage(viewerCommand.imageId).id, viewerCommand.tag);
+            break;
+          case 'remove-auto-tag':
+            state.removeAutoTagFromImage(requireImage(viewerCommand.imageId).id, viewerCommand.tag);
+            break;
+          case 'set-search':
+            state.setSearchQuery(viewerCommand.query);
+            await api.imageViewerWindowAction({ sessionId, action: 'minimize' });
+            await api.imageViewerWindowAction({ sessionId, action: 'focus-main' });
+            break;
+          case 'slideshow-started':
+            handleSlideshowStartAcknowledged(session.modalId);
+            break;
+          default:
+            throw new Error('Unsupported image viewer command.');
+        }
+        respond({ success: true });
+      })().catch((error) => respond({ success: false, error: error instanceof Error ? error.message : 'Viewer command failed.' }));
+    });
+  }, [directoryPathById, generateWithA1111, generateWithComfyUI, handleImageDeleted, openBatchExportModal, handleImageModalNavigate, handleImageRenamed, handleOpenComfyUIWorkflowFromImageModal, handleOpenImageEditorFromImageModal, handleSlideshowStartAcknowledged, openFindSimilar, openImageModals, reparseViewerImages, resolveModalNavigationImages]);
 
   const footerWindowItems = useMemo(() => {
     return openImageModals
@@ -3027,10 +3827,10 @@ export default function App() {
       }>;
   }, [activeImageModalId, getImageByIdFromStore, openImageModals]);
   const hasActiveVisibleImageModal = openImageModalEntries.some(
-    (modal) => !modal.isMinimized && modal.modalId === activeImageModalId
+    (modal) => modal.host === 'inline' && !modal.isMinimized && modal.modalId === activeImageModalId
   );
-  const hasVisibleImageModal = openImageModalEntries.some(
-    (modal) => !modal.isMinimized
+  const hasVisibleInlineImageModal = openImageModalEntries.some(
+    (modal) => modal.host === 'inline' && !modal.isMinimized
   );
   const shouldShowEmbeddedComfyUIView =
     libraryView === 'comfyui' &&
@@ -3045,7 +3845,7 @@ export default function App() {
     !isSaveFilteredCollectionModalOpen &&
     !isA1111GenerateModalOpen &&
     !isComfyUIGenerateModalOpen &&
-    !hasVisibleImageModal &&
+    !hasVisibleInlineImageModal &&
     !generatedOutputPreview &&
     !proModalOpen;
   const libraryContentFocusClass = hasActiveVisibleImageModal
@@ -3122,7 +3922,7 @@ export default function App() {
   const shouldShowLibraryPlaceholder =
     libraryView === 'library' &&
     safeFilteredImages.length === 0 &&
-    activeFolderHasProgress;
+    (isStartupHydrating || isLoading || activeFolderHasProgress);
 
   return (
     <React.Profiler id="App" onRender={appProfilerOnRender}>
@@ -3181,14 +3981,18 @@ export default function App() {
           availableLoras={availableLoras}
           availableSamplers={availableSamplers}
           availableSchedulers={availableSchedulers}
+          availableNodes={availableNodes}
+          nodeFacetCounts={nodeFacetCounts}
           selectedModels={selectedModels}
           selectedLoras={selectedLoras}
           selectedSamplers={selectedSamplers}
           selectedSchedulers={selectedSchedulers}
+          selectedNodes={selectedNodes}
           onModelChange={(models) => setSelectedFilters({ models })}
           onLoraChange={(loras) => setSelectedFilters({ loras })}
           onSamplerChange={(samplers) => setSelectedFilters({ samplers })}
           onSchedulerChange={(schedulers) => setSelectedFilters({ schedulers })}
+          onNodeChange={setSelectedNodes}
           onClearAllFilters={handleClearAllFilters}
           advancedFilters={advancedFilters}
           onAdvancedFiltersChange={setAdvancedFilters}
@@ -3205,11 +4009,6 @@ export default function App() {
           excludedFolders={excludedFolders}
           onExcludeFolder={addExcludedFolder}
           onIncludeFolder={removeExcludedFolder}
-          sortOrder={sortOrder}
-          onSortOrderChange={imageStoreSetSortOrder}
-          onReshuffle={reshuffle}
-          groupBy={sortOrder === 'random' ? 'none' : groupBy}
-          onGroupByChange={setGroupBy}
         >
           <DirectoryList
             directories={safeDirectories}
@@ -3244,6 +4043,20 @@ export default function App() {
               jobName: item.imageName,
             });
           }}
+          onOpenGeneratedOutputImage={(item) => {
+            const outputs = enrichGeneratedOutputs(item.generatedOutputs || []);
+            const [output] = outputs;
+            if (output?.imageId) {
+              handleOpenImageModalFromGeneratedOutput(output.imageId);
+              return;
+            }
+            setGeneratedOutputPreview({
+              itemId: item.id,
+              outputs,
+              initialIndex: 0,
+              jobName: item.imageName,
+            });
+          }}
         />
       ) : hasRightSidebar ? (
         <ImagePreviewSidebar
@@ -3264,16 +4077,19 @@ export default function App() {
       )}
 
       <div
-        className={`h-screen flex flex-col ${isSidebarResizing ? 'transition-none' : 'transition-[margin] duration-300 ease-in-out'}`}
+        className={`h-screen flex flex-col ${isSidebarResizing || rightSidebarVisibilityChanged ? 'transition-none' : 'transition-[margin] duration-300 ease-in-out'}`}
         style={{ marginLeft: mainContentMarginLeft, marginRight: mainContentMarginRight }}
       >
         <Header
           onOpenSettings={() => handleOpenSettings()}
-          onOpenAnalytics={() => setIsAnalyticsOpen(true)}
           onOpenLicense={handleOpenLicenseSettings}
           onGeneratorSetupNeeded={handleGeneratorSetupNeeded}
           libraryView={libraryView}
           onLibraryViewChange={setLibraryView}
+          onNavigateExplore={(dimension) => {
+            setExploreDimension(dimension);
+            setLibraryView('explore');
+          }}
           onOpenDroppedImageInComfyUI={(imageId) => {
             const image = imageLookup.get(imageId);
             if (image) {
@@ -3281,6 +4097,8 @@ export default function App() {
             }
           }}
         />
+
+        <TrialExpiredBanner />
 
         <CollectionFormModal
           isOpen={isSaveFilteredCollectionModalOpen}
@@ -3367,9 +4185,9 @@ export default function App() {
             </div>
           )}
 
-          {!isLoading && !hasDirectories && <FolderSelector onSelectFolder={handleSelectFolder} />}
+          {!isStartupHydrating && !isLoading && !hasDirectories && libraryView !== 'prompts' && <FolderSelector onSelectFolder={handleSelectFolder} />}
 
-          {hasDirectories && (
+          {(hasDirectories || libraryView === 'prompts') && (
             <>
                 {libraryView === 'library' && (
                   <AnalyticsSummaryStrip
@@ -3384,10 +4202,10 @@ export default function App() {
                     }}
                   />
                 )}
-                {(libraryView === 'library' || libraryView === 'node' || (libraryView === 'collections' && Boolean(activeCollection))) && (
+                {(libraryView === 'library' || (libraryView === 'collections' && Boolean(activeCollection))) && (
                   <GridToolbar
                     selectedImages={safeSelectedImages}
-                    images={libraryView === 'node' ? nodeViewVisibleImages : paginatedImages}
+                    images={imagesForGrid}
                     directories={safeDirectories}
                     onCreateCollectionFromFiltered={
                       canSaveCurrentFilteredAsCollection
@@ -3423,7 +4241,37 @@ export default function App() {
                     groupBy={effectiveImageGroupBy}
                     onJumpToGroup={(groupId) => setPendingJumpGroupRequest({ groupId, requestId: Date.now() })}
                     onClearAllFilters={handleClearAllFilters}
+                    onExitScope={
+                      activeImageScope
+                        ? () => {
+                            const dimension: ExploreDimension =
+                              activeImageScope.type === 'cluster'
+                                ? 'clusters'
+                                : activeImageScope.type === 'model'
+                                ? 'models'
+                                : 'collections';
+                            setActiveImageScope(null);
+                            setExploreDimension(dimension);
+                            resetLibraryGridScrollPosition();
+                            setLibraryView('explore');
+                          }
+                        : undefined
+                    }
+                    scopeReturnLabel={
+                      activeImageScope
+                        ? activeImageScope.type === 'cluster'
+                          ? 'Clusters'
+                          : activeImageScope.type === 'model'
+                          ? 'Models'
+                          : 'Collections'
+                        : undefined
+                    }
+                    onOpenAnalytics={() => setIsAnalyticsOpen(true)}
                   />
+                )}
+
+                {libraryView === 'library' && (
+                  <VisualSearchOnboarding hasImages={safeFilteredImages.length > 0} />
                 )}
 
                 {libraryView === 'library' && findSimilarGridFilter && (
@@ -3444,6 +4292,35 @@ export default function App() {
                         setCurrentPage(1);
                       }}
                       className="inline-flex items-center gap-1 rounded-md border border-cyan-400/40 px-2 py-1 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      Clear
+                    </button>
+                  </div>
+                )}
+
+                {libraryView === 'library' && semanticSimilarSourceName && (
+                  <div className="mx-5 mb-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-sm text-indigo-100">
+                    <div className="min-w-0">
+                      <span className="font-medium">Visually similar</span>
+                      <span className="text-indigo-200/80"> to </span>
+                      <span className="inline-block max-w-[320px] truncate align-bottom" title={semanticSimilarSourceName}>
+                        {semanticSimilarSourceName}
+                      </span>
+                      <span className="text-indigo-200/80">
+                        {semanticQueryRunning
+                          ? ' · searching…'
+                          : ` · ${semanticResultCount} match${semanticResultCount === 1 ? '' : 'es'}`}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        clearSemanticQuery();
+                        resetLibraryGridScrollPosition();
+                        setCurrentPage(1);
+                      }}
+                      className="inline-flex items-center gap-1 rounded-md border border-indigo-400/40 px-2 py-1 text-xs font-medium text-indigo-100 transition-colors hover:bg-indigo-500/20"
                     >
                       <X className="h-3.5 w-3.5" />
                       Clear
@@ -3475,50 +4352,53 @@ export default function App() {
                     </div>
                   ) : viewMode === 'grid' ? (
                         <ImageGrid
-                          images={paginatedImages}
+                          images={imagesForGrid}
                           onImageClick={handleGridImageClick}
                           selectedImages={safeSelectedImages}
                           currentPage={currentPage}
                           totalPages={totalPages}
                           onPageChange={setCurrentPage}
                           onBatchExport={handleOpenBatchExport}
+                          onDeleteSelected={handleDeleteSelectedImages}
                           onImageRenamed={handleImageRenamed}
                           onFindSimilar={(image) => openFindSimilar(image, displayImages, { checkpointMode: 'ignore' })}
+                          onFindVisuallySimilar={runVisualSimilar}
+                          canFindVisuallySimilar={canFindVisuallySimilar}
                           onOpenImageEditor={(image) => handleOpenImageEditor(image, displayImages)}
                           onOpenComfyUIWorkspace={(image) => openComfyUIWorkflowInWorkspace(image, displayImages)}
                           groupBy={effectiveImageGroupBy}
                           groupSortOrder={imageGroupingSortOrder}
+                          clusterByImageId={clusterByImageId}
                           jumpToGroupRequest={pendingJumpGroupRequest}
                           initialScrollTop={libraryGridScrollTopRef.current}
                           onScrollPositionChange={handleLibraryGridScrollPositionChange}
                           scrollResetKey={libraryGridSignature}
+                          hasRightSidebar={hasRightSidebar}
                         />
                       ) : (
                         <ImageTable
-                          images={paginatedImages}
+                          images={imagesForGrid}
                           onImageClick={handleGridImageClick}
                           selectedImages={safeSelectedImages}
                           onBatchExport={handleOpenBatchExport}
                           onImageRenamed={handleImageRenamed}
                           onFindSimilar={(image) => openFindSimilar(image, displayImages, { checkpointMode: 'ignore' })}
+                          onFindVisuallySimilar={runVisualSimilar}
+                          canFindVisuallySimilar={canFindVisuallySimilar}
                           onOpenImageEditor={(image) => handleOpenImageEditor(image, displayImages)}
                           onOpenComfyUIWorkspace={(image) => handleOpenComfyUIWorkspace(image, displayImages)}
                           groupBy={effectiveImageGroupBy}
                           groupSortOrder={imageGroupingSortOrder}
+                          clusterByImageId={clusterByImageId}
                           jumpToGroupRequest={pendingJumpGroupRequest}
                         />
                   )
-                ) : libraryView === 'model' ? (
-                  <ModelView
-                    isQueueOpen={isQueueOpen}
-                    onToggleQueue={() => setIsQueueOpen((prev) => !prev)}
-                    page={modelViewPage}
-                    onPageChange={setModelViewPage}
-                    activeModelName={selectedModels.length === 1 ? selectedModels[0] : null}
-                    onModelSelect={(modelName) => {
+                ) : libraryView === 'prompts' ? (
+                  <PromptLibrary onViewSource={handleOpenFileFromDeepLink} />
+                ) : libraryView === 'explore' ? (
+                  <ExploreWorkspace
+                    onNavigateToLibrary={() => {
                       resetLibraryGridScrollPosition();
-                      setModelViewPage(1);
-                      setSelectedFilters({ models: [modelName] });
                       setLibraryView('library');
                     }}
                     onFindMatchingPrompts={openModelPromptPicker}
@@ -3530,29 +4410,34 @@ export default function App() {
                   >
                     {viewMode === 'grid' ? (
                       <ImageGrid
-                        images={paginatedImages}
+                        images={imagesForGrid}
                         onImageClick={handleGridImageClick}
                         selectedImages={safeSelectedImages}
                         currentPage={currentPage}
                         totalPages={totalPages}
                         onPageChange={setCurrentPage}
                         onBatchExport={handleOpenBatchExport}
+                        onDeleteSelected={handleDeleteSelectedImages}
                         activeCollection={activeCollection}
                         isCollectionsView
                         onImageRenamed={handleImageRenamed}
                         onFindSimilar={(image) => openFindSimilar(image, displayImages, { checkpointMode: 'ignore' })}
+                        onFindVisuallySimilar={runVisualSimilar}
+                        canFindVisuallySimilar={canFindVisuallySimilar}
                         onOpenImageEditor={(image) => handleOpenImageEditor(image, displayImages)}
                         onOpenComfyUIWorkspace={(image) => handleOpenComfyUIWorkspace(image, displayImages)}
                         groupBy={effectiveImageGroupBy}
                         groupSortOrder={imageGroupingSortOrder}
+                        clusterByImageId={clusterByImageId}
                         jumpToGroupRequest={pendingJumpGroupRequest}
                         initialScrollTop={collectionsGridScrollTopRef.current}
                         onScrollPositionChange={handleCollectionsGridScrollPositionChange}
                         scrollResetKey={collectionsGridSignature}
+                        hasRightSidebar={hasRightSidebar}
                       />
                     ) : (
                       <ImageTable
-                        images={paginatedImages}
+                        images={imagesForGrid}
                         onImageClick={handleGridImageClick}
                         selectedImages={safeSelectedImages}
                         onBatchExport={handleOpenBatchExport}
@@ -3560,25 +4445,17 @@ export default function App() {
                         isCollectionsView
                         onImageRenamed={handleImageRenamed}
                         onFindSimilar={(image) => openFindSimilar(image, displayImages, { checkpointMode: 'ignore' })}
+                        onFindVisuallySimilar={runVisualSimilar}
+                        canFindVisuallySimilar={canFindVisuallySimilar}
                         onOpenImageEditor={(image) => handleOpenImageEditor(image, displayImages)}
                         onOpenComfyUIWorkspace={(image) => handleOpenComfyUIWorkspace(image, displayImages)}
                         groupBy={effectiveImageGroupBy}
                         groupSortOrder={imageGroupingSortOrder}
+                        clusterByImageId={clusterByImageId}
                         jumpToGroupRequest={pendingJumpGroupRequest}
                       />
                     )}
                   </CollectionsWorkspace>
-                ) : libraryView === 'node' ? (
-                  <NodeView
-                    images={safeFilteredImages}
-                    selectedImages={safeSelectedImages}
-                    onImageClick={handleImageSelection}
-                    onBatchExport={handleOpenBatchExport}
-                    isQueueOpen={isQueueOpen}
-                    onToggleQueue={() => setIsQueueOpen((prev) => !prev)}
-                    onVisibleImagesChange={setNodeViewVisibleImages}
-                    onResultImagesChange={handleNodeViewResultImagesChange}
-                  />
                 ) : libraryView === 'comfyui' ? (
                   <ComfyUIWorkspace
                     image={comfyUIWorkspaceImage}
@@ -3647,16 +4524,7 @@ export default function App() {
                       </div>
                     </div>
                   )
-                ) : (
-                  <SmartLibrary
-                    isQueueOpen={isQueueOpen}
-                    onToggleQueue={() => setIsQueueOpen((prev) => !prev)}
-                    onBatchExport={handleOpenBatchExport}
-                    onOpenImageInBackground={(image, navigationImages) => {
-                      handleOpenImageModalInBackground(image, navigationImages, 'cluster');
-                    }}
-                  />
-                )}
+                ) : null}
               </div>
 
               {(libraryView === 'library' || libraryView === 'comfyui' || libraryView === 'editor' || (libraryView === 'collections' && Boolean(activeCollection))) && (
@@ -3684,23 +4552,33 @@ export default function App() {
                   customText={libraryView === 'comfyui' ? 'ComfyUI Workspace' : libraryView === 'editor' ? 'Image Editor' : undefined}
                   windowItems={footerWindowItems}
                   onWindowSelect={(modalId) => {
-                    if (libraryView === 'comfyui' || libraryView === 'editor') {
+                    const targetModal = openImageModals.find((modal) => modal.modalId === modalId);
+                    if (targetModal?.host === 'inline' && (libraryView === 'comfyui' || libraryView === 'editor')) {
                       setLibraryView('library');
                     }
                     handleActivateImageModal(modalId);
                   }}
                   onWindowClose={handleCloseImageModalFromFooter}
+                  showSortControls={canGroupCurrentImages}
+                  sortOrder={sortOrder}
+                  onSortOrderChange={imageStoreSetSortOrder}
+                  onReshuffle={reshuffle}
+                  groupBy={sortOrder === 'random' || sortOrder === 'relevance' ? 'none' : groupBy}
+                  onGroupByChange={setGroupBy}
+                  hidePageSize={isSectionedByEntity}
                 />
               )}
             </>
           )}
         </main>
 
-        {openImageModalEntries.map((modal) => (
+        {openImageModalEntries.filter((modal) => modal.host === 'inline').map((modal) => (
           <ImageModal
             key={modal.modalId}
             modalId={modal.modalId}
             image={modal.image}
+            prefetchPrevious={modal.prefetchPrevious}
+            prefetchNext={modal.prefetchNext}
             onClose={() => handleCloseImageModal(modal.modalId, modal.image.id)}
             onImageDeleted={handleImageDeleted}
             onImageRenamed={handleImageRenamed}
@@ -3708,6 +4586,8 @@ export default function App() {
             totalImages={modal.totalImages}
             onNavigateNext={() => handleImageModalNavigate(modal.modalId, 'next')}
             onNavigatePrevious={() => handleImageModalNavigate(modal.modalId, 'previous')}
+            onNavigateNextWrapping={() => handleImageModalNavigate(modal.modalId, 'next', { wrap: true })}
+            onNavigateRandom={() => handleImageModalNavigate(modal.modalId, 'random')}
             directoryPath={modal.directoryPath}
             isIndexing={progress && progress.total > 0 && progress.current < progress.total}
             zIndex={modal.zIndex}

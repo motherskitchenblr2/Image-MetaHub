@@ -9,7 +9,7 @@ export interface ParserNode {
 export type ComfyNodeDataType =
   | 'MODEL' | 'CONDITIONING' | 'LATENT' | 'IMAGE' | 'VAE' | 'CLIP' | 'INT'
   | 'FLOAT' | 'STRING' | 'CONTROL_NET' | 'GUIDER' | 'SAMPLER' | 'SCHEDULER'
-  | 'SIGMAS' | 'NOISE' | 'UPSCALE_MODEL' | 'MASK' | 'ANY' | 'LORA_STACK' | 'SDXL_TUPLE';
+  | 'SIGMAS' | 'NOISE' | 'UPSCALE_MODEL' | 'MASK' | 'BOOLEAN' | 'ANY' | 'LORA_STACK' | 'SDXL_TUPLE';
 
 export type ComfyTraversableParam =
   | 'prompt' | 'negativePrompt' | 'seed' | 'steps' | 'cfg' | 'width' | 'height'
@@ -33,7 +33,8 @@ export type NodeBehavior = 'SOURCE' | 'SINK' | 'TRANSFORM' | 'PASS_THROUGH' | 'R
 
 export interface ConditionalRoutingRule {
   control_input: string;
-  dynamic_input_prefix: string;
+  dynamic_input_prefix?: string;
+  routes?: Record<string, string>;
 }
 
 export interface NodeDefinition {
@@ -45,6 +46,32 @@ export interface NodeDefinition {
   pass_through_rules?: PassThroughRule[];
   conditional_routing?: ConditionalRoutingRule;
   widget_order?: string[];
+}
+
+// Lineage detection (img2img/inpaint/outpaint). Mirrors the app's central
+// types.ts definitions (services/../types.ts) so comfyUIParser.ts can be kept
+// in sync between the app and this package without an app-specific import.
+export type GenerationType = 'txt2img' | 'img2img' | 'inpaint' | 'outpaint';
+
+export interface SourceImageReference {
+  fileName?: string | null;
+  relativePath?: string | null;
+  absolutePath?: string | null;
+  sha256?: string | null;
+  width?: number | null;
+  height?: number | null;
+  nodeId?: string | null;
+  nodeType?: string | null;
+}
+
+export interface ImageLineage {
+  detection?: 'explicit' | 'inferred';
+  sourceImage?: SourceImageReference | null;
+  workflowSourceImage?: SourceImageReference | null;
+  denoiseStrength?: number | null;
+  maskBlur?: number | null;
+  maskedContent?: string | null;
+  resizeMode?: string | null;
 }
 
 export interface WorkflowFacts {

@@ -15,6 +15,8 @@
     "electron.mjs",
     "electron-deeplink.mjs",
     "preload.js",
+    "comfyui-view-preload.js",
+    "electron/**/*.mjs",
     "services/**/*",
     "utils/**/*.js",
     "utils/**/*.mjs",
@@ -25,9 +27,8 @@
     "icon": "public/icon.ico",
     "target": [
       "nsis",
-      "zip"
-    ],
-    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+      "portable"
+    ]
   },
   "mac": {
     "icon": "public/logo1.png",
@@ -62,6 +63,10 @@
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
     "artifactName": "ImageMetaHub-Setup-${version}.${ext}"
+  },
+  "portable": {
+    "artifactName": "ImageMetaHub-Portable-${version}-${arch}.${ext}",
+    "requestExecutionLevel": "user"
   },
   "publish": {
     "provider": "github",

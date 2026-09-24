@@ -203,6 +203,9 @@ describe('useImageStore tri-state filters', () => {
   });
 
   afterEach(() => {
+    // Unconditional: tests that opt into fake timers must not leak them into
+    // the rest of the file if an assertion throws before restoring.
+    vi.useRealTimers();
     useImageStore.getState().resetState();
     vi.unstubAllGlobals();
     mockWorkerInstances.length = 0;
@@ -214,6 +217,36 @@ describe('useImageStore tri-state filters', () => {
 
     useImageStore.getState().setFavoriteFilterMode('exclude');
     expect(useImageStore.getState().filteredImages.map((image) => image.name)).toEqual(['b.png', 'd.png', 'e.png', 'f.png', 'g.png', 'h.png', 'i.png']);
+  });
+
+  it('keeps root folder selection working when the directory id contains the id separator', () => {
+    const separatorDirectory: Directory = {
+      ...directory,
+      id: '/tmp/a::b/c',
+      path: '/tmp/a::b/c',
+    };
+    const rootImage = createImage({
+      id: `${separatorDirectory.id}::root.png`,
+      directoryId: separatorDirectory.id,
+      name: 'root.png',
+    });
+    const nestedImage = createImage({
+      id: `${separatorDirectory.id}::nested/child.png`,
+      directoryId: separatorDirectory.id,
+      name: 'child.png',
+    });
+
+    useImageStore.setState({
+      directories: [separatorDirectory],
+      images: [rootImage, nestedImage],
+      filteredImages: [rootImage, nestedImage],
+      selectedFolders: new Set([separatorDirectory.path]),
+      includeSubfolders: false,
+    });
+
+    useImageStore.getState().filterAndSortImages();
+
+    expect(useImageStore.getState().filteredImages.map((image) => image.name)).toEqual(['root.png']);
   });
 
   it('supports include and exclude for tags and auto-tags', () => {
@@ -345,6 +378,43 @@ describe('useImageStore tri-state filters', () => {
     expect(useImageStore.getState().filteredImages.map((image) => image.name)).toEqual(['searchable.png']);
   });
 
+  it('rebuilds memoized search text when an image is replaced by a new object', async () => {
+    // buildCatalogSearchText/buildCompactSearchText are memoized in WeakMaps keyed
+    // by the IndexedImage object itself. That is only sound because every store
+    // path replaces images instead of mutating them in place. If a future change
+    // ever mutates an image, the memoized text goes stale and search silently
+    // returns wrong results with no other symptom — this test is the guard.
+    const original = createImage({
+      id: 'dir-1::memoized.png',
+      name: 'memoized.png',
+      prompt: 'alpha-marker prompt',
+      enrichmentState: 'enriched',
+    });
+
+    useImageStore.getState().resetState();
+    useImageStore.setState({
+      directories: [directory],
+      images: [original],
+      filteredImages: [original],
+      sortOrder: 'asc',
+    });
+
+    useImageStore.getState().setSearchQuery('alpha-marker');
+    await flushSearchWorker();
+    expect(useImageStore.getState().filteredImages.map((image) => image.id)).toEqual(['dir-1::memoized.png']);
+
+    // Same id, new object, different prompt — the enrichment/merge shape.
+    useImageStore.getState().mergeImages([{ ...original, prompt: 'beta-marker prompt' }]);
+
+    useImageStore.getState().setSearchQuery('beta-marker');
+    await flushSearchWorker();
+    expect(useImageStore.getState().filteredImages.map((image) => image.id)).toEqual(['dir-1::memoized.png']);
+
+    useImageStore.getState().setSearchQuery('alpha-marker');
+    await flushSearchWorker();
+    expect(useImageStore.getState().filteredImages).toEqual([]);
+  });
+
   it('does not match search terms that exist only inside raw metadata JSON blobs', async () => {
     const rawOnly = createImage({
       id: 'dir-1::raw-only.png',
@@ -442,6 +512,9 @@ describe('useImageStore tri-state filters', () => {
       dimensions: { name: '1024x1024' } as any,
     });
 
+    // Install fake timers BEFORE the call so the deferred reconciliation
+    // timer is tracked and can be advanced.
+    vi.useFakeTimers();
     expect(() => useImageStore.getState().appendImagesSilently([malformed])).not.toThrow();
 
     const stored = useImageStore.getState().images[0];
@@ -450,6 +523,8 @@ describe('useImageStore tri-state filters', () => {
     expect(stored.sampler).toBe('euler_a');
     expect(stored.scheduler).toBe('karras');
     expect(stored.dimensions).toBe('1024x1024');
+    // Facet counts are deferred (~400ms) in the incremental path.
+    vi.advanceTimersByTime(500);
     expect(useImageStore.getState().availableSamplers).toEqual(['euler_a']);
     expect(useImageStore.getState().availableSchedulers).toEqual(['karras']);
     expect(useImageStore.getState().availableDimensions).toEqual(['1024x1024']);
@@ -484,6 +559,71 @@ describe('useImageStore tri-state filters', () => {
     const storedTarget = useImageStore.getState().images.find((image) => image.id === targetImage.id);
     expect(useImageStore.getState().images).toHaveLength(queuedImages.length);
     expect(storedTarget?.rating).toBe(4);
+  });
+
+  it('defers enrichment merges until startup directory refresh finishes', () => {
+    const catalogImage = createImage({
+      id: 'dir-1::refreshing.png',
+      name: 'refreshing.png',
+      prompt: 'catalog metadata',
+    });
+
+    useImageStore.getState().resetState();
+    useImageStore.setState({
+      directories: [directory],
+      images: [],
+      filteredImages: [],
+      sortOrder: 'asc',
+    });
+
+    useImageStore.getState().setDirectoryRefreshing(directory.id, true);
+    useImageStore.getState().addImages([catalogImage]);
+    useImageStore.getState().mergeImages([{ ...catalogImage, prompt: 'enriched metadata' }]);
+
+    expect(useImageStore.getState().images).toEqual([]);
+
+    useImageStore.getState().setDirectoryRefreshing(directory.id, false);
+
+    expect(useImageStore.getState().images).toHaveLength(1);
+    expect(useImageStore.getState().images[0].prompt).toBe('enriched metadata');
+  });
+
+  it('only defers merge updates that belong to the refreshing directory', () => {
+    const refreshingImage = createImage({
+      id: 'dir-1::refreshing.png',
+      name: 'refreshing.png',
+      prompt: 'old refreshing metadata',
+    });
+    const editedImage = createImage({
+      id: 'dir-2::edited.png',
+      name: 'edited.png',
+      directoryId: 'dir-2',
+      prompt: 'old edited metadata',
+    });
+
+    useImageStore.getState().resetState();
+    useImageStore.setState({
+      directories: [directory, secondDirectory],
+      images: [refreshingImage, editedImage],
+      filteredImages: [refreshingImage, editedImage],
+      sortOrder: 'asc',
+    });
+
+    useImageStore.getState().setDirectoryRefreshing(directory.id, true);
+    useImageStore.getState().mergeImages([
+      { ...refreshingImage, prompt: 'new refreshing metadata' },
+      { ...editedImage, prompt: 'new edited metadata' },
+    ]);
+
+    expect(useImageStore.getState().images.find((image) => image.id === refreshingImage.id)?.prompt)
+      .toBe('old refreshing metadata');
+    expect(useImageStore.getState().images.find((image) => image.id === editedImage.id)?.prompt)
+      .toBe('new edited metadata');
+
+    useImageStore.getState().setDirectoryRefreshing(directory.id, false);
+
+    expect(useImageStore.getState().images.find((image) => image.id === refreshingImage.id)?.prompt)
+      .toBe('new refreshing metadata');
   });
 
   it('ignores queued images and merges from removed directories', () => {

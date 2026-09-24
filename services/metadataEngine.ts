@@ -2,11 +2,14 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { execFile } from 'child_process';
+import { readBasicMp4Metadata } from '../utils/mp4Metadata.mjs';
 import { promisify } from 'util';
 import exifr from 'exifr';
 import { BaseMetadata, ImageMetadata, type AudioInfo, type VideoInfo, isEasyDiffusionJson } from '../types';
 import { parseImageMetadata as normalizeMetadata } from './parsers/metadataParserFactory';
 import { isAudioFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { isAvifBuffer, parseAvifMetadata } from '../utils/avifMetadata.mjs';
+import { applyImageMetaHubAvifExtension } from '../utils/imageMetaHubAvifExtension.mjs';
 
 interface Dimensions {
   width: number;
@@ -53,7 +56,7 @@ export interface MetadataEngineResult {
   rawMetadata: ImageMetadata | null;
   metadata: BaseMetadata | null;
   dimensions?: Dimensions | null;
-  rawSource?: 'png' | 'jpeg' | 'sidecar' | 'video' | 'audio' | 'unknown';
+  rawSource?: 'png' | 'jpeg' | 'avif' | 'sidecar' | 'video' | 'audio' | 'unknown';
   errors?: string[];
   schema_version: string;
   _telemetry: {
@@ -482,7 +485,7 @@ function extractDimensionsFromBuffer(buffer: ArrayBuffer): Dimensions | null {
 }
 
 async function tryReadEasyDiffusionSidecarJson(imagePath: string): Promise<ImageMetadata | null> {
-  const jsonPath = imagePath.replace(/\.(png|jpg|jpeg)$/i, '.json');
+  const jsonPath = imagePath.replace(/\.(png|jpg|jpeg|webp|avif)$/i, '.json');
   const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(jsonPath) || jsonPath.startsWith('/');
 
   if (!isAbsolutePath || !jsonPath || jsonPath === imagePath) {
@@ -521,12 +524,31 @@ export async function parseImageFile(filePath: string): Promise<MetadataEngineRe
   let rawSource: MetadataEngineResult['rawSource'] = 'unknown';
   let videoInfo: VideoInfo | null = null;
   let audioInfo: AudioInfo | null = null;
+  let carrierDimensions: Dimensions | null = null;
   const isVideo = isVideoFileName(absolutePath);
   const isAudio = isAudioFileName(absolutePath);
 
   if (isVideo || isAudio) {
     rawSource = isAudio ? 'audio' : 'video';
-    const mediaMetadata = await readMediaMetadataWithFfprobe(absolutePath);
+    let mediaMetadata = await readMediaMetadataWithFfprobe(absolutePath);
+    const extension = path.extname(absolutePath).toLowerCase();
+    if (!mediaMetadata && isVideo && (extension === '.mp4' || extension === '.mov' || extension === '.m4v')) {
+      const basic = await readBasicMp4Metadata(absolutePath).catch(() => null);
+      if (basic) {
+        mediaMetadata = {
+          video: {
+            frame_rate: null,
+            frame_count: null,
+            duration_seconds: basic.duration_seconds,
+            width: basic.width,
+            height: basic.height,
+            codec: null,
+            format: 'mp4',
+          },
+          audio: null,
+        };
+      }
+    }
     if (mediaMetadata) {
       const raw: MetadataRecord = {
         description: mediaMetadata.description,
@@ -550,7 +572,13 @@ export async function parseImageFile(filePath: string): Promise<MetadataEngineRe
     }
   } else {
     const view = new DataView(arrayBuffer);
-    if (view.getUint32(0) === 0x89504e47 && view.getUint32(4) === 0x0d0a1a0a) {
+    if (isAvifBuffer(arrayBuffer)) {
+      const avifResult = await parseAvifMetadata(arrayBuffer);
+      rawMetadata = avifResult.rawMetadata as ImageMetadata | null;
+      rawSource = 'avif';
+      carrierDimensions = avifResult.dimensions;
+      errors.push(...avifResult.errors);
+    } else if (view.getUint32(0) === 0x89504e47 && view.getUint32(4) === 0x0d0a1a0a) {
       rawMetadata = await parsePNGMetadata(arrayBuffer);
       rawSource = 'png';
     } else if (view.getUint16(0) === 0xffd8) {
@@ -582,10 +610,24 @@ export async function parseImageFile(filePath: string): Promise<MetadataEngineRe
       errors.push(`Failed to parse workflow/prompt JSON: ${getErrorMessage(err)}`);
     }
 
-    metadata = await normalizeMetadata(rawMetadata, arrayBuffer);
+    const rawRecord = rawMetadata as MetadataRecord;
+    let metadataForNormalization = rawMetadata;
+    if (rawRecord._carrierFormat === 'avif' && 'imagemetahub_data' in rawRecord) {
+      const canonicalCarrierMetadata = { ...rawRecord };
+      delete canonicalCarrierMetadata.imagemetahub_data;
+      metadataForNormalization = canonicalCarrierMetadata as ImageMetadata;
+    }
+
+    metadata = await normalizeMetadata(metadataForNormalization, arrayBuffer);
+    if ('imagemetahub_extension' in rawRecord) {
+      metadata = applyImageMetaHubAvifExtension(
+        metadata as MetadataRecord | null,
+        rawRecord.imagemetahub_extension,
+      ) as BaseMetadata | null;
+    }
   }
 
-  let dimensions = isVideo ? null : extractDimensionsFromBuffer(arrayBuffer);
+  let dimensions = isVideo ? null : (carrierDimensions ?? extractDimensionsFromBuffer(arrayBuffer));
   if (metadata && dimensions) {
     metadata.width = metadata.width || dimensions.width;
     metadata.height = metadata.height || dimensions.height;

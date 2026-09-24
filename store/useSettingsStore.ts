@@ -5,6 +5,16 @@ import {
   DEFAULT_TAG_SUGGESTION_LIMIT,
   sanitizeTagUiLimit,
 } from '../utils/tagSuggestions';
+import {
+  DEFAULT_EMBEDDING_MODEL_KEY,
+  getEmbeddingModel,
+  type EmbeddingModelKey,
+} from '../services/embeddings/embeddingModel';
+import {
+  DEFAULT_SEMANTIC_SEARCH_PRECISION,
+  sanitizeSemanticSearchPrecision,
+  type SemanticSearchPrecision,
+} from '../services/embeddings/semanticSearchPrecision';
 
 export const stripLicenseFromSettings = <T extends Record<string, unknown>>(settings: T | null | undefined): Omit<T, 'license'> => {
   if (!settings) {
@@ -63,7 +73,12 @@ const electronStorage: StateStorage = {
 };
 
 import { Keymap } from '../types';
-import type { ImageGroupByMode } from '../utils/imageGrouping';
+import type { ImageGroupByMode, ImageGroupingSortOrder } from '../utils/imageGrouping';
+
+const VALID_SORT_ORDERS: ImageGroupingSortOrder[] = ['asc', 'desc', 'date-asc', 'date-desc', 'random'];
+const isValidSortOrder = (value: unknown): value is ImageGroupingSortOrder =>
+  typeof value === 'string' && (VALID_SORT_ORDERS as string[]).includes(value);
+const VALID_GROUP_BY: ImageGroupByMode[] = ['none', 'date', 'name', 'session', 'model', 'cluster'];
 
 const detectDefaultIndexingConcurrency = (): number => {
   if (typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number') {
@@ -94,10 +109,40 @@ export const sanitizeSlideshowIntervalSeconds = (value: number): number => {
   );
 };
 
+export type VideoRepeatMode = 'off' | 'one' | 'all';
+export type ImageViewerMode = 'detached' | 'inline';
+export type ImageViewerDefaultZoom = 'fit' | 'actual';
+
+export const sanitizeImageViewerMode = (value: unknown): ImageViewerMode =>
+  value === 'inline' || value === 'detached' ? value : 'detached';
+
+export const sanitizeImageViewerDefaultZoom = (value: unknown): ImageViewerDefaultZoom =>
+  value === 'actual' ? 'actual' : 'fit';
+
+const VALID_VIDEO_REPEAT_MODES: VideoRepeatMode[] = ['off', 'one', 'all'];
+const isValidVideoRepeatMode = (value: unknown): value is VideoRepeatMode =>
+  typeof value === 'string' && (VALID_VIDEO_REPEAT_MODES as string[]).includes(value);
+
+/**
+ * Before the tri-state repeat control the video player kept a boolean loop flag in its own
+ * localStorage key. Seeding the initial state from it migrates existing users: persisted settings
+ * are merged on top, so anyone who already has a repeat mode keeps it.
+ */
+const LEGACY_VIDEO_LOOP_STORAGE_KEY = 'video_player_loop';
+
+export const readLegacyVideoRepeatMode = (): VideoRepeatMode => {
+  try {
+    return localStorage.getItem(LEGACY_VIDEO_LOOP_STORAGE_KEY) === 'true' ? 'one' : 'off';
+  } catch {
+    return 'off';
+  }
+};
+
 // Define the state shape
 interface SettingsState {
-  // App settings
-  sortOrder: 'asc' | 'desc';
+  // App settings. Unified with useImageStore.sortOrder (the single writer); this copy is
+  // persistence-only. Kept as the full union so the two never drift.
+  sortOrder: ImageGroupingSortOrder;
   itemsPerPage: number;
   scanSubfolders: boolean;
   imageSize: number;
@@ -121,10 +166,42 @@ interface SettingsState {
   sensitiveTags: string[];
   blurSensitiveImages: boolean;
   enableSafeMode: boolean;
+  civitaiLookupEnabled: boolean;
+  /** Master switch for local visual search. Off by default: while off, no new
+   *  code path runs and no file is written — the onboarding card is still
+   *  discoverable above the grid, and turning this on there or in Settings is
+   *  what first opens the index (the model download and index build stay
+   *  separate, explicit user actions after that). */
+  semanticSearchEnabled: boolean;
+  /** Inference backend for the CLIP model. WASM (CPU) by default so it never
+   *  competes with an image generator for VRAM. */
+  semanticSearchDevice: 'wasm' | 'webgpu';
+  /** Which CLIP model backs the index. Trades indexing time for search quality;
+   *  each model keeps its own index, so switching back is free. */
+  semanticSearchModel: EmbeddingModelKey;
+  /** How close results must be to the best text-search match. */
+  semanticSearchPrecision: SemanticSearchPrecision;
   enableAnimations: boolean;
+  /** Classic mode: show the legacy tabs (Model View / Smart Library / Collections / Node View)
+   *  as deep-links into the unified Explore surface. Off by default. */
+  classicMode: boolean;
+  /** One-time flag so the Explore navigation-change onboarding toast shows only once, ever. */
+  hasSeenExploreOnboarding: boolean;
+  /** One-time flag so the visual-search intro card shows only once, ever. */
+  hasSeenVisualSearchOnboarding: boolean;
   performanceDiagnosticsEnabled: boolean;
   slideshowIntervalSeconds: number;
   slideshowShowFilename: boolean;
+  /** Start playback automatically when a video or audio file opens in the viewer. */
+  autoPlayMedia: boolean;
+  /** Video player repeat mode: no repeat, repeat the current file, or advance through the list. */
+  videoRepeatMode: VideoRepeatMode;
+  /** Video player shuffle: when a video ends, jump to a random item instead of the next one. */
+  videoShuffle: boolean;
+  /** Desktop viewer host. Web builds always resolve this preference to inline. */
+  imageViewerMode: ImageViewerMode;
+  /** Zoom mode applied whenever an image opens in the viewer. */
+  imageViewerDefaultZoom: ImageViewerDefaultZoom;
   creatorAttributionToken: string | null;
   creatorAttributionUpdatedAt: number | null;
 
@@ -146,7 +223,7 @@ interface SettingsState {
   generatorLaunchWorkingDirectory: string;
 
   // Actions
-  setSortOrder: (order: 'asc' | 'desc') => void;
+  setSortOrder: (order: ImageGroupingSortOrder) => void;
   setItemsPerPage: (count: number) => void;
   toggleScanSubfolders: () => void;
   setImageSize: (size: number) => void;
@@ -171,10 +248,23 @@ interface SettingsState {
   setSensitiveTags: (tags: string[]) => void;
   setBlurSensitiveImages: (value: boolean) => void;
   setEnableSafeMode: (value: boolean) => void;
+  setCivitaiLookupEnabled: (value: boolean) => void;
+  setSemanticSearchEnabled: (value: boolean) => void;
+  setSemanticSearchDevice: (value: 'wasm' | 'webgpu') => void;
+  setSemanticSearchModel: (value: EmbeddingModelKey) => void;
+  setSemanticSearchPrecision: (value: SemanticSearchPrecision) => void;
   setEnableAnimations: (value: boolean) => void;
+  setClassicMode: (value: boolean) => void;
+  setHasSeenExploreOnboarding: (value: boolean) => void;
+  setHasSeenVisualSearchOnboarding: (value: boolean) => void;
   setPerformanceDiagnosticsEnabled: (value: boolean) => void;
   setSlideshowIntervalSeconds: (value: number) => void;
   setSlideshowShowFilename: (value: boolean) => void;
+  setAutoPlayMedia: (value: boolean) => void;
+  setVideoRepeatMode: (value: VideoRepeatMode) => void;
+  setVideoShuffle: (value: boolean) => void;
+  setImageViewerMode: (value: ImageViewerMode) => void;
+  setImageViewerDefaultZoom: (value: ImageViewerDefaultZoom) => void;
   setCreatorAttributionToken: (token: string | null) => void;
   setA1111Enabled: (value: boolean) => void;
   setA1111ServerUrl: (url: string) => void;
@@ -225,10 +315,23 @@ export const useSettingsStore = create<SettingsState>()(
       sensitiveTags: ['nsfw', 'private', 'hidden'],
       blurSensitiveImages: true,
       enableSafeMode: true,
+      civitaiLookupEnabled: true,
+      semanticSearchEnabled: false,
+      semanticSearchDevice: 'wasm',
+      semanticSearchModel: DEFAULT_EMBEDDING_MODEL_KEY,
+      semanticSearchPrecision: DEFAULT_SEMANTIC_SEARCH_PRECISION,
       enableAnimations: true,
+      classicMode: false,
+      hasSeenExploreOnboarding: false,
+      hasSeenVisualSearchOnboarding: false,
       performanceDiagnosticsEnabled: false,
       slideshowIntervalSeconds: DEFAULT_SLIDESHOW_INTERVAL_SECONDS,
       slideshowShowFilename: true,
+      autoPlayMedia: true,
+      videoRepeatMode: readLegacyVideoRepeatMode(),
+      videoShuffle: false,
+      imageViewerMode: 'detached',
+      imageViewerDefaultZoom: 'fit',
       creatorAttributionToken: null,
       creatorAttributionUpdatedAt: null,
 
@@ -287,11 +390,25 @@ export const useSettingsStore = create<SettingsState>()(
       },
       setBlurSensitiveImages: (value) => set({ blurSensitiveImages: !!value }),
       setEnableSafeMode: (value) => set({ enableSafeMode: !!value }),
+      setCivitaiLookupEnabled: (value) => set({ civitaiLookupEnabled: !!value }),
+      setSemanticSearchEnabled: (value) => set({ semanticSearchEnabled: !!value }),
+      setSemanticSearchDevice: (value) => set({ semanticSearchDevice: value === 'webgpu' ? 'webgpu' : 'wasm' }),
+      setSemanticSearchModel: (value) => set({ semanticSearchModel: getEmbeddingModel(value).key }),
+      setSemanticSearchPrecision: (value) => set({ semanticSearchPrecision: sanitizeSemanticSearchPrecision(value) }),
       setEnableAnimations: (value) => set({ enableAnimations: !!value }),
+      setClassicMode: (value) => set({ classicMode: !!value }),
+      setHasSeenExploreOnboarding: (value) => set({ hasSeenExploreOnboarding: !!value }),
+      setHasSeenVisualSearchOnboarding: (value) => set({ hasSeenVisualSearchOnboarding: !!value }),
       setPerformanceDiagnosticsEnabled: (value) => set({ performanceDiagnosticsEnabled: !!value }),
       setSlideshowIntervalSeconds: (value) =>
         set({ slideshowIntervalSeconds: sanitizeSlideshowIntervalSeconds(value) }),
       setSlideshowShowFilename: (value) => set({ slideshowShowFilename: !!value }),
+      setAutoPlayMedia: (value) => set({ autoPlayMedia: !!value }),
+      setVideoRepeatMode: (value) =>
+        set({ videoRepeatMode: isValidVideoRepeatMode(value) ? value : 'off' }),
+      setVideoShuffle: (value) => set({ videoShuffle: !!value }),
+      setImageViewerMode: (value) => set({ imageViewerMode: sanitizeImageViewerMode(value) }),
+      setImageViewerDefaultZoom: (value) => set({ imageViewerDefaultZoom: sanitizeImageViewerDefaultZoom(value) }),
       setCreatorAttributionToken: (token) => {
         const normalizedToken = typeof token === 'string' ? token.trim() : '';
         set({
@@ -363,10 +480,23 @@ export const useSettingsStore = create<SettingsState>()(
         sensitiveTags: ['nsfw', 'private', 'hidden'],
         blurSensitiveImages: true,
         enableSafeMode: true,
+        civitaiLookupEnabled: true,
+        semanticSearchEnabled: false,
+        semanticSearchDevice: 'wasm',
+        semanticSearchModel: DEFAULT_EMBEDDING_MODEL_KEY,
+        semanticSearchPrecision: DEFAULT_SEMANTIC_SEARCH_PRECISION,
         enableAnimations: true,
+        classicMode: false,
+        hasSeenExploreOnboarding: false,
+        hasSeenVisualSearchOnboarding: false,
         performanceDiagnosticsEnabled: false,
         slideshowIntervalSeconds: DEFAULT_SLIDESHOW_INTERVAL_SECONDS,
         slideshowShowFilename: true,
+        autoPlayMedia: true,
+        videoRepeatMode: 'off',
+        videoShuffle: false,
+        imageViewerMode: 'detached',
+        imageViewerDefaultZoom: 'fit',
         creatorAttributionToken: null,
         creatorAttributionUpdatedAt: null,
         a1111Enabled: true,
@@ -413,13 +543,13 @@ export const useSettingsStore = create<SettingsState>()(
           state.showFilenames = false;
         }
 
-        if (
-          state &&
-          state.groupBy !== 'none' &&
-          state.groupBy !== 'date' &&
-          state.groupBy !== 'name' &&
-          state.groupBy !== 'session'
-        ) {
+        // Keep a persisted-but-valid sortOrder; only reset corrupted/unknown values so we
+        // never destroy a user's preference (D7).
+        if (state && !isValidSortOrder(state.sortOrder)) {
+          state.sortOrder = 'date-desc';
+        }
+
+        if (state && !VALID_GROUP_BY.includes(state.groupBy)) {
           state.groupBy = 'none';
         }
 
@@ -457,6 +587,14 @@ export const useSettingsStore = create<SettingsState>()(
           state.enableSafeMode = true;
         }
 
+        if (state && typeof state.civitaiLookupEnabled !== 'boolean') {
+          state.civitaiLookupEnabled = true;
+        }
+
+        if (state) {
+          state.semanticSearchPrecision = sanitizeSemanticSearchPrecision(state.semanticSearchPrecision);
+        }
+
         if (state && typeof state.enableAnimations !== 'boolean') {
           state.enableAnimations = true;
         }
@@ -471,6 +609,26 @@ export const useSettingsStore = create<SettingsState>()(
 
         if (state && typeof state.slideshowShowFilename !== 'boolean') {
           state.slideshowShowFilename = true;
+        }
+
+        if (state && typeof state.autoPlayMedia !== 'boolean') {
+          state.autoPlayMedia = true;
+        }
+
+        if (state && !isValidVideoRepeatMode(state.videoRepeatMode)) {
+          state.videoRepeatMode = 'off';
+        }
+
+        if (state) {
+          state.imageViewerDefaultZoom = sanitizeImageViewerDefaultZoom(state.imageViewerDefaultZoom);
+        }
+
+        if (state && typeof state.videoShuffle !== 'boolean') {
+          state.videoShuffle = false;
+        }
+
+        if (state) {
+          state.imageViewerMode = sanitizeImageViewerMode(state.imageViewerMode);
         }
 
         if (state && typeof state.creatorAttributionToken !== 'string') {
@@ -526,3 +684,13 @@ export const useSettingsStore = create<SettingsState>()(
     }
   )
 );
+
+// Settings live in a single file on disk, but every window keeps its own copy and
+// persists that whole copy on any change. Without this, a window that missed an
+// update (for example a detached image viewer left open while the main window
+// changes a preference) would silently revert the newer value on its next write.
+if (typeof window !== 'undefined') {
+  window.electronAPI?.onSettingsUpdated?.(() => {
+    void useSettingsStore.persist.rehydrate();
+  });
+}

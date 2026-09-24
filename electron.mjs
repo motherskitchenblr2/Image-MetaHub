@@ -1,5 +1,5 @@
 import electron from 'electron';
-const { app, BrowserWindow, shell, dialog, ipcMain, nativeTheme, Menu, nativeImage, screen, protocol, WebContentsView } = electron;
+const { app, BrowserWindow, shell, dialog, ipcMain, nativeTheme, Menu, nativeImage, screen, protocol, WebContentsView, safeStorage } = electron;
 // console.log('📦 Loaded electron module');
 
 import electronUpdater from 'electron-updater';
@@ -23,18 +23,76 @@ import {
 } from './utils/generatorLauncher.mjs';
 import {
   inferMimeTypeFromName,
+  isExternalResourceModel3DFileName,
+  isModel3DFileName,
   isSupportedMediaFileName,
 } from './utils/mediaTypes.js';
+import { normalizeBirthtimeMs, resolveFileSortDate } from './utils/fileTimestamps.js';
+import { PARSER_VERSION } from './utils/parserVersion.js';
+import { copyFilePreservingTimestamps } from './utils/fileCopy.mjs';
+import { readBasicMp4Metadata } from './utils/mp4Metadata.mjs';
 import {
   isComfyUIViewUrlAllowed,
   normalizeComfyUIViewUrl,
 } from './utils/comfyUIViewSecurity.mjs';
+import { rewriteAvifMetadata, stripAvifMetadata } from './utils/avifMetadata.mjs';
+import { applyCacheTombstones, readCacheTombstonesFile } from './utils/cacheTombstones.mjs';
+import { buildImageMetaHubAvifExtension } from './utils/imageMetaHubAvifExtension.mjs';
+import { createLicenseManager } from './electron/licenseManager.mjs';
+import { licenseClientConfig } from './electron/licenseClientConfig.generated.mjs';
+import { resolveLicenseRuntimeConfig } from './electron/licenseRuntimeConfig.mjs';
+import { resetUserDataContents } from './electron/cacheReset.mjs';
+import { ProvenanceRepositoryLifecycle } from './electron/provenanceRepository.mjs';
+import { StableIdentityIndexer } from './electron/stableIdentityIndexer.mjs';
+import { StableIdentityFileOperationCoordinator } from './electron/stableIdentityFileOperationCoordinator.mjs';
+import { StableIdentityUserDataService } from './electron/stableIdentityUserDataService.mjs';
+import { runStableIdentityFileOperationsSmoke } from './electron/stableIdentityFileOperationsSmoke.mjs';
+import { runSavedPromptPackagedSmoke } from './electron/savedPromptPackagedSmoke.mjs';
+import { openAuthorizedCacheDirectory } from './electron/cacheDirectory.mjs';
+import { appendEmbeddingSegmentAtOffset } from './electron/embeddingSegmentFile.mjs';
+import { hashFileSha256 } from './electron/fileFingerprint.mjs';
+import {
+  createPermanentDeleteGrantStore,
+  permanentlyDeleteGrantedFiles,
+  requestPermanentDeleteConfirmation,
+} from './electron/permanentDeletePolicy.mjs';
+import { resolvePortableRuntime } from './utils/portableRuntime.mjs';
+import { buildDetachedViewerLoadTarget, buildDetachedViewerUrl } from './utils/detachedViewerUrl.mjs';
+import {
+  buildEmbeddingModelDownloadUrl,
+  validateEmbeddingModelId,
+  validateEmbeddingModelRequest,
+} from './electron/embeddingModelPolicy.mjs';
+import {
+  verifyDownloadedModelFile,
+  waitForWritableDrain,
+} from './electron/embeddingModelIntegrity.mjs';
+import {
+  getModel3DSidecarPathIfPresent,
+  renameModel3DWithSidecar,
+  trashModel3DWithSidecar,
+  transferModel3DWithSidecar,
+  writeModel3DExportDataWithSidecar,
+  writeModel3DExportWithSidecar,
+} from './utils/model3DFileOperations.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const desktopRuntime = resolvePortableRuntime();
+const LATEST_RELEASE_URL = 'https://github.com/LuqP2/Image-MetaHub/releases/latest';
+const PORTABLE_UPDATE_ERROR = 'PORTABLE_UPDATE_UNSUPPORTED';
+const permanentDeleteGrants = createPermanentDeleteGrantStore({
+  createToken: () => crypto.randomUUID(),
+});
 
 // Simple development check
-const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+const isDev = !app.isPackaged;
+const PACKAGED_DETACHED_VIEWER_SMOKE_SESSION_ID = 'packaged-detached-viewer-smoke';
+const packagedDetachedViewerSmokeImagePath = app.isPackaged
+  && process.env.GITHUB_ACTIONS === 'true'
+  && typeof process.env.IMH_PACKAGED_DETACHED_VIEWER_SMOKE_IMAGE === 'string'
+  ? process.env.IMH_PACKAGED_DETACHED_VIEWER_SMOKE_IMAGE.trim()
+  : '';
 const gpuMitigationEnabled = process.env.IMH_DISABLE_GPU === '1' || process.env.IMH_DISABLE_GPU === 'true';
 const mediaSafeModeEnabled = process.platform === 'darwin' && (process.env.IMH_MEDIA_SAFE_MODE === '1' || process.env.IMH_MEDIA_SAFE_MODE === 'true');
 const audioDiagnosticModeEnabled = process.platform === 'darwin' && (process.env.IMH_AUDIO_DIAGNOSTIC_MODE === '1' || process.env.IMH_AUDIO_DIAGNOSTIC_MODE === 'true');
@@ -43,6 +101,12 @@ const macOSAudioMitigationOptOut = process.env.IMH_DISABLE_MACOS_AUDIO_MITIGATIO
   || process.env.IMH_ENABLE_OUT_OF_PROCESS_AUDIO === '1'
   || process.env.IMH_ENABLE_OUT_OF_PROCESS_AUDIO === 'true';
 const macOSAudioMitigationEnabled = process.platform === 'darwin' && app.isPackaged && !macOSAudioMitigationOptOut;
+const provenanceIndexingEnabled = process.env.IMH_ENABLE_PROVENANCE_INDEXING === '1'
+  || process.env.IMH_ENABLE_PROVENANCE_INDEXING === 'true';
+const packagedProvenanceFileOperationsSmokeEnabled = app.isPackaged
+  && process.env.IMH_PACKAGED_PROVENANCE_FILE_OPERATIONS_SMOKE === '1';
+const packagedSavedPromptSmokeEnabled = app.isPackaged
+  && process.env.IMH_PACKAGED_SAVED_PROMPT_SMOKE === '1';
 const enabledMediaCommandLineSwitches = [];
 const disabledChromiumFeatures = new Set();
 
@@ -84,9 +148,12 @@ if (disabledChromiumFeatures.size > 0) {
 
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096');
 
-// Parser version - increment when parser logic changes
-// This ensures cache is invalidated when parsing rules change
-const PARSER_VERSION = 9; // v9: Preserve probed audio stream metadata on normalized video records
+// WebGPU powers the optional GPU backend for local visual search. Several
+// Electron builds keep navigator.gpu behind this switch even when hardware
+// acceleration is on, so enable it unless the user disabled the GPU entirely.
+if (!gpuMitigationEnabled) {
+  app.commandLine.appendSwitch('enable-unsafe-webgpu');
+}
 
 const logMainPerf = (event, details = {}) => {
   console.log('[main:perf]', { event, ...details });
@@ -111,12 +178,24 @@ const DEFAULT_WINDOW_HEIGHT = 900;
 const MIN_WINDOW_WIDTH = 800;
 const MIN_WINDOW_HEIGHT = 600;
 const FILE_STAT_CONCURRENCY = 64;
+const MODEL_3D_METADATA_MAX_BYTES = 16 * 1024 * 1024;
 const MEDIA_PROTOCOL_SCHEME = 'imh-media';
 const THUMBNAIL_PROTOCOL_SCHEME = 'imh-thumb';
+const MODEL_PROTOCOL_SCHEME = 'imh-model';
 const THUMBNAIL_CACHE_VERSION = 2;
 const THUMBNAIL_MANIFEST_VERSION = 1;
 const THUMBNAIL_MANIFEST_FILE = 'thumbnail-manifest-v1.json';
 const THUMBNAIL_ALLOWED_EXTENSIONS = new Set(['webp', 'png', 'jpg', 'jpeg']);
+
+const trimJsonChunkPadding = (value) => {
+  let end = value.length;
+  while (end > 0) {
+    const character = value[end - 1];
+    if (character.charCodeAt(0) !== 0 && character.trim() !== '') break;
+    end -= 1;
+  }
+  return value.slice(0, end);
+};
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -139,9 +218,112 @@ protocol.registerSchemesAsPrivileged([
       corsEnabled: true,
     },
   },
+  {
+    // Serves the downloaded CLIP weights to the embedding worker. transformers.js
+    // fetches model files by URL, and the worker has no preload bridge to read
+    // them through, so they need a fetchable origin.
+    scheme: MODEL_PROTOCOL_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      corsEnabled: true,
+    },
+  },
 ]);
 
 const getMimeTypeFromName = (name) => inferMimeTypeFromName(name);
+
+const parseJsonValue = (value) => {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    try {
+      return JSON.parse(value.replace(/:\s*NaN/g, ': null'));
+    } catch {
+      return value;
+    }
+  }
+};
+
+const normalizeEmbeddedModel3DExtras = (extras) => {
+  if (!extras || typeof extras !== 'object' || Array.isArray(extras)) return null;
+  const imageMetaHubData = parseJsonValue(extras.imagemetahub_data);
+  if (imageMetaHubData && typeof imageMetaHubData === 'object' && !Array.isArray(imageMetaHubData)) {
+    return { imagemetahub_data: imageMetaHubData };
+  }
+
+  const workflow = parseJsonValue(extras.workflow);
+  const prompt = parseJsonValue(extras.prompt);
+  if (workflow && typeof workflow === 'object' || prompt && typeof prompt === 'object') {
+    return {
+      ...(workflow && typeof workflow === 'object' ? { workflow } : {}),
+      ...(prompt && typeof prompt === 'object' ? { prompt } : {}),
+    };
+  }
+  return null;
+};
+
+const readModel3DMetadata = async (filePath) => {
+  const sidecarPath = `${filePath}.imagemetahub.json`;
+  try {
+    const sidecarStats = await fs.stat(sidecarPath);
+    if (sidecarStats.isFile() && sidecarStats.size <= MODEL_3D_METADATA_MAX_BYTES) {
+      const sidecar = JSON.parse(await fs.readFile(sidecarPath, 'utf8'));
+      if (sidecar && typeof sidecar === 'object' && !Array.isArray(sidecar)) {
+        return { metadata: { imagemetahub_data: sidecar }, source: 'sidecar' };
+      }
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.warn('[model3d] Could not read metadata sidecar:', error?.message || error);
+    }
+  }
+
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === '.gltf') {
+    const handle = await fs.open(filePath, 'r');
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.size <= 0 || stats.size > MODEL_3D_METADATA_MAX_BYTES) {
+        return { metadata: null, source: 'none' };
+      }
+      const jsonBuffer = Buffer.alloc(stats.size);
+      const jsonRead = await handle.read(jsonBuffer, 0, stats.size, 0);
+      if (jsonRead.bytesRead !== stats.size) return { metadata: null, source: 'none' };
+      const document = JSON.parse(jsonBuffer.toString('utf8'));
+      return { metadata: normalizeEmbeddedModel3DExtras(document?.asset?.extras), source: 'embedded' };
+    } finally {
+      await handle.close();
+    }
+  }
+  if (extension !== '.glb') {
+    return { metadata: null, source: 'none' };
+  }
+
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const header = Buffer.alloc(20);
+    const headerRead = await handle.read(header, 0, header.length, 0);
+    if (headerRead.bytesRead < 20 || header.toString('ascii', 0, 4) !== 'glTF') {
+      return { metadata: null, source: 'none' };
+    }
+    const jsonLength = header.readUInt32LE(12);
+    const jsonType = header.readUInt32LE(16);
+    if (jsonType !== 0x4e4f534a || jsonLength <= 0 || jsonLength > MODEL_3D_METADATA_MAX_BYTES) {
+      return { metadata: null, source: 'none' };
+    }
+    const jsonBuffer = Buffer.alloc(jsonLength);
+    const jsonRead = await handle.read(jsonBuffer, 0, jsonLength, 20);
+    if (jsonRead.bytesRead !== jsonLength) return { metadata: null, source: 'none' };
+    const document = JSON.parse(trimJsonChunkPadding(jsonBuffer.toString('utf8')));
+    return { metadata: normalizeEmbeddedModel3DExtras(document?.asset?.extras), source: 'embedded' };
+  } finally {
+    await handle.close();
+  }
+};
 
 const getSafeFileDetails = async (filePath) => {
   const fileName = path.basename(String(filePath || ''));
@@ -297,6 +479,63 @@ const registerThumbnailProtocol = () => {
   });
 };
 
+const getEmbeddingModelsRoot = () => path.join(app.getPath('userData'), 'models');
+
+// Models are app-scoped, not library-scoped, so they stay in userData even when
+// the user points the cache at another drive. The Hugging Face `org/name`
+// layout is preserved on disk so imh-model:// URLs map straight to files.
+const getEmbeddingModelDir = (modelId) => {
+  const safeModelId = String(modelId || '').replace(/[^a-zA-Z0-9-_./]/g, '_');
+  const modelsRoot = getEmbeddingModelsRoot();
+  const resolved = path.resolve(modelsRoot, safeModelId);
+  if (!isSameOrChildPath(normalizeAllowedPath(resolved), normalizeAllowedPath(modelsRoot))) {
+    throw new Error(`Rejected model id: ${modelId}`);
+  }
+  return resolved;
+};
+
+// Individual file entries (`files`) come from the renderer's model descriptor and
+// are joined onto modelDir with no validation elsewhere; unlike modelId above and
+// every cache-sidecar path in this file, a `file` was never checked for escaping
+// its directory. path.resolve neutralizes both `../..` segments and an absolute
+// `file`, and isSameOrChildPath is the final gate.
+const resolveEmbeddingModelFilePath = (modelDir, file) => {
+  if (typeof file !== 'string' || !file) {
+    throw new Error(`Rejected model file: ${file}`);
+  }
+  const resolved = path.resolve(modelDir, file);
+  if (!isSameOrChildPath(normalizeAllowedPath(resolved), normalizeAllowedPath(modelDir))) {
+    throw new Error(`Rejected model file: ${file}`);
+  }
+  return resolved;
+};
+
+let embeddingModelDownload = null;
+
+const registerModelProtocol = () => {
+  protocol.registerFileProtocol(MODEL_PROTOCOL_SCHEME, async (request, callback) => {
+    try {
+      const requestUrl = new URL(request.url);
+      const relativePath = decodeURIComponent(requestUrl.pathname).replace(/^\/+/, '');
+      const modelsRoot = getEmbeddingModelsRoot();
+      const filePath = path.resolve(modelsRoot, relativePath);
+
+      if (!isSameOrChildPath(normalizeAllowedPath(filePath), normalizeAllowedPath(modelsRoot))) {
+        console.error('SECURITY VIOLATION: Attempted to load a model file outside of the models directory.');
+        console.error('  [imh-model] Requested path:', relativePath);
+        callback({ error: -10 });
+        return;
+      }
+
+      await fs.access(filePath);
+      callback({ path: filePath });
+    } catch (error) {
+      console.error('Error serving model protocol request:', request.url, error);
+      callback({ error: -6 });
+    }
+  });
+};
+
 const parseFrameRate = (value) => {
   if (typeof value !== 'string' || !value.includes('/')) {
     return null;
@@ -376,6 +615,33 @@ async function readMediaMetadataWithFfprobe(filePath) {
 }
 
 let mainWindow;
+let licenseManager;
+let provenanceRepositoryLifecycle;
+let stableIdentityIndexer;
+let stableIdentityFileOperationCoordinator;
+let stableIdentityUserDataService;
+const detachedImageViewerWindows = new Map();
+const detachedImageViewerSnapshots = new Map();
+const detachedImageViewerRequestResolvers = new Map();
+
+async function executeWithStableIdentity(options) {
+  if (!stableIdentityFileOperationCoordinator) {
+    return { value: await options.perform(), provenance: { enabled: false, available: false } };
+  }
+  return stableIdentityFileOperationCoordinator.executeKnownOperation(options);
+}
+
+async function continuePendingStableIdentityDelete(options) {
+  if (!stableIdentityFileOperationCoordinator || !options.operationId) {
+    return executeWithStableIdentity({
+      kind: 'delete',
+      sourcePath: options.sourcePath,
+      perform: options.perform,
+    });
+  }
+  return stableIdentityFileOperationCoordinator.continuePendingDelete(options);
+}
+let packagedDetachedViewerSmokeReadyResolver = null;
 let comfyUIView = null;
 let comfyUIViewConfiguredUrl = '';
 let comfyUIViewState = {
@@ -700,6 +966,10 @@ function mergeSettingsUpdate(currentSettings, newSettings) {
 
 
 async function getCacheRootPath() {
+  if (desktopRuntime.isPortable) {
+    return app.getPath('userData');
+  }
+
   const settings = await readSettings();
   if (settings && typeof settings.cachePath === 'string' && settings.cachePath.trim().length > 0) {
     return settings.cachePath;
@@ -1290,11 +1560,17 @@ function ensureComfyUIView() {
   comfyUIView = new WebContentsView({
     webPreferences: {
       nodeIntegration: false,
-      contextIsolation: true,
+      // contextIsolation is disabled ONLY for this embedded ComfyUI view so the
+      // preload can patch window.WebSocket in the page's main world at document
+      // start (before ComfyUI creates its socket) and read progress/preview frames.
+      // The preload exposes nothing to the page and only reads socket traffic; the
+      // page is the user's own local ComfyUI server. sandbox stays on (no Node).
+      contextIsolation: false,
       sandbox: true,
       webSecurity: true,
       partition: 'persist:imagemetahub-comfyui',
       backgroundThrottling: false,
+      preload: path.join(__dirname, 'comfyui-view-preload.js'),
     },
   });
 
@@ -1792,6 +2068,45 @@ async function launchGeneratorCommand({ command, workingDirectory }) {
 
 // --- Application Menu ---
 function createApplicationMenu() {
+  const updateMenuItem = desktopRuntime.isPortable
+    ? {
+        label: 'Download Latest Release...',
+        click: async () => {
+          await shell.openExternal(LATEST_RELEASE_URL);
+        },
+      }
+    : {
+        label: 'Check for Updates...',
+        click: async () => {
+          if (autoUpdater) {
+            try {
+              console.log('Manually checking for updates...');
+              isManualUpdateCheck = true;
+              await autoUpdater.checkForUpdates();
+            } catch (error) {
+              isManualUpdateCheck = false;
+              console.error('Error checking for updates:', error);
+              if (mainWindow) {
+                dialog.showMessageBox(mainWindow, {
+                  type: 'info',
+                  title: 'Update Check',
+                  message: 'Failed to check for updates.',
+                  detail: error.message || 'Please try again later.',
+                  buttons: ['OK']
+                });
+              }
+            }
+          } else if (mainWindow) {
+            dialog.showMessageBox(mainWindow, {
+              type: 'info',
+              title: 'Update Check',
+              message: 'Auto-updater is not available in development mode.',
+              buttons: ['OK']
+            });
+          }
+        },
+      };
+
   const template = [
     {
       label: 'File',
@@ -1888,39 +2203,7 @@ function createApplicationMenu() {
           }
         },
         { type: 'separator' },
-        {
-          label: 'Check for Updates...',
-          click: async () => {
-            if (autoUpdater) {
-              try {
-                console.log('Manually checking for updates...');
-                isManualUpdateCheck = true;
-                await autoUpdater.checkForUpdates();
-              } catch (error) {
-                isManualUpdateCheck = false;
-                console.error('Error checking for updates:', error);
-                if (mainWindow) {
-                  dialog.showMessageBox(mainWindow, {
-                    type: 'info',
-                    title: 'Update Check',
-                    message: 'Failed to check for updates.',
-                    detail: error.message || 'Please try again later.',
-                    buttons: ['OK']
-                  });
-                }
-              }
-            } else {
-              if (mainWindow) {
-                dialog.showMessageBox(mainWindow, {
-                  type: 'info',
-                  title: 'Update Check',
-                  message: 'Auto-updater is not available in development mode.',
-                  buttons: ['OK']
-                });
-              }
-            }
-          }
-        },
+        updateMenuItem,
         { type: 'separator' },
         {
           label: 'Documentation',
@@ -1965,7 +2248,7 @@ function createApplicationMenu() {
 // --- End Application Menu ---
 
 // Configure auto-updater
-if (autoUpdater) {
+if (autoUpdater && desktopRuntime.autoUpdateSupported) {
   autoUpdater.autoDownload = false; // CRITICAL: Disable automatic downloads
 
   // Configure for macOS specifically
@@ -1991,12 +2274,14 @@ if (autoUpdater) {
       console.log('Auto-update is disabled by user settings.');
     }
   }, 3000); // Wait 3 seconds after app start
+} else if (desktopRuntime.isPortable) {
+  console.log('Portable mode: automatic updates are disabled.');
 } else {
   console.log('⚠️ Auto-updater not available, skipping update configuration');
 }
 
 // Auto-updater events
-if (autoUpdater) {
+if (autoUpdater && desktopRuntime.autoUpdateSupported) {
   autoUpdater.on('checking-for-update', () => {
     // console.log('Checking for update...');
   });
@@ -2132,6 +2417,358 @@ function resolveInitialWindowState(settings) {
   };
 }
 
+function resolveDetachedImageViewerState(settings, sequence = 0) {
+  const saved = settings?.detachedImageViewerWindowState;
+  const mainBounds = mainWindow && !mainWindow.isDestroyed()
+    ? mainWindow.getBounds()
+    : screen.getPrimaryDisplay().bounds;
+  const displays = screen.getAllDisplays();
+  const savedDisplay = typeof saved?.displayId === 'number'
+    ? displays.find((display) => display.id === saved.displayId)
+    : null;
+  const matchedSavedDisplay = saved?.bounds ? screen.getDisplayMatching(saved.bounds) : null;
+  const targetDisplay = savedDisplay ?? matchedSavedDisplay ?? screen.getDisplayMatching(mainBounds);
+  const workArea = targetDisplay.workArea;
+  const margin = 20;
+  const defaultBounds = {
+    x: workArea.x + Math.round(workArea.width * 0.075),
+    y: workArea.y + Math.round(workArea.height * 0.075),
+    width: Math.max(MIN_WINDOW_WIDTH, Math.round(workArea.width * 0.85)),
+    height: Math.max(MIN_WINDOW_HEIGHT, Math.round(workArea.height * 0.85)),
+  };
+  const baseBounds = saved?.bounds ?? defaultBounds;
+  const offset = sequence * 28;
+  const width = Math.min(Math.max(MIN_WINDOW_WIDTH, baseBounds.width), Math.max(MIN_WINDOW_WIDTH, workArea.width - margin * 2));
+  const height = Math.min(Math.max(MIN_WINDOW_HEIGHT, baseBounds.height), Math.max(MIN_WINDOW_HEIGHT, workArea.height - margin * 2));
+  const x = Math.min(
+    Math.max(baseBounds.x + offset, workArea.x + margin),
+    workArea.x + workArea.width - width - margin,
+  );
+  const y = Math.min(
+    Math.max(baseBounds.y + offset, workArea.y + margin),
+    workArea.y + workArea.height - height - margin,
+  );
+  return { bounds: { x, y, width, height }, isMaximized: Boolean(saved?.isMaximized) };
+}
+
+// One debounce timer per viewer window: a shared timer would let the most recent
+// window cancel another window's pending write and silently drop its geometry.
+// Keyed by window id rather than the window object: `closed` fires after the
+// native object is gone, when reading `viewerWindow.id` would throw.
+const persistDetachedViewerStateTimers = new Map();
+function cancelDetachedViewerStatePersist(windowId) {
+  const timer = persistDetachedViewerStateTimers.get(windowId);
+  if (timer) {
+    clearTimeout(timer);
+    persistDetachedViewerStateTimers.delete(windowId);
+  }
+}
+function queueDetachedViewerStatePersist(viewerWindow) {
+  if (!viewerWindow || viewerWindow.isDestroyed()) return;
+  const windowId = viewerWindow.id;
+  cancelDetachedViewerStatePersist(windowId);
+  persistDetachedViewerStateTimers.set(windowId, setTimeout(() => {
+    persistDetachedViewerStateTimers.delete(windowId);
+    if (viewerWindow.isDestroyed()) return;
+    const bounds = viewerWindow.isMaximized() || viewerWindow.isFullScreen()
+      ? viewerWindow.getNormalBounds()
+      : viewerWindow.getBounds();
+    const display = screen.getDisplayMatching(bounds);
+    queueSettingsUpdate((currentSettings) => ({
+      ...currentSettings,
+      detachedImageViewerWindowState: {
+        bounds,
+        displayId: display?.id ?? null,
+        isMaximized: viewerWindow.isMaximized(),
+      },
+    })).catch(() => {});
+  }, 200));
+}
+
+/**
+ * Pick the lowest cascade slot no open viewer is using.
+ *
+ * The offset is clamped to the work area, so slots must be reused as viewers
+ * close: deriving it from a counter (or from how many viewers are open) makes a
+ * new viewer land exactly on top of an existing one once any earlier viewer in
+ * the cascade has been closed.
+ */
+function pickDetachedViewerCascadeSlot() {
+  const usedSlots = new Set();
+  for (const openWindow of detachedImageViewerWindows.values()) {
+    if (openWindow.isDestroyed()) continue;
+    if (typeof openWindow.__imageViewerCascadeSlot === 'number') {
+      usedSlots.add(openWindow.__imageViewerCascadeSlot);
+    }
+  }
+
+  let slot = 0;
+  while (usedSlots.has(slot)) slot += 1;
+  return slot;
+}
+
+/** Notify every renderer except the one that just wrote settings. */
+function broadcastSettingsUpdated(senderWebContents) {
+  const targets = [mainWindow, ...detachedImageViewerWindows.values()];
+  for (const targetWindow of targets) {
+    if (!targetWindow || targetWindow.isDestroyed()) continue;
+    if (targetWindow.webContents === senderWebContents) continue;
+    targetWindow.webContents.send('settings-updated');
+  }
+}
+
+function sendDetachedViewerEvent(sessionId, type, details = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('image-viewer-event', { sessionId, type, ...details });
+}
+
+function openDetachedViewerUrlExternally(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  // Only hand http(s) to the OS handler: file:/javascript:/custom schemes must
+  // never be forwarded to the shell from renderer-controlled input.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+  shell.openExternal(parsed.toString()).catch((error) => {
+    console.warn('Failed to open external viewer URL:', error);
+  });
+}
+
+// The detached viewer runs the same preload as the main window, so a popup or a
+// navigation away from the viewer document would hand `window.electronAPI` to an
+// arbitrary origin. Mirror (and tighten) the main window's hardening.
+function configureDetachedViewerNavigationHandlers(viewerWindow, baseUrl) {
+  const isSameDocument = (url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === baseUrl.protocol
+        && parsed.host === baseUrl.host
+        && parsed.pathname === baseUrl.pathname;
+    } catch {
+      return false;
+    }
+  };
+
+  viewerWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openDetachedViewerUrlExternally(url);
+    return { action: 'deny' };
+  });
+
+  viewerWindow.webContents.on('will-navigate', (event, url) => {
+    if (isSameDocument(url)) return;
+    event.preventDefault();
+    openDetachedViewerUrlExternally(url);
+  });
+}
+
+async function createDetachedImageViewer(sessionId, snapshot) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { success: false, error: 'Main window is not available.' };
+  }
+  const existing = detachedImageViewerWindows.get(sessionId);
+  if (existing && !existing.isDestroyed()) {
+    if (existing.isMinimized()) existing.restore();
+    existing.show();
+    existing.focus();
+    return { success: true, existing: true };
+  }
+
+  const settings = await readSettings();
+  const cascadeSlot = pickDetachedViewerCascadeSlot();
+  const initialState = resolveDetachedImageViewerState(settings, cascadeSlot);
+  const viewerWindow = new BrowserWindow({
+    ...initialState.bounds,
+    minWidth: MIN_WINDOW_WIDTH,
+    minHeight: MIN_WINDOW_HEIGHT,
+    modal: false,
+    alwaysOnTop: false,
+    skipTaskbar: false,
+    show: false,
+    title: 'Image MetaHub',
+    icon: getIconPath(),
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      enableRemoteModule: false,
+      webSecurity: true,
+      backgroundThrottling: false,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+  viewerWindow.setMenu(null);
+  viewerWindow.__imageViewerCascadeSlot = cascadeSlot;
+  const viewerWindowId = viewerWindow.id;
+  if (sessionId === PACKAGED_DETACHED_VIEWER_SMOKE_SESSION_ID) {
+    viewerWindow.once('show', () => {
+      packagedDetachedViewerSmokeReadyResolver?.();
+      packagedDetachedViewerSmokeReadyResolver = null;
+    });
+  }
+
+  const viewerIndexPath = path.join(__dirname, 'dist', 'index.html');
+  const viewerUrl = buildDetachedViewerUrl(
+    viewerIndexPath,
+    sessionId,
+    isDev,
+  );
+  const viewerLoadTarget = buildDetachedViewerLoadTarget(viewerIndexPath, sessionId, isDev);
+  configureDetachedViewerNavigationHandlers(viewerWindow, viewerUrl);
+
+  detachedImageViewerWindows.set(sessionId, viewerWindow);
+  detachedImageViewerSnapshots.set(sessionId, snapshot);
+  let rendererReady = false;
+  let nativeReady = false;
+  const rendererReadyTimeout = setTimeout(() => {
+    if (rendererReady || viewerWindow.isDestroyed()) return;
+    viewerWindow.__suppressImageViewerClosedEvent = true;
+    sendDetachedViewerEvent(sessionId, 'load-failed', { reason: 'Viewer renderer did not become ready.' });
+    viewerWindow.destroy();
+  }, 15000);
+  const showWhenReady = () => {
+    if (!rendererReady || !nativeReady || viewerWindow.isDestroyed()) return;
+    if (initialState.isMaximized) viewerWindow.maximize();
+    viewerWindow.show();
+  };
+  viewerWindow.once('ready-to-show', () => { nativeReady = true; showWhenReady(); });
+  viewerWindow.webContents.on('did-finish-load', () => {
+    // The explicit renderer handshake remains authoritative; this only marks native loading.
+  });
+  viewerWindow.__markImageViewerRendererReady = () => {
+    rendererReady = true;
+    clearTimeout(rendererReadyTimeout);
+    showWhenReady();
+  };
+  viewerWindow.webContents.on('did-fail-load', (_event, errorCode, description, _validatedURL, isMainFrame) => {
+    // Sub-frame failures and aborted loads (ERR_ABORTED, fired whenever a load is
+    // superseded — e.g. a dev-server reload) must not tear the whole window down.
+    if (!isMainFrame || errorCode === -3) return;
+    if (rendererReady || viewerWindow.isDestroyed()) return;
+    viewerWindow.__suppressImageViewerClosedEvent = true;
+    sendDetachedViewerEvent(sessionId, 'load-failed', { reason: description || 'Viewer failed to load.' });
+    viewerWindow.destroy();
+  });
+
+  viewerWindow.on('focus', () => sendDetachedViewerEvent(sessionId, 'focus'));
+  viewerWindow.on('minimize', () => sendDetachedViewerEvent(sessionId, 'minimize'));
+  viewerWindow.on('restore', () => sendDetachedViewerEvent(sessionId, 'restore'));
+  viewerWindow.on('maximize', () => sendDetachedViewerEvent(sessionId, 'maximize'));
+  viewerWindow.on('unmaximize', () => sendDetachedViewerEvent(sessionId, 'unmaximize'));
+  viewerWindow.on('enter-full-screen', () => {
+    if (!viewerWindow.isDestroyed()) viewerWindow.webContents.send('fullscreen-changed', { isFullscreen: true });
+  });
+  viewerWindow.on('leave-full-screen', () => {
+    if (!viewerWindow.isDestroyed()) viewerWindow.webContents.send('fullscreen-changed', { isFullscreen: false });
+  });
+  viewerWindow.on('move', () => queueDetachedViewerStatePersist(viewerWindow));
+  viewerWindow.on('resize', () => queueDetachedViewerStatePersist(viewerWindow));
+  viewerWindow.webContents.on('render-process-gone', (_event, details) => {
+    viewerWindow.__suppressImageViewerClosedEvent = true;
+    sendDetachedViewerEvent(sessionId, rendererReady ? 'render-process-gone' : 'load-failed', { reason: details?.reason || 'unknown' });
+    if (!viewerWindow.isDestroyed()) viewerWindow.destroy();
+  });
+  viewerWindow.on('closed', () => {
+    clearTimeout(rendererReadyTimeout);
+    cancelDetachedViewerStatePersist(viewerWindowId);
+    detachedImageViewerWindows.delete(sessionId);
+    detachedImageViewerSnapshots.delete(sessionId);
+    if (!viewerWindow.__suppressImageViewerClosedEvent) sendDetachedViewerEvent(sessionId, 'closed');
+  });
+
+  try {
+    if (viewerLoadTarget.method === 'url') {
+      await viewerWindow.loadURL(viewerLoadTarget.url);
+    } else {
+      await viewerWindow.loadFile(viewerLoadTarget.filePath, viewerLoadTarget.options);
+    }
+    return { success: true };
+  } catch (error) {
+    detachedImageViewerWindows.delete(sessionId);
+    detachedImageViewerSnapshots.delete(sessionId);
+    if (!viewerWindow.isDestroyed()) viewerWindow.destroy();
+    return { success: false, error: error?.message || 'Failed to load detached viewer.' };
+  }
+}
+
+async function runPackagedDetachedViewerSmokeTest() {
+  if (!packagedDetachedViewerSmokeImagePath) return;
+
+  let timeoutId;
+  try {
+    const imagePath = path.resolve(packagedDetachedViewerSmokeImagePath);
+    const imageStats = await fs.stat(imagePath);
+    if (!imageStats.isFile()) {
+      throw new Error(`Smoke image is not a file: ${imagePath}`);
+    }
+
+    const directoryPath = path.dirname(imagePath);
+    const imageName = path.basename(imagePath);
+    const readyPromise = new Promise((resolve, reject) => {
+      packagedDetachedViewerSmokeReadyResolver = resolve;
+      timeoutId = setTimeout(() => reject(new Error('Detached viewer did not become visible after its renderer-ready handshake.')), 20000);
+    });
+    const snapshot = {
+      sessionId: PACKAGED_DETACHED_VIEWER_SMOKE_SESSION_ID,
+      revision: 1,
+      image: {
+        id: imagePath,
+        name: imageName,
+        metadata: { normalizedMetadata: {} },
+        metadataString: '',
+        lastModified: imageStats.mtimeMs,
+        models: [],
+        loras: [],
+        scheduler: '',
+        directoryId: directoryPath,
+        fileSize: imageStats.size,
+        fileType: 'image/png',
+      },
+      previousImage: null,
+      nextImage: null,
+      currentIndex: 0,
+      totalImages: 1,
+      directoryPath,
+      isIndexing: false,
+      startSlideshow: false,
+      closeOnSlideshowExit: false,
+      recentTags: [],
+      comparisonCount: 0,
+      comparisonImages: [],
+      collections: [],
+      selectedImageIds: [],
+    };
+
+    const openResult = await createDetachedImageViewer(PACKAGED_DETACHED_VIEWER_SMOKE_SESSION_ID, snapshot);
+    if (!openResult.success) {
+      throw new Error(openResult.error || 'Failed to open detached viewer.');
+    }
+
+    await readyPromise;
+    console.log('[packaged-detached-viewer-smoke] renderer-ready');
+    closeAllDetachedImageViewers();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+    app.exit(0);
+  } catch (error) {
+    console.error('[packaged-detached-viewer-smoke] failed:', error);
+    closeAllDetachedImageViewers();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+    app.exit(1);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    packagedDetachedViewerSmokeReadyResolver = null;
+  }
+}
+
+function closeAllDetachedImageViewers() {
+  for (const viewerWindow of detachedImageViewerWindows.values()) {
+    if (!viewerWindow.isDestroyed()) viewerWindow.destroy();
+  }
+  detachedImageViewerWindows.clear();
+  detachedImageViewerSnapshots.clear();
+}
+
 async function persistWindowState() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
@@ -2187,7 +2824,7 @@ async function createWindow(startupDirectory = null) {
     mainWindow.setTitle(`Image MetaHub v${appVersion}`);
   } catch {
     // Fallback if app.getVersion is not available
-    mainWindow.setTitle('Image MetaHub v0.17.3');
+    mainWindow.setTitle('Image MetaHub v0.19.3');
   }
 
   // Load the app
@@ -2273,6 +2910,7 @@ async function createWindow(startupDirectory = null) {
   });
 
   mainWindow.on('closed', () => {
+    closeAllDetachedImageViewers();
     disposeComfyUIView('main-window-closed');
     mainWindow = null;
   });
@@ -2339,13 +2977,140 @@ app.whenReady().then(async () => {
   registerProcessDiagnostics();
   registerMediaProtocol();
   registerThumbnailProtocol();
+  registerModelProtocol();
+
+  provenanceRepositoryLifecycle = new ProvenanceRepositoryLifecycle({
+    userDataPath: app.getPath('userData'),
+  });
+  provenanceRepositoryLifecycle.initialize();
+  stableIdentityUserDataService = new StableIdentityUserDataService({
+    repositoryLifecycle: provenanceRepositoryLifecycle,
+    userDataPath: app.getPath('userData'),
+    migrationEnabled: provenanceIndexingEnabled,
+    publishChanges: (payload) => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('stable-user-data-changed', payload);
+        }
+      }
+    },
+  });
+  try {
+    stableIdentityUserDataService.initialize();
+  } catch (error) {
+    console.error('Stable-identity user-data migration could not initialize; application startup will continue.', error);
+  }
+  stableIdentityIndexer = new StableIdentityIndexer({
+    repositoryLifecycle: provenanceRepositoryLifecycle,
+    enabled: provenanceIndexingEnabled && provenanceRepositoryLifecycle.getStatus().available,
+  });
+  const stableUserDataStatus = stableIdentityUserDataService.getStatus();
+  stableIdentityFileOperationCoordinator = new StableIdentityFileOperationCoordinator({
+    repositoryLifecycle: provenanceRepositoryLifecycle,
+    indexer: stableIdentityIndexer,
+    // A profile that already crossed the user-data authority boundary must keep
+    // journaling known file operations even when indexing is later disabled.
+    // The indexer stays disabled, so this does not restart scans or hashing.
+    enabled: provenanceIndexingEnabled || (
+      stableUserDataStatus.authority === 'sqlite' && stableUserDataStatus.available
+    ),
+    publishMappings: (payload) => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('provenance-identities-assigned', payload);
+        }
+      }
+    },
+  });
+  await stableIdentityFileOperationCoordinator.initializeRecovery();
+
+  if (packagedSavedPromptSmokeEnabled) {
+    const resultPath = process.env.IMH_PACKAGED_SAVED_PROMPT_SMOKE_RESULT?.trim();
+    try {
+      if (!resultPath) throw new Error('Packaged saved-prompt smoke result path is required.');
+      const result = runSavedPromptPackagedSmoke({
+        userDataPath: app.getPath('userData'),
+        repositoryLifecycle: provenanceRepositoryLifecycle,
+        indexingEnabled: provenanceIndexingEnabled,
+      });
+      await fs.mkdir(path.dirname(resultPath), { recursive: true });
+      await fs.writeFile(resultPath, JSON.stringify(result, null, 2), 'utf8');
+      console.log('[packaged-saved-prompt-smoke] success');
+      app.exit(0);
+    } catch (error) {
+      console.error('[packaged-saved-prompt-smoke] failed', error);
+      if (resultPath) {
+        try {
+          await fs.mkdir(path.dirname(resultPath), { recursive: true });
+          await fs.writeFile(resultPath, JSON.stringify({ success: false, error: error?.message || String(error) }, null, 2), 'utf8');
+        } catch { /* console output remains the fallback diagnostic */ }
+      }
+      app.exit(1);
+    }
+    return;
+  }
+
+  if (packagedProvenanceFileOperationsSmokeEnabled) {
+    const smokeRoot = process.env.IMH_PACKAGED_PROVENANCE_FILE_OPERATIONS_SMOKE_ROOT?.trim();
+    const resultPath = process.env.IMH_PACKAGED_PROVENANCE_FILE_OPERATIONS_SMOKE_RESULT?.trim();
+    try {
+      if (!smokeRoot || !resultPath) throw new Error('Packaged provenance smoke paths are required.');
+      const result = await runStableIdentityFileOperationsSmoke({
+        rootPath: smokeRoot,
+        userDataPath: app.getPath('userData'),
+        repositoryLifecycle: provenanceRepositoryLifecycle,
+        userDataService: stableIdentityUserDataService,
+        indexer: stableIdentityIndexer,
+        coordinator: stableIdentityFileOperationCoordinator,
+      });
+      await fs.mkdir(path.dirname(resultPath), { recursive: true });
+      await fs.writeFile(resultPath, JSON.stringify(result, null, 2), 'utf8');
+      console.log('[packaged-provenance-file-operations-smoke] success');
+      app.exit(0);
+    } catch (error) {
+      console.error('[packaged-provenance-file-operations-smoke] failed', error);
+      if (resultPath) {
+        try {
+          await fs.mkdir(path.dirname(resultPath), { recursive: true });
+          await fs.writeFile(resultPath, JSON.stringify({ success: false, error: error?.message || String(error) }, null, 2), 'utf8');
+        } catch { /* console output remains the fallback diagnostic */ }
+      }
+      app.exit(1);
+    }
+    return;
+  }
+
+  const licenseRuntimeConfig = resolveLicenseRuntimeConfig({
+    isPackaged: app.isPackaged,
+    env: process.env,
+    bakedConfig: licenseClientConfig,
+  });
+  licenseManager = createLicenseManager({
+    userDataPath: app.getPath('userData'),
+    serverUrl: licenseRuntimeConfig.serverUrl,
+    publicKey: licenseRuntimeConfig.publicKey,
+    safeStorage,
+    readSettings,
+    updateSettings: async (updater) => {
+      await queueSettingsUpdate(updater);
+      broadcastSettingsUpdated(null);
+    },
+    onStatusChanged: (status) => broadcastLicenseStatusChanged(status),
+    appVersion: app.getVersion(),
+    platform: process.platform,
+  });
+  await licenseManager.initialize();
 
   // Listen for theme changes and notify renderer
   nativeTheme.on('updated', () => {
+    const themePayload = {
+      shouldUseDarkColors: nativeTheme.shouldUseDarkColors,
+    };
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('theme-updated', {
-        shouldUseDarkColors: nativeTheme.shouldUseDarkColors,
-      });
+      mainWindow.webContents.send('theme-updated', themePayload);
+    }
+    for (const viewerWindow of detachedImageViewerWindows.values()) {
+      if (!viewerWindow.isDestroyed()) viewerWindow.webContents.send('theme-updated', themePayload);
     }
   });
 
@@ -2383,10 +3148,206 @@ app.whenReady().then(async () => {
   }
 
   // Setup IPC handlers for file operations BEFORE creating window
+  setupLicenseHandlers();
+  setupImageViewerHandlers();
   setupFileOperationHandlers();
   
   await createWindow(startupDirectory);
+  await runPackagedDetachedViewerSmokeTest();
 });
+
+function setupLicenseHandlers() {
+  ipcMain.handle('trial:activate', async (event) => {
+    try {
+      if (desktopRuntime.isPortable) {
+        return {
+          success: false,
+          activated: false,
+          trialStartDate: null,
+          error: 'The free trial is not available in the Portable edition. Activate a license key to unlock Pro.',
+        };
+      }
+
+      const authorityStatus = await licenseManager.getStatus();
+      if (authorityStatus.authorized) {
+        return {
+          success: false,
+          activated: false,
+          trialStartDate: null,
+          error: 'A paid license is already active.',
+        };
+      }
+
+      let activated = false;
+      let trialStartDate = null;
+      await queueSettingsUpdate((currentSettings) => {
+        const currentLicense = currentSettings?.license && typeof currentSettings.license === 'object'
+          ? currentSettings.license
+          : {};
+        const persistedTrialStartDate = Number(currentLicense.trialStartDate);
+        const hasExistingTrial = currentLicense.trialActivated === true
+          && Number.isFinite(persistedTrialStartDate)
+          && persistedTrialStartDate > 0;
+        trialStartDate = hasExistingTrial ? persistedTrialStartDate : Date.now();
+        activated = !hasExistingTrial;
+
+        return {
+          ...currentSettings,
+          license: {
+            ...currentLicense,
+            migrationResetApplied: true,
+            expiredTrialResetApplied: true,
+            nextReleaseTrialResetApplied: true,
+            trialDurationV2ResetApplied: true,
+            trialStartDate,
+            trialActivated: true,
+            licenseStatus: 'trial',
+            trialExpiredNoticeDismissed: false,
+          },
+        };
+      });
+
+      // The source renderer receives the canonical result below; every other
+      // renderer rehydrates from the settings just committed by the main process.
+      broadcastSettingsUpdated(event.sender);
+      return {
+        success: true,
+        activated,
+        trialStartDate,
+      };
+    } catch (error) {
+      console.error('Failed to activate trial:', error);
+      return {
+        success: false,
+        activated: false,
+        trialStartDate: null,
+        error: 'The trial state could not be saved.',
+      };
+    }
+  });
+  ipcMain.handle('license:get-status', () => licenseManager.getStatus());
+  ipcMain.handle('license:activate', (_event, { key, email } = {}) => licenseManager.activate(key, email));
+  ipcMain.handle('license:refresh', () => licenseManager.refresh());
+  ipcMain.handle('license:deactivate', () => licenseManager.deactivate());
+}
+
+function broadcastLicenseStatusChanged(status) {
+  const targets = [mainWindow, ...detachedImageViewerWindows.values()];
+  for (const targetWindow of targets) {
+    if (!targetWindow || targetWindow.isDestroyed()) continue;
+    targetWindow.webContents.send('license-status-changed', status);
+  }
+}
+
+function setupImageViewerHandlers() {
+  const isMainSender = (event) => Boolean(
+    mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents
+  );
+  const resolveViewerSender = (event, sessionId) => {
+    const viewerWindow = detachedImageViewerWindows.get(sessionId);
+    return viewerWindow && !viewerWindow.isDestroyed() && event.sender === viewerWindow.webContents
+      ? viewerWindow
+      : null;
+  };
+
+  ipcMain.handle('image-viewer-open', async (event, payload) => {
+    if (!isMainSender(event) || typeof payload?.sessionId !== 'string' || !payload?.snapshot) {
+      return { success: false, error: 'Unauthorized image viewer request.' };
+    }
+    return createDetachedImageViewer(payload.sessionId, payload.snapshot);
+  });
+
+  ipcMain.handle('image-viewer-update', (event, payload) => {
+    if (!isMainSender(event) || typeof payload?.sessionId !== 'string' || !payload?.snapshot) {
+      return { success: false, error: 'Unauthorized image viewer update.' };
+    }
+    const viewerWindow = detachedImageViewerWindows.get(payload.sessionId);
+    if (!viewerWindow || viewerWindow.isDestroyed()) {
+      return { success: false, error: 'Image viewer is not open.' };
+    }
+    const previous = detachedImageViewerSnapshots.get(payload.sessionId);
+    if (previous && Number(previous.revision) >= Number(payload.snapshot.revision)) {
+      return { success: true, ignored: true };
+    }
+    detachedImageViewerSnapshots.set(payload.sessionId, payload.snapshot);
+    viewerWindow.webContents.send('image-viewer-snapshot', payload.snapshot);
+    return { success: true };
+  });
+
+  ipcMain.handle('image-viewer-ready', (event, sessionId) => {
+    const viewerWindow = resolveViewerSender(event, sessionId);
+    if (!viewerWindow) return { success: false, error: 'Unknown image viewer.' };
+    const snapshot = detachedImageViewerSnapshots.get(sessionId);
+    if (!snapshot) return { success: false, error: 'Image viewer snapshot is unavailable.' };
+    viewerWindow.webContents.send('image-viewer-snapshot', snapshot);
+    viewerWindow.__markImageViewerRendererReady?.();
+    return { success: true };
+  });
+
+  ipcMain.handle('image-viewer-window-action', (event, payload) => {
+    const sessionId = payload?.sessionId;
+    const action = payload?.action;
+    const viewerWindow = isMainSender(event)
+      ? detachedImageViewerWindows.get(sessionId)
+      : resolveViewerSender(event, sessionId);
+    if (!viewerWindow || viewerWindow.isDestroyed()) {
+      return { success: false, error: 'Unknown image viewer.' };
+    }
+    if (action === 'focus' || action === 'restore') {
+      if (viewerWindow.isMinimized()) viewerWindow.restore();
+      viewerWindow.show();
+      viewerWindow.focus();
+    } else if (action === 'minimize') {
+      viewerWindow.minimize();
+    } else if (action === 'close') {
+      viewerWindow.close();
+    } else if (action === 'focus-main') {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    } else if (action === 'toggle-always-on-top') {
+      const isAlwaysOnTop = !viewerWindow.isAlwaysOnTop();
+      viewerWindow.setAlwaysOnTop(isAlwaysOnTop);
+      return { success: true, isAlwaysOnTop };
+    } else {
+      return { success: false, error: 'Unsupported image viewer action.' };
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('image-viewer-command', (event, payload) => {
+    const sessionId = payload?.sessionId;
+    if (!resolveViewerSender(event, sessionId) || !payload?.command || !mainWindow || mainWindow.isDestroyed()) {
+      return Promise.resolve({ success: false, error: 'Unauthorized image viewer command.' });
+    }
+    const requestId = `${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        detachedImageViewerRequestResolvers.delete(requestId);
+        resolve({ success: false, error: 'Image viewer command timed out.' });
+      }, 15000);
+      detachedImageViewerRequestResolvers.set(requestId, (response) => {
+        clearTimeout(timeout);
+        resolve(response);
+      });
+      mainWindow.webContents.send('image-viewer-command', {
+        sessionId,
+        requestId,
+        command: payload.command,
+      });
+    });
+  });
+
+  ipcMain.on('image-viewer-command-response', (event, payload) => {
+    if (!isMainSender(event) || typeof payload?.requestId !== 'string') return;
+    const resolve = detachedImageViewerRequestResolvers.get(payload.requestId);
+    if (!resolve) return;
+    detachedImageViewerRequestResolvers.delete(payload.requestId);
+    resolve(payload.response ?? { success: true });
+  });
+}
 
 // Setup IPC handlers for file operations
 // Store allowed directory paths for security
@@ -2423,6 +3384,64 @@ const isPathAllowed = (filePath) => {
   return Array.from(allowedDirectoryPaths).some((allowedPath) => isSameOrChildPath(normalizedFilePath, allowedPath));
 };
 
+const findAllowedDirectoryRoot = (filePath) => {
+  if (!filePath) return null;
+  const normalizedFilePath = normalizeAllowedPath(filePath);
+  return Array.from(allowedDirectoryPaths)
+    .filter((allowedPath) => isSameOrChildPath(normalizedFilePath, allowedPath))
+    .sort((left, right) => right.length - left.length)[0] ?? null;
+};
+
+const stableFileUserDataContext = ({ legacyImageId, sourcePath = null, destinationPath = null, copyUserData = false } = {}) => {
+  if (typeof legacyImageId !== 'string' || !legacyImageId.trim()) return null;
+  const stableStatus = stableIdentityUserDataService?.getStatus?.();
+  return {
+    legacyImageId,
+    copyUserData,
+    ...(stableStatus?.authority === 'sqlite' && sourcePath
+      ? { sourceRootPath: findAllowedDirectoryRoot(sourcePath) }
+      : {}),
+    ...(stableStatus?.authority === 'sqlite' && destinationPath
+      ? { destinationRootPath: findAllowedDirectoryRoot(destinationPath) }
+      : {}),
+  };
+};
+
+// Symlink-aware containment check for write operations (e.g. creating a folder).
+// isPathAllowed compares textual paths, which is correct for reads but has two
+// blind spots when writing: a symlinked subfolder inside the library can point
+// OUTSIDE it, and an indexed root can itself be a symlink/alias (common on macOS,
+// or when the library lives on an external disk) whose real target is not in the
+// textual allowlist. Resolving both sides and comparing the *real* paths handles
+// both: it permits a legitimately symlinked root while still rejecting a symlink
+// that escapes the library's real tree. Falls back to the textual check if a
+// realpath cannot be resolved.
+const isResolvedPathWithinAllowed = async (candidatePath) => {
+  if (allowedDirectoryPaths.size === 0 || !candidatePath) return false;
+
+  let realCandidate;
+  try {
+    realCandidate = await fs.realpath(candidatePath);
+  } catch {
+    return isPathAllowed(candidatePath);
+  }
+  const normalizedCandidate = normalizeAllowedPath(realCandidate);
+
+  for (const allowedPath of allowedDirectoryPaths) {
+    let realAllowed = allowedPath;
+    try {
+      realAllowed = await fs.realpath(allowedPath);
+    } catch {
+      // Allowed root no longer resolvable; skip it.
+      continue;
+    }
+    if (isSameOrChildPath(normalizedCandidate, normalizeAllowedPath(realAllowed))) {
+      return true;
+    }
+  }
+  return false;
+};
+
 // Helper function for recursive file search
 async function mapWithConcurrency(items, concurrency, mapper) {
   const results = [];
@@ -2452,13 +3471,14 @@ async function statMediaEntries(directory, entries, baseDirectory) {
     const lowerName = entry.name.toLowerCase();
     const fullPath = path.join(directory, entry.name);
     const stats = await fs.stat(fullPath);
+    const birthtimeMs = normalizeBirthtimeMs(stats.birthtimeMs);
     return {
       name: path.relative(baseDirectory, fullPath).replace(/\\/g, '/'),
-      lastModified: stats.birthtimeMs ?? stats.mtimeMs,
+      lastModified: resolveFileSortDate(birthtimeMs, stats.mtimeMs),
       contentModifiedMs: stats.mtimeMs,
       size: stats.size,
       type: getMimeTypeFromName(lowerName),
-      birthtimeMs: stats.birthtimeMs,
+      birthtimeMs,
     };
   });
 
@@ -2489,6 +3509,7 @@ async function getFilesRecursively(directory, baseDirectory) {
   const start = Date.now();
   let directoriesVisited = 0;
   let directoriesSkipped = 0;
+  let complete = true;
 
   while (directoriesToVisit.length > 0) {
     const currentDirectory = directoriesToVisit.pop();
@@ -2517,6 +3538,7 @@ async function getFilesRecursively(directory, baseDirectory) {
       files.push(...fileRecords);
     } catch (error) {
       // Ignore errors from directories we can't read, e.g. permissions
+      complete = false;
       console.warn(`Could not read directory ${currentDirectory}: ${error.message}`);
     }
   }
@@ -2528,11 +3550,17 @@ async function getFilesRecursively(directory, baseDirectory) {
     files: files.length,
     durationMs: elapsedMs(start),
   });
-  return files;
+  return { files, complete };
 }
 
 function setupFileOperationHandlers() {
   const approvedWriteRoots = new Set();
+  const activeFingerprintRequests = new Map();
+  const fingerprintRequestKey = (senderId, requestId) => `${senderId}:${requestId}`;
+  const cancelFingerprintRequest = (senderId, requestId) => {
+    if (typeof requestId !== 'string' || !requestId) return;
+    activeFingerprintRequests.get(fingerprintRequestKey(senderId, requestId))?.abort();
+  };
   const registerApprovedWriteRoot = (targetPath) => {
     if (!targetPath) return;
     const normalizedTarget = normalizeAllowedPath(targetPath);
@@ -2617,7 +3645,7 @@ function setupFileOperationHandlers() {
   };
 
   const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const PNG_EXPORTABLE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+  const METADATA_REWRITE_SUPPORTED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.avif']);
   const PNG_METADATA_CHUNKS = new Set(['tEXt', 'iTXt', 'zTXt', 'eXIf', 'tIME']);
   const WEBP_METADATA_CHUNKS = new Set(['EXIF', 'XMP ']);
   const WEBP_VP8X_EXIF_FLAG = 0x08;
@@ -2903,7 +3931,11 @@ function setupFileOperationHandlers() {
       return stripMetadataFromWebpBuffer(buffer);
     }
 
-    throw new Error('This file format can only be exported with metadata preserved in v1.');
+    if (sourceExtension === '.avif') {
+      return Buffer.from(stripAvifMetadata(buffer));
+    }
+
+    throw new Error('This file format can only be exported with metadata preserved.');
   };
 
   const toLoraPayload = (loras) => {
@@ -3035,15 +4067,30 @@ function setupFileOperationHandlers() {
     }
 
     const sourceExtension = path.extname(relativePath).toLowerCase();
-    if (!PNG_EXPORTABLE_EXTENSIONS.has(sourceExtension)) {
-      throw new Error('This file format can only be exported with metadata preserved in v1.');
+    if (!METADATA_REWRITE_SUPPORTED_EXTENSIONS.has(sourceExtension)) {
+      throw new Error('This file format can only be exported with metadata preserved.');
     }
 
-    if (metadataPolicy === 'strip' && targetFormat === 'original') {
+    // AVIF cannot be re-encoded to another format in the main process (nativeImage
+    // has no AVIF decoder), so a strip export of an AVIF always strips in place and
+    // stays AVIF rather than falling through to the nativeImage conversion path.
+    if (metadataPolicy === 'strip' && (targetFormat === 'original' || sourceExtension === '.avif')) {
       const sourceBuffer = await fs.readFile(sourcePath);
       return {
         buffer: stripMetadataFromImageBuffer(sourceBuffer, sourceExtension),
         fileName: path.basename(relativePath),
+      };
+    }
+
+    if (metadataPolicy === 'metahub_standard' && sourceExtension === '.avif') {
+      if (!effectiveMetadata) {
+        throw new Error('Edited metadata is required for MetaHub export.');
+      }
+      const sourceBuffer = await fs.readFile(sourcePath);
+      const extension = buildImageMetaHubAvifExtension(effectiveMetadata);
+      return {
+        buffer: Buffer.from(rewriteAvifMetadata(sourceBuffer, { extension })),
+        fileName: `${path.parse(relativePath).name}.avif`,
       };
     }
 
@@ -3072,6 +4119,10 @@ function setupFileOperationHandlers() {
   ipcMain.handle('save-settings', async (event, newSettings) => {
     try {
       await queueSettingsUpdate((currentSettings) => mergeSettingsUpdate(currentSettings, newSettings));
+      // Every window persists its *whole* settings state, so a window holding a
+      // stale copy would revert another window's newer values on the next write.
+      // Tell the other windows to rehydrate so none of them can go stale.
+      broadcastSettingsUpdated(event.sender);
       return { success: true };
     } catch (error) {
       return { success: false, error: error?.message || 'Failed to save settings.' };
@@ -3088,6 +4139,9 @@ function setupFileOperationHandlers() {
         ...currentSettings,
         lastViewedVersion: versionToPersist,
       }));
+      // `lastViewedVersion` is part of the renderer settings store, so the other
+      // windows have to pick it up or they would write the old value back.
+      broadcastSettingsUpdated(event.sender);
 
       return { success: true };
     } catch (error) {
@@ -3157,6 +4211,55 @@ function setupFileOperationHandlers() {
     }
   });
 
+  // On-demand Civitai lookup for a model/LoRA reference, keyed by hash or by
+  // Civitai model version id. This is the ONLY outbound network request the app
+  // makes for this feature, and it fires only when the user clicks a model/LoRA
+  // in the image modal — never during indexing. Routing it through the main
+  // process avoids CORS and keeps it auditable/local-first.
+  ipcMain.handle('civitai-lookup', async (event, query) => {
+    try {
+      const hash = typeof query?.hash === 'string' ? query.hash.trim() : '';
+      const versionId = typeof query?.versionId === 'number' ? query.versionId : null;
+
+      let endpoint;
+      if (hash && /^[0-9a-f]{8,64}$/i.test(hash)) {
+        endpoint = `https://civitai.com/api/v1/model-versions/by-hash/${encodeURIComponent(hash)}`;
+      } else if (versionId && Number.isFinite(versionId)) {
+        endpoint = `https://civitai.com/api/v1/model-versions/${encodeURIComponent(String(versionId))}`;
+      } else {
+        return { status: 'notFound' };
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      let response;
+      try {
+        response = await fetch(endpoint, { signal: controller.signal, headers: { Accept: 'application/json' } });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      if (response.status === 404) {
+        return { status: 'notFound' };
+      }
+      // Rate limit / server hiccups / anything non-OK: transient, do not cache.
+      if (!response.ok) {
+        return { status: 'unavailable' };
+      }
+
+      const data = await response.json();
+      const modelId = data?.modelId;
+      const resolvedVersionId = data?.id;
+      if (typeof modelId !== 'number' || typeof resolvedVersionId !== 'number') {
+        return { status: 'notFound' };
+      }
+      return { status: 'found', modelId, versionId: resolvedVersionId };
+    } catch (error) {
+      // Network failure / abort — transient, let the renderer offer a retry.
+      return { status: 'unavailable' };
+    }
+  });
+
   ipcMain.handle('open-path', async (event, filePath) => {
     try {
       if (!filePath) {
@@ -3189,6 +4292,74 @@ function setupFileOperationHandlers() {
       return await openComfyUIView(payload);
     } catch (error) {
       return { success: false, error: error?.message || 'Failed to open embedded ComfyUI.' };
+    }
+  });
+
+  // Relay read-only ComfyUI WebSocket events observed by the embedded view's
+  // preload (progress / preview) to the main renderer's generation queue.
+  ipcMain.on('comfy-embedded-ws-event', (event, message) => {
+    if (!comfyUIView || comfyUIView.webContents.isDestroyed()) {
+      return;
+    }
+    // Only accept events from the embedded ComfyUI view, never other web contents.
+    if (event.sender !== comfyUIView.webContents) {
+      return;
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+    mainWindow.webContents.send('comfy-embedded-progress', message);
+  });
+
+  // Queue the workflow currently loaded in the embedded ComfyUI view, so the user
+  // can trigger a generation from anywhere in the app. Uses ComfyUI's own queue
+  // mechanism (window.app) so the exact current graph/widget state is serialized.
+  ipcMain.handle('comfy-view-run-workflow', async () => {
+    try {
+      const contents = comfyUIView?.webContents;
+      if (!contents || contents.isDestroyed()) {
+        return { success: false, error: 'ComfyUI is not open. Open the ComfyUI workspace and load a workflow first.' };
+      }
+
+      const currentUrl = contents.getURL();
+      if (!currentUrl || !isComfyNavigationAllowed(currentUrl)) {
+        return { success: false, error: 'ComfyUI is not loaded on the configured server.' };
+      }
+
+      await waitForComfyUIRuntime(contents);
+
+      return await contents.executeJavaScript(`
+        (async () => {
+          const app = window.app || window.comfyApp || window.ComfyApp?.instance || null;
+          if (!app) {
+            return { success: false, error: 'ComfyUI app was not found on the page.' };
+          }
+          const runMaybeAsync = async (fn) => {
+            if (typeof fn !== 'function') return false;
+            const out = fn();
+            if (out && typeof out.then === 'function') await out;
+            return true;
+          };
+          const candidates = [
+            () => app.queuePrompt(0),
+            () => app.queuePrompt(0, 1),
+            () => app.extensionManager?.command?.execute?.('Comfy.QueuePrompt'),
+          ];
+          let lastError = null;
+          for (const candidate of candidates) {
+            try {
+              if (await runMaybeAsync(candidate)) {
+                return { success: true };
+              }
+            } catch (error) {
+              lastError = error?.message || String(error);
+            }
+          }
+          return { success: false, error: lastError || 'This ComfyUI version did not expose a supported queue action.' };
+        })()
+      `, true);
+    } catch (error) {
+      return { success: false, error: error?.message || 'Failed to run the ComfyUI workflow.' };
     }
   });
 
@@ -3295,9 +4466,7 @@ function setupFileOperationHandlers() {
 
   ipcMain.handle('get-default-cache-path', () => {
     try {
-      // Define a specific subfolder for the cache
-      const cachePath = path.join(app.getPath('userData'), 'ImageMetaHubCache');
-      return { success: true, path: cachePath };
+      return { success: true, path: app.getPath('userData') };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -3306,6 +4475,12 @@ function setupFileOperationHandlers() {
   ipcMain.handle('get-user-data-path', () => {
     return app.getPath('userData');
   });
+
+  ipcMain.handle('get-runtime-info', () => ({
+    isPortable: desktopRuntime.isPortable,
+    userDataPath: app.getPath('userData'),
+    autoUpdateSupported: desktopRuntime.autoUpdateSupported,
+  }));
 
   ipcMain.handle('get-theme', () => {
     return {
@@ -3449,8 +4624,13 @@ function setupFileOperationHandlers() {
 
     // Write main cache record (without metadata) with parser version
     const mainCachePath = await getCacheFilePath(cacheId);
+
+    // Every entry was just rewritten from the caller's full list, so any
+    // pending tombstones are already reflected in it.
+    await applyCacheTombstones({ cacheDir, safeCacheId, recordPath: mainCachePath, tombstones: undefined });
     cacheRecord.chunkCount = chunkCount;
     cacheRecord.parserVersion = PARSER_VERSION; // Add parser version
+    cacheRecord.tombstoneCount = 0;
     await fs.writeFile(mainCachePath, JSON.stringify(cacheRecord, null, 2));
 
     logMainPerf('cache-data:complete', {
@@ -3537,14 +4717,14 @@ function setupFileOperationHandlers() {
     }
   });
 
-  ipcMain.handle('finalize-cache-write', async (event, { cacheId, sourceCacheId, record }) => {
+  ipcMain.handle('finalize-cache-write', async (event, { cacheId, sourceCacheId, record, tombstones }) => {
     const start = Date.now();
     try {
       const safeCacheId = cacheId.replace(/[^a-zA-Z0-9-_]/g, '_');
       const safeSourceCacheId = sourceCacheId?.replace(/[^a-zA-Z0-9-_]/g, '_');
+      const rootPath = await getCacheRootPath();
+      const cacheDir = path.join(rootPath, 'json_cache');
       if (safeSourceCacheId && safeSourceCacheId !== safeCacheId) {
-        const rootPath = await getCacheRootPath();
-        const cacheDir = path.join(rootPath, 'json_cache');
         await fs.mkdir(cacheDir, { recursive: true });
 
         const files = await fs.readdir(cacheDir).catch(error => {
@@ -3584,14 +4764,27 @@ function setupFileOperationHandlers() {
       }
 
       const mainCachePath = await getCacheFilePath(cacheId);
+
+      // Sidecar first: if the process dies between the two writes the record
+      // still carries the old count, the mismatch invalidates the sidecar, and
+      // the cache is served whole rather than with images missing. A throw here
+      // aborts the whole finalize, leaving both files untouched.
+      const tombstoneCount = await applyCacheTombstones({
+        cacheDir,
+        safeCacheId,
+        recordPath: mainCachePath,
+        tombstones,
+      });
+
       // Add parser version to cache record
-      const recordWithVersion = { ...record, parserVersion: PARSER_VERSION };
+      const recordWithVersion = { ...record, parserVersion: PARSER_VERSION, tombstoneCount };
       await fs.writeFile(mainCachePath, JSON.stringify(recordWithVersion, null, 2));
       logMainPerf('finalize-cache-write:complete', {
         cacheId,
         sourceCacheId: sourceCacheId ?? null,
         imageCount: recordWithVersion.imageCount,
         chunkCount: recordWithVersion.chunkCount,
+        tombstoneCount,
         durationMs: elapsedMs(start),
       });
       return { success: true };
@@ -3636,6 +4829,53 @@ function setupFileOperationHandlers() {
     }
   });
 
+  // Sidecar id->chunk index used to make single-image "Reparse Metadata" read
+  // only the chunk holding the target image instead of scanning every chunk.
+  // Stored as `${safeCacheId}_index.json` so `clear-cache-data` (which removes
+  // every `${safeCacheId}_*` file) cleans it up automatically.
+  ipcMain.handle('write-cache-index', async (event, { cacheId, data }) => {
+    try {
+      const safeCacheId = cacheId.replace(/[^a-zA-Z0-9-_]/g, '_');
+      const rootPath = await getCacheRootPath();
+      const cacheDir = path.join(rootPath, 'json_cache');
+      await fs.mkdir(cacheDir, { recursive: true });
+      const indexPath = path.join(cacheDir, `${safeCacheId}_index.json`);
+      await fs.writeFile(indexPath, JSON.stringify(data));
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('read-cache-index', async (event, { cacheId }) => {
+    try {
+      const safeCacheId = cacheId.replace(/[^a-zA-Z0-9-_]/g, '_');
+      const rootPath = await getCacheRootPath();
+      const cacheDir = path.join(rootPath, 'json_cache');
+      const indexPath = path.join(cacheDir, `${safeCacheId}_index.json`);
+      const raw = await fs.readFile(indexPath, 'utf-8');
+      return { success: true, data: JSON.parse(raw) };
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return { success: true, data: null };
+      }
+      return { success: false, error: error.message };
+    }
+  });
+
+  // The sidecar is only ever written as part of finalize-cache-write, so there
+  // is no matching write handler here.
+  ipcMain.handle('read-cache-tombstones', async (event, { cacheId }) => {
+    try {
+      const safeCacheId = cacheId.replace(/[^a-zA-Z0-9-_]/g, '_');
+      const rootPath = await getCacheRootPath();
+      const cacheDir = path.join(rootPath, 'json_cache');
+      return { success: true, data: await readCacheTombstonesFile(cacheDir, safeCacheId) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
   ipcMain.handle('clear-cache-data', async (event, cacheId) => {
     const safeCacheId = cacheId.replace(/[^a-zA-Z0-9-_]/g, '_');
     const rootPath = await getCacheRootPath();
@@ -3658,6 +4898,351 @@ function setupFileOperationHandlers() {
         return { success: true };
     } catch (error) {
         return { success: false, error: error.message };
+    }
+  });
+
+
+  // --- Visual search (embedding) sidecar IPC Handlers ---
+  // These live in json_cache next to the metadata chunks and are named
+  // `${safeCacheId}_emb*`, so clear-cache-data's prefix sweep already removes
+  // them and no separate cleanup path is needed.
+  const getEmbeddingCacheDir = async () => {
+    const rootPath = await getCacheRootPath();
+    const cacheDir = path.join(rootPath, 'json_cache');
+    await fs.mkdir(cacheDir, { recursive: true });
+    return cacheDir;
+  };
+
+  // Each opened renderer index is bound to the root from which its manifest
+  // was read. Keep issued roots allowlisted so a later Settings change cannot
+  // redirect that index's writes into a different cache tree.
+  const issuedEmbeddingCacheRoots = new Set();
+  const issueEmbeddingCacheRoot = async () => {
+    const cacheDir = path.resolve(await getEmbeddingCacheDir());
+    issuedEmbeddingCacheRoots.add(cacheDir);
+    return cacheDir;
+  };
+  const resolveIssuedEmbeddingCacheRoot = (cacheRootIdentity) => {
+    if (typeof cacheRootIdentity !== 'string' || !issuedEmbeddingCacheRoots.has(cacheRootIdentity)) {
+      throw new Error('Embedding cache location is missing or no longer authorized');
+    }
+    return cacheRootIdentity;
+  };
+
+  const toSafeCacheId = (cacheId) => String(cacheId ?? '').replace(/[^a-zA-Z0-9-_]/g, '_');
+
+  // Sidecar names are built in the renderer from a whitelisted pattern; reject
+  // anything else so a malformed id cannot escape the cache directory.
+  const isSafeEmbeddingFileName = (fileName) =>
+    typeof fileName === 'string' && /^[a-zA-Z0-9-_]+_emb_(manifest\.json|rows_\d+\.json|seg_\d+\.bin)$/.test(fileName);
+
+  const resolveEmbeddingFilePath = (fileName, cacheRootIdentity) => {
+    if (!isSafeEmbeddingFileName(fileName)) {
+      throw new Error(`Rejected embedding sidecar name: ${fileName}`);
+    }
+    return path.join(resolveIssuedEmbeddingCacheRoot(cacheRootIdentity), fileName);
+  };
+
+  ipcMain.handle('get-embedding-cache-identity', async () => {
+    try {
+      return { success: true, identity: await issueEmbeddingCacheRoot() };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('read-embedding-file', async (event, { fileName, binary = false, cacheRootIdentity } = {}) => {
+    try {
+      const filePath = resolveEmbeddingFilePath(fileName, cacheRootIdentity);
+      const contents = await fs.readFile(filePath).catch((error) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (contents === null) {
+        return { success: true, data: null };
+      }
+      if (binary) {
+        // Copy out of Node's Buffer pool so the renderer receives exactly the
+        // file's bytes rather than a view into a shared allocation.
+        const copy = contents.buffer.slice(
+          contents.byteOffset,
+          contents.byteOffset + contents.byteLength
+        );
+        return { success: true, data: copy };
+      }
+      return { success: true, data: JSON.parse(contents.toString('utf8')) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('write-embedding-file', async (event, { fileName, data, binary = false, cacheRootIdentity } = {}) => {
+    try {
+      const filePath = resolveEmbeddingFilePath(fileName, cacheRootIdentity);
+      const payload = binary ? Buffer.from(data) : Buffer.from(JSON.stringify(data), 'utf8');
+      // Temp+rename so a crash mid-write cannot leave a half-parsed manifest.
+      const tempPath = `${filePath}.tmp`;
+      await fs.writeFile(tempPath, payload);
+      await renameCacheChunkWithRetry(tempPath, filePath);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Appending is the hot path during backfill: segments grow one flush at a
+  // time and rewriting a 4MB segment per flush would dominate the job's IO.
+  ipcMain.handle('append-embedding-segment', async (event, { fileName, data, expectedOffset, cacheRootIdentity } = {}) => {
+    try {
+      const filePath = resolveEmbeddingFilePath(fileName, cacheRootIdentity);
+      const byteLength = await appendEmbeddingSegmentAtOffset(filePath, data, expectedOffset);
+      return { success: true, byteLength };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('stat-embedding-index', async (event, { cacheId, cacheRootIdentity } = {}) => {
+    try {
+      const safeCacheId = toSafeCacheId(cacheId);
+      const cacheDir = resolveIssuedEmbeddingCacheRoot(cacheRootIdentity);
+      const files = await fs.readdir(cacheDir).catch((error) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      });
+      const prefix = `${safeCacheId}_emb_`;
+      let totalBytes = 0;
+      let fileCount = 0;
+      for (const file of files) {
+        if (!file.startsWith(prefix)) continue;
+        const stats = await fs.stat(path.join(cacheDir, file)).catch(() => null);
+        if (!stats) continue;
+        totalBytes += stats.size;
+        fileCount += 1;
+      }
+      return { success: true, totalBytes, fileCount };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  // --- Visual search model download ---
+  // The model is ~155MB and only a subset of users enable visual search, so it
+  // is fetched on first opt-in instead of shipping in the installer. This is the
+  // only network request the feature ever makes; nothing is uploaded.
+  ipcMain.handle('get-embedding-model-status', async (event, { modelId, files } = {}) => {
+    try {
+      const validated = validateEmbeddingModelRequest({ modelId, files });
+      const modelDir = getEmbeddingModelDir(modelId);
+      const missing = [];
+      let totalBytes = 0;
+      for (const integrity of validated.files) {
+        const { file } = integrity;
+        const filePath = resolveEmbeddingModelFilePath(modelDir, file);
+        const stats = await fs.stat(filePath).catch(() => null);
+        if (!stats) {
+          missing.push(file);
+        } else {
+          try {
+            await verifyDownloadedModelFile(filePath, integrity);
+            totalBytes += integrity.size;
+          } catch {
+            // Integrity failures remove the unusable file. Report it as missing
+            // so the only recovery path is a fresh, verified download.
+            missing.push(file);
+          }
+        }
+      }
+      return { success: true, installed: missing.length === 0, modelDir, missing, totalBytes };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('download-embedding-model', async (event, request = {}) => {
+    if (embeddingModelDownload) {
+      return { success: false, error: 'A model download is already running' };
+    }
+
+    let validated;
+    try {
+      validated = validateEmbeddingModelRequest(request);
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+    const { modelId, revision, files } = validated;
+    const controller = new AbortController();
+    embeddingModelDownload = controller;
+    const sender = event.sender;
+    const modelDir = getEmbeddingModelDir(modelId);
+
+    const emit = (payload) => {
+      if (!sender.isDestroyed()) {
+        sender.send('embedding-model-progress', payload);
+      }
+    };
+    let activePartPath = null;
+
+    try {
+      const list = files;
+      let completed = 0;
+
+      for (const integrity of list) {
+        const { file } = integrity;
+        const destination = resolveEmbeddingModelFilePath(modelDir, file);
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+
+        const existing = await fs.stat(destination).catch(() => null);
+        if (existing) {
+          try {
+            await verifyDownloadedModelFile(destination, integrity);
+            completed += 1;
+            emit({ phase: 'downloading', file, completedFiles: completed, totalFiles: list.length, receivedBytes: integrity.size, totalBytes: integrity.size });
+            continue;
+          } catch {
+            // The verifier removed the stale/corrupt cache entry. Download the
+            // trusted bytes below instead of silently treating it as installed.
+          }
+        }
+
+        const partPath = `${destination}.part`;
+        activePartPath = partPath;
+        let partial = await fs.stat(partPath).catch(() => null);
+        if (partial?.size === integrity.size) {
+          try {
+            await verifyDownloadedModelFile(partPath, integrity);
+            await fs.rename(partPath, destination);
+            activePartPath = null;
+            completed += 1;
+            emit({ phase: 'downloading', file, completedFiles: completed, totalFiles: list.length, receivedBytes: integrity.size, totalBytes: integrity.size });
+            continue;
+          } catch {
+            partial = null;
+          }
+        } else if (partial && partial.size > integrity.size) {
+          await fs.rm(partPath, { force: true });
+          partial = null;
+        }
+        const resumeFrom = partial ? partial.size : 0;
+
+        const url = buildEmbeddingModelDownloadUrl({ modelId, revision, file });
+        const headers = resumeFrom > 0 ? { Range: `bytes=${resumeFrom}-` } : {};
+        const response = await fetch(url, { headers, signal: controller.signal });
+
+        if (!response.ok && response.status !== 206) {
+          throw new Error(`Download failed for ${file}: HTTP ${response.status}`);
+        }
+        // A server that ignores the Range header restarts the file; drop the
+        // partial rather than concatenating two copies of the same prefix.
+        const appending = response.status === 206 && resumeFrom > 0;
+        if (!appending && resumeFrom > 0) {
+          await fs.rm(partPath, { force: true });
+        }
+
+        const totalBytes = integrity.size;
+        let received = appending ? resumeFrom : 0;
+
+        const stream = fsSync.createWriteStream(partPath, { flags: appending ? 'a' : 'w' });
+        // Without an 'error' listener a write failure (disk full, device removed)
+        // is an uncaught exception in the main process instead of surfacing through
+        // this handler's try/catch. Wait on 'close' rather than the end() callback,
+        // since autoDestroy fires 'close' on both the success and error paths —
+        // the end() callback alone would never settle after stream.destroy().
+        let streamError = null;
+        const closed = new Promise((resolve) => stream.once('close', resolve));
+        stream.on('error', (err) => {
+          streamError = err;
+          stream.destroy();
+        });
+        try {
+          const reader = response.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            received += value.byteLength;
+            if (!stream.write(Buffer.from(value))) {
+              await waitForWritableDrain(stream);
+            }
+            emit({ phase: 'downloading', file, completedFiles: completed, totalFiles: list.length, receivedBytes: received, totalBytes });
+          }
+        } finally {
+          stream.end();
+          await closed;
+        }
+        if (streamError) {
+          throw streamError;
+        }
+
+        if (totalBytes > 0 && received !== totalBytes) {
+          throw new Error(`Truncated download for ${file}: got ${received} of ${totalBytes} bytes`);
+        }
+
+        // Verify against the immutable main-process policy, never response
+        // headers or renderer-supplied metadata, before exposing the file.
+        try {
+          await verifyDownloadedModelFile(partPath, integrity);
+        } catch (error) {
+          throw new Error(`Integrity check failed for ${file}: ${error.message}`);
+        }
+
+        // Only rename once the bytes are complete and verified, so a partial or
+        // corrupt file is never visible under the real name.
+        await fs.rename(partPath, destination);
+        activePartPath = null;
+        completed += 1;
+        emit({ phase: 'downloading', file, completedFiles: completed, totalFiles: list.length, receivedBytes: received, totalBytes });
+      }
+
+      emit({ phase: 'complete', completedFiles: completed, totalFiles: list.length });
+      return { success: true, modelDir };
+    } catch (error) {
+      const cancelled = error?.name === 'AbortError';
+      if (!cancelled && typeof activePartPath === 'string') {
+        await fs.rm(activePartPath, { force: true }).catch(() => undefined);
+      }
+      emit({ phase: cancelled ? 'cancelled' : 'error', error: cancelled ? null : error.message });
+      return { success: false, cancelled, error: cancelled ? 'Download cancelled' : error.message };
+    } finally {
+      embeddingModelDownload = null;
+    }
+  });
+
+  ipcMain.handle('cancel-embedding-model-download', async () => {
+    if (!embeddingModelDownload) {
+      return { success: true, running: false };
+    }
+    embeddingModelDownload.abort();
+    return { success: true, running: true };
+  });
+
+  ipcMain.handle('delete-embedding-model', async (event, { modelId } = {}) => {
+    try {
+      validateEmbeddingModelId(modelId);
+      await fs.rm(getEmbeddingModelDir(modelId), { recursive: true, force: true });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('delete-embedding-index', async (event, { cacheId, cacheRootIdentity } = {}) => {
+    try {
+      const safeCacheId = toSafeCacheId(cacheId);
+      const cacheDir = resolveIssuedEmbeddingCacheRoot(cacheRootIdentity);
+      const files = await fs.readdir(cacheDir).catch((error) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      });
+      const prefix = `${safeCacheId}_emb_`;
+      let removed = 0;
+      for (const file of files) {
+        if (!file.startsWith(prefix)) continue;
+        await unlinkCacheChunkWithRetry(path.join(cacheDir, file));
+        removed += 1;
+      }
+      return { success: true, removed };
+    } catch (error) {
+      return { success: false, error: error.message };
     }
   });
 
@@ -4040,29 +5625,10 @@ function setupFileOperationHandlers() {
       const userDataDir = app.getPath('userData');
       const settingsBeforeDelete = await readSettings();
       const preservedLicense = options?.preserveLicense === true ? settingsBeforeDelete?.license : undefined;
-
-      try {
-        const files = await fs.readdir(userDataDir);
-
-        // Delete each file/folder inside userData
-        for (const file of files) {
-          const filePath = path.join(userDataDir, file);
-          const stat = await fs.stat(filePath);
-
-          if (stat.isDirectory()) {
-            // Recursively delete directories
-            await fs.rm(filePath, { recursive: true, force: true });
-          } else {
-            // Delete files
-            await fs.unlink(filePath);
-          }
-        }
-      } catch (error) {
-        // If userData doesn't exist or can't be read, that's fine (already clean)
-        if (error.code !== 'ENOENT') {
-          throw error;
-        }
-      }
+      const preservedFileNames = options?.preserveLicense === true
+        ? licenseManager.getPreservedStateFileNames()
+        : new Set();
+      await resetUserDataContents({ userDataDir, preservedFileNames });
 
       if (preservedLicense) {
         await saveSettings({ license: preservedLicense });
@@ -4079,7 +5645,14 @@ function setupFileOperationHandlers() {
   ipcMain.handle('restart-app', async () => {
     try {
       console.log('🔄 Restarting application...');
-      app.relaunch();
+      if (desktopRuntime.isPortable) {
+        if (!desktopRuntime.portableExecutableFile) {
+          throw new Error('Portable launcher path is unavailable.');
+        }
+        app.relaunch({ execPath: desktopRuntime.portableExecutableFile });
+      } else {
+        app.relaunch();
+      }
       app.quit();
       return { success: true };
     } catch (error) {
@@ -4131,6 +5704,13 @@ function setupFileOperationHandlers() {
         ? fileIcon
         : nativeImage.createFromPath(getIconPath());
 
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('native-file-drag-started', {
+          directoryPath,
+          relativePath,
+          imageId: typeof payload?.imageId === 'string' ? payload.imageId : undefined,
+        });
+      }
       event.sender.startDrag({ file: fullPath, icon: dragIcon });
     } catch (error) {
       console.error('Error starting file drag:', error);
@@ -4166,7 +5746,10 @@ function setupFileOperationHandlers() {
 
   ipcMain.handle('show-save-dialog', async (event, options = {}) => {
     try {
-      const result = await dialog.showSaveDialog(mainWindow, options);
+      const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+      const result = parentWindow
+        ? await dialog.showSaveDialog(parentWindow, options)
+        : await dialog.showSaveDialog(options);
       if (result.canceled) {
         return { success: true, canceled: true };
       }
@@ -4181,7 +5764,8 @@ function setupFileOperationHandlers() {
   });
 
   // Handle file deletion (move to trash)
-  ipcMain.handle('trash-file', async (event, filePath) => {
+  ipcMain.handle('trash-file', async (event, filePath, userDataContext = null) => {
+    let trashAttempted = false;
     try {
       if (!isPathAllowed(filePath)) {
         console.error('SECURITY VIOLATION: Attempted to trash file outside of allowed directories.');
@@ -4189,16 +5773,149 @@ function setupFileOperationHandlers() {
       }
 
       console.log('Attempting to trash file:', filePath);
-      await shell.trashItem(filePath);
-      return { success: true };
+      const coordinated = await executeWithStableIdentity({
+        kind: 'delete',
+        sourcePath: filePath,
+        userDataContext: stableFileUserDataContext({
+          legacyImageId: userDataContext?.legacyImageId,
+          sourcePath: filePath,
+        }),
+        perform: async () => {
+          if (isModel3DFileName(filePath)) {
+            await trashModel3DWithSidecar(
+              fs,
+              (targetPath) => shell.trashItem(targetPath),
+              filePath,
+            );
+          } else {
+            trashAttempted = true;
+            await shell.trashItem(filePath);
+          }
+        },
+      });
+      return { success: true, provenance: coordinated.provenance };
     } catch (error) {
       console.error('Error trashing file:', error);
-      return { success: false, error: error.message };
+      if (!trashAttempted && error?.trashAttempted !== true) {
+        return { success: false, error: error.message };
+      }
+      const remainingPaths = Array.isArray(error?.remainingPaths)
+        ? error.remainingPaths
+        : [filePath];
+      const safeRemainingPaths = remainingPaths.filter((targetPath) => isPathAllowed(targetPath));
+      if (safeRemainingPaths.length !== remainingPaths.length || safeRemainingPaths.length === 0) {
+        return { success: false, error: error.message };
+      }
+      let targetFiles;
+      try {
+        targetFiles = await Promise.all(safeRemainingPaths.map(async (targetPath) => {
+          const stats = await fs.lstat(targetPath);
+          return { path: targetPath, dev: stats.dev, ino: stats.ino };
+        }));
+      } catch (identityError) {
+        return {
+          success: false,
+          error: `${error.message}. The preserved file scope could not be verified (${identityError.message}).`,
+        };
+      }
+      const permanentDeleteToken = permanentDeleteGrants.issue(
+        event.sender.id,
+        filePath,
+        targetFiles,
+        error?.primaryDeleted === true,
+        error?.provenanceOperationId ?? null,
+      );
+      return {
+        success: false,
+        error: error.message,
+        permanentDeleteToken,
+        primaryDeleted: error?.primaryDeleted === true,
+        remainingFileCount: safeRemainingPaths.length,
+      };
+    }
+  });
+
+  ipcMain.handle('confirm-permanent-delete', async (event, { tokens } = {}) => {
+    try {
+      const grants = permanentDeleteGrants.inspect(tokens, event.sender.id);
+      const targetPaths = [...new Set(grants.flatMap(
+        (grant) => grant.targetFiles.map((target) => target.path),
+      ))];
+      if (targetPaths.some((targetPath) => !isPathAllowed(targetPath))) {
+        throw new Error('Permanent-delete scope is no longer allowed');
+      }
+      const scopeLabel = grants.length === 1
+        ? path.basename(grants[0].requestedPath)
+        : `${grants.length} selected items (${targetPaths.length} files)`;
+      const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+      const showMessageBox = (options) => parentWindow
+        ? dialog.showMessageBox(parentWindow, options)
+        : dialog.showMessageBox(options);
+      const confirmed = await requestPermanentDeleteConfirmation(showMessageBox, {
+        itemCount: grants.length,
+        fileCount: targetPaths.length,
+        scopeLabel,
+      });
+      if (!confirmed) {
+        return { success: false, cancelled: true, deletedTokens: [], failedTokens: [] };
+      }
+
+      const authorizedGrants = permanentDeleteGrants.consume(tokens, event.sender.id);
+      const deletedTokens = [];
+      const failedTokens = [];
+      const errors = [];
+      for (const grant of authorizedGrants) {
+        const coordinated = await continuePendingStableIdentityDelete({
+          operationId: grant.provenanceOperationId,
+          sourcePath: grant.requestedPath,
+          perform: () => permanentlyDeleteGrantedFiles(fs, grant),
+        });
+        const result = coordinated.value;
+        errors.push(...result.failures.map(
+          (failure) => `${path.basename(failure.path)}: ${failure.error.message}`,
+        ));
+        const primaryStillPresent = result.failures.length > 0 && !result.primaryDeleted;
+        (primaryStillPresent ? failedTokens : deletedTokens).push(grant.token);
+      }
+      if (errors.length > 0) {
+        const partialFailureMessage = authorizedGrants.length === 1
+          ? 'The item was deleted, but an associated file could not be permanently deleted.'
+          : 'The selected items were deleted, but associated files could not be permanently deleted.';
+        await showMessageBox({
+          type: 'error',
+          title: 'Permanent deletion failed',
+          message: failedTokens.length === 0
+            ? partialFailureMessage
+            : failedTokens.length === 1
+            ? 'One item could not be permanently deleted.'
+            : `${failedTokens.length} items could not be permanently deleted.`,
+          detail: `Files that could not be deleted were preserved.\n\n${errors.join('\n')}`,
+          buttons: ['OK'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+      }
+      return {
+        success: failedTokens.length === 0,
+        cancelled: false,
+        deletedTokens,
+        failedTokens,
+        error: errors.length > 0 ? errors.join('; ') : undefined,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        cancelled: false,
+        deletedTokens: [],
+        failedTokens: Array.isArray(tokens) ? tokens : [],
+        error: error.message,
+      };
     }
   });
 
   // Handle file renaming
-  ipcMain.handle('rename-file', async (event, oldPath, newPath) => {
+  ipcMain.handle('rename-file', async (event, oldPath, newPath, userDataContext = null) => {
     try {
       if (!isAllowedOrInternal(oldPath) || !isRenameTargetAllowed(oldPath, newPath)) {
         console.error('SECURITY VIOLATION: Attempted to rename file outside of allowed directories.');
@@ -4206,6 +5923,15 @@ function setupFileOperationHandlers() {
       }
       
       console.log('Attempting to rename file:', oldPath, 'to', newPath);
+      if (
+        path.normalize(oldPath) !== path.normalize(newPath)
+        && isExternalResourceModel3DFileName(oldPath)
+      ) {
+        return {
+          success: false,
+          error: 'Renaming GLTF, OBJ, and FBX files is not available because these models can depend on sibling files.',
+        };
+      }
       const oldStats = await fs.lstat(oldPath);
       try {
         const targetStats = await fs.lstat(newPath);
@@ -4219,7 +5945,23 @@ function setupFileOperationHandlers() {
         }
       }
 
-      await fs.rename(oldPath, newPath);
+      const coordinated = await executeWithStableIdentity({
+        kind: 'rename',
+        sourcePath: oldPath,
+        destinationPath: newPath,
+        userDataContext: stableFileUserDataContext({
+          legacyImageId: userDataContext?.legacyImageId,
+          sourcePath: oldPath,
+          destinationPath: newPath,
+        }),
+        perform: async () => {
+          if (isModel3DFileName(oldPath)) {
+            await renameModel3DWithSidecar(fs, oldPath, newPath);
+          } else {
+            await fs.rename(oldPath, newPath);
+          }
+        },
+      });
 
       const normalizedOldAllowedPath = normalizeAllowedPath(oldPath);
       if (allowedDirectoryPaths.has(normalizedOldAllowedPath)) {
@@ -4227,7 +5969,7 @@ function setupFileOperationHandlers() {
         allowedDirectoryPaths.add(normalizeAllowedPath(newPath));
       }
 
-      return { success: true };
+      return { success: true, provenance: coordinated.provenance };
     } catch (error) {
       console.error('Error renaming file:', error);
       return { success: false, error: error.message };
@@ -4274,16 +6016,15 @@ function setupFileOperationHandlers() {
     }
   });
 
-  // Handle open cache location (without security restrictions since it's app's internal cache)
-  ipcMain.handle('open-cache-location', async (event, cachePath) => {
+  // Resolve the configured cache root in the trusted main process.
+  ipcMain.handle('open-cache-location', async () => {
     try {
-      const normalizedCachePath = path.normalize(cachePath);
-      const parentPath = path.dirname(normalizedCachePath);
-      console.log('📂 Opening cache parent directory:', parentPath);
-
-      shell.showItemInFolder(parentPath);
-      console.log('✅ shell.showItemInFolder called for:', parentPath);
-
+      const normalizedCachePath = await openAuthorizedCacheDirectory({
+        getCacheRootPath,
+        fsApi: fs,
+        shellApi: shell,
+      });
+      console.log('📂 Opened cache directory:', normalizedCachePath);
       return { success: true };
     } catch (error) {
       console.error('❌ Error opening cache location:', error);
@@ -4355,8 +6096,108 @@ function setupFileOperationHandlers() {
     }
   });
 
+  // Create a new subfolder under an already-indexed root/subfolder. Used by the
+  // "Create New Folder" action in the Move/Copy To panel. Validation mirrors
+  // utils/folderName.ts; kept inline here because the main process cannot import
+  // the renderer TS helper.
+  ipcMain.handle('create-subfolder', async (event, { parentPath, folderName } = {}) => {
+    try {
+      if (typeof parentPath !== 'string' || typeof folderName !== 'string') {
+        return { success: false, error: 'Invalid arguments.' };
+      }
+
+      if (!isPathAllowed(parentPath)) {
+        console.error('SECURITY VIOLATION: Attempted to create a folder outside of allowed directories.');
+        return { success: false, error: 'Access denied: Cannot create folders outside of the allowed directories.' };
+      }
+
+      const name = folderName.trim();
+      const RESERVED = new Set([
+        'con', 'prn', 'aux', 'nul',
+        'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+        'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+      ]);
+      // eslint-disable-next-line no-control-regex
+      const illegal = new RegExp('[<>:"/\\\\|?*\\x00-\\x1f]');
+      if (
+        !name ||
+        name === '.' ||
+        name === '..' ||
+        illegal.test(name) ||
+        /[. ]$/.test(name) ||
+        RESERVED.has(name.toLowerCase()) ||
+        name.length > 255
+      ) {
+        return { success: false, error: 'Invalid folder name.' };
+      }
+
+      const normalizedParent = path.normalize(parentPath);
+
+      // Verify the parent exists and is a directory.
+      try {
+        const stats = await fs.stat(normalizedParent);
+        if (!stats.isDirectory()) {
+          return { success: false, error: 'Parent path is not a directory.' };
+        }
+      } catch {
+        return { success: false, error: 'Parent folder does not exist.' };
+      }
+
+      // The parent may be a symlink/alias (list-subfolders surfaces those as
+      // selectable destinations, and an indexed root can itself be a symlink).
+      // Validate by comparing the resolved parent against the resolved allowed
+      // roots: this rejects a symlink that escapes the library's real tree while
+      // still permitting a legitimately symlinked root whose target is not in the
+      // textual allowlist.
+      if (!(await isResolvedPathWithinAllowed(normalizedParent))) {
+        console.error('SECURITY VIOLATION: Resolved parent folder is outside allowed directories.');
+        return { success: false, error: 'Access denied: Cannot create folders outside of the allowed directories.' };
+      }
+
+      // Create under the parent as the user selected it (symlink-preserving, like
+      // list-subfolders); the OS follows the link to the real target.
+      const targetPath = path.join(normalizedParent, name);
+
+      // Defense in depth: the target must stay directly inside the parent.
+      const relative = path.relative(normalizedParent, targetPath);
+      if (relative !== name || relative.startsWith('..') || path.isAbsolute(relative)) {
+        return { success: false, error: 'Invalid folder name.' };
+      }
+
+      // Refuse to reuse an existing folder so the user gets clear feedback.
+      try {
+        await fs.access(targetPath);
+        return { success: false, error: 'A folder with that name already exists.' };
+      } catch {
+        // Does not exist — good, proceed.
+      }
+
+      await fs.mkdir(targetPath);
+
+      let realPath = targetPath;
+      try {
+        realPath = await fs.realpath(targetPath);
+      } catch {
+        realPath = targetPath;
+      }
+
+      console.log('📁 Created subfolder:', targetPath);
+      return { success: true, folder: { name, path: targetPath, realPath } };
+    } catch (error) {
+      console.error('❌ Error creating subfolder:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Handle manual update check
   ipcMain.handle('check-for-updates', async () => {
+    if (!desktopRuntime.autoUpdateSupported) {
+      return {
+        success: false,
+        errorCode: PORTABLE_UPDATE_ERROR,
+        error: 'Portable builds must be updated manually from GitHub Releases.',
+      };
+    }
     if (!autoUpdater) {
       return { success: false, error: 'Auto-updater not available' };
     }
@@ -4375,6 +6216,13 @@ function setupFileOperationHandlers() {
   });
 
   ipcMain.handle('download-update', async () => {
+    if (!desktopRuntime.autoUpdateSupported) {
+      return {
+        success: false,
+        errorCode: PORTABLE_UPDATE_ERROR,
+        error: 'Portable builds must be updated manually from GitHub Releases.',
+      };
+    }
     if (!autoUpdater) {
       return { success: false, error: 'Auto-updater not available' };
     }
@@ -4392,6 +6240,13 @@ function setupFileOperationHandlers() {
   });
 
   ipcMain.handle('install-update', async () => {
+    if (!desktopRuntime.autoUpdateSupported) {
+      return {
+        success: false,
+        errorCode: PORTABLE_UPDATE_ERROR,
+        error: 'Portable builds must be updated manually from GitHub Releases.',
+      };
+    }
     if (!autoUpdater) {
       return { success: false, error: 'Auto-updater not available' };
     }
@@ -4439,17 +6294,23 @@ function setupFileOperationHandlers() {
   });
 
   // Handle listing directory files
-  ipcMain.handle('list-directory-files', async (event, { dirPath, recursive = false }) => {
+  ipcMain.handle('list-directory-files', async (event, { dirPath, recursive = false, provenanceRootPath = dirPath }) => {
     const scanStart = Date.now();
     try {
       if (!dirPath) {
         return { success: false, error: 'No directory path provided' };
       }
+      const provenanceScanToken = provenanceIndexingEnabled && stableIdentityIndexer
+        ? stableIdentityIndexer.beginScan(provenanceRootPath)
+        : null;
 
       let imageFiles = [];
+      let scanComplete = true;
 
       if (recursive) {
-        imageFiles = await getFilesRecursively(dirPath, dirPath);
+        const recursiveResult = await getFilesRecursively(dirPath, dirPath);
+        imageFiles = recursiveResult.files;
+        scanComplete = recursiveResult.complete;
       } else {
         const files = await fs.readdir(dirPath, { withFileTypes: true });
         imageFiles = await statMediaEntries(dirPath, files, dirPath);
@@ -4463,6 +6324,24 @@ function setupFileOperationHandlers() {
         durationMs: elapsedMs(scanStart),
       });
 
+      if (provenanceIndexingEnabled && stableIdentityIndexer) {
+        setImmediate(() => {
+          void stableIdentityIndexer.indexScan({
+            rootPath: provenanceRootPath,
+            scanPath: dirPath,
+            files: imageFiles,
+            scanComplete,
+            recursive,
+            scanToken: provenanceScanToken,
+            onBatch: (payload) => {
+              if (!event.sender.isDestroyed()) event.sender.send('provenance-identities-assigned', payload);
+            },
+          }).catch((backfillError) => {
+            console.warn('Provenance identity backfill failed; library indexing remains available.', backfillError);
+          });
+        });
+      }
+
       return { success: true, files: imageFiles };
     } catch (error) {
       console.error('Error listing directory files:', error);
@@ -4475,6 +6354,92 @@ function setupFileOperationHandlers() {
       return { success: false, error: error.message };
     }
   });
+
+  ipcMain.handle('provenance-backfill-control', (_event, action) => {
+    if (!provenanceIndexingEnabled || !stableIdentityIndexer) return { success: false, enabled: false };
+    if (action === 'pause') return { success: true, ...stableIdentityIndexer.pause() };
+    if (action === 'resume') return { success: true, ...stableIdentityIndexer.resume() };
+    return { success: false, enabled: true, error: 'Unsupported provenance backfill action.' };
+  });
+
+  const handleStableUserDataRequest = (operation) => {
+    try {
+      if (!stableIdentityUserDataService) throw new Error('Stable user-data service is unavailable.');
+      return { success: true, value: operation(stableIdentityUserDataService) };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        code: error?.code || 'USER_DATA_OPERATION_FAILED',
+        details: error?.details ?? null,
+      };
+    }
+  };
+
+  ipcMain.handle('stable-user-data-status', () => (
+    stableIdentityUserDataService?.getStatus?.() ?? {
+      initialized: false,
+      authority: 'legacy',
+      available: true,
+      migrationEnabled: provenanceIndexingEnabled,
+      indexingEnabled: provenanceIndexingEnabled,
+    }
+  ));
+  ipcMain.handle('stable-user-data-sync', (_event, { entries } = {}) => (
+    handleStableUserDataRequest((service) => service.syncLegacyBatch(entries))
+  ));
+  ipcMain.handle('stable-user-data-mutate', (_event, input) => (
+    handleStableUserDataRequest((service) => service.mutate(input))
+  ));
+  ipcMain.handle('stable-user-data-reserve-legacy-mutation', (_event, input) => (
+    handleStableUserDataRequest((service) => service.reserveLegacyMutation(input))
+  ));
+  ipcMain.handle('stable-user-data-finalize-legacy-mutation', (_event, input) => (
+    handleStableUserDataRequest((service) => service.finalizeLegacyMutation(input))
+  ));
+  ipcMain.handle('stable-user-data-complete-legacy-scan', () => (
+    handleStableUserDataRequest((service) => service.completeLegacyScan())
+  ));
+  ipcMain.handle('stable-user-data-global-tag-mutation', (_event, input) => (
+    handleStableUserDataRequest((service) => service.mutateAnnotationTagGlobally(input))
+  ));
+  ipcMain.handle('stable-user-data-tag-counts', () => (
+    handleStableUserDataRequest((service) => service.getTagCounts())
+  ));
+
+  const handleSavedPromptRequest = (operation) => {
+    try {
+      return { success: true, data: provenanceRepositoryLifecycle.run(operation) };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        errorCode: error?.code || 'SAVED_PROMPT_OPERATION_FAILED',
+      };
+    }
+  };
+  const notifySavedPromptsChanged = () => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('saved-prompts:changed');
+    }
+  };
+
+  ipcMain.handle('saved-prompts:list', () => (
+    handleSavedPromptRequest((repository) => repository.listSavedPrompts())
+  ));
+  ipcMain.handle('saved-prompts:save', (_event, input) => {
+    const result = handleSavedPromptRequest((repository) => repository.savePrompt(input));
+    if (result.success && result.data.status === 'saved') notifySavedPromptsChanged();
+    return result;
+  });
+  ipcMain.handle('saved-prompts:remove', (_event, id) => {
+    const result = handleSavedPromptRequest((repository) => repository.removeSavedPrompt(id));
+    if (result.success && result.data.removed) notifySavedPromptsChanged();
+    return result;
+  });
+  ipcMain.handle('saved-prompts:resolve-source', (_event, id) => (
+    handleSavedPromptRequest((repository) => repository.resolveSavedPromptSource(id))
+  ));
 
   // ============================================================
   // File Watching Handlers
@@ -4497,7 +6462,10 @@ function setupFileOperationHandlers() {
       return { success: false, error: 'No window available' };
     }
 
-    return fileWatcher.startWatching(directoryId, dirPath, mainWindow);
+    return fileWatcher.startWatching(directoryId, dirPath, mainWindow, {
+      onFilesObserved: (payload) => stableIdentityFileOperationCoordinator?.observeWatcherFiles(payload),
+      onPathsRemoved: (payload) => stableIdentityFileOperationCoordinator?.observeWatcherRemovals(payload),
+    });
   });
 
   ipcMain.handle('stop-watching-directory', async (event, args) => {
@@ -4624,9 +6592,60 @@ function setupFileOperationHandlers() {
     }
   });
 
-  const handleReadMediaMetadata = async (args) => {
+  // Provenance fingerprints are deliberately on-demand. The main process streams
+  // the selected file so large media files never cross into renderer memory.
+  ipcMain.on('cancel-hash-file-sha256', (event, requestId) => {
+    cancelFingerprintRequest(event.sender.id, requestId);
+  });
+
+  ipcMain.handle('hash-file-sha256', async (event, args) => {
+    const filePath = args?.filePath;
+    const requestId = args?.requestId;
+    let controller;
+    let requestKey;
+    let abortOnDestroyed;
     try {
-      const filePath = args?.filePath;
+      if (!filePath || typeof requestId !== 'string' || !requestId) {
+        return { success: false, error: 'Invalid fingerprint request' };
+      }
+
+      if (!isPathAllowed(filePath)) {
+        return { success: false, error: 'Access denied', errorType: 'PERMISSION_DENIED' };
+      }
+
+      requestKey = fingerprintRequestKey(event.sender.id, requestId);
+      activeFingerprintRequests.get(requestKey)?.abort();
+      controller = new AbortController();
+      activeFingerprintRequests.set(requestKey, controller);
+      abortOnDestroyed = () => controller.abort();
+      event.sender.once('destroyed', abortOnDestroyed);
+
+      const sha256 = await hashFileSha256(filePath, { signal: controller.signal });
+      return { success: true, sha256 };
+    } catch (error) {
+      const errorCode = error?.code;
+      const errorType = error?.name === 'AbortError' || errorCode === 'ABORT_ERR'
+        ? 'CANCELLED'
+        : errorCode === 'ENOENT'
+        ? 'FILE_NOT_FOUND'
+        : (errorCode === 'EACCES' || errorCode === 'EPERM')
+          ? 'PERMISSION_DENIED'
+          : 'READ_ERROR';
+      return { success: false, error: error?.message || 'Failed to calculate SHA-256.', errorType, errorCode };
+    } finally {
+      if (abortOnDestroyed && !event.sender.isDestroyed()) {
+        event.sender.removeListener('destroyed', abortOnDestroyed);
+      }
+      if (requestKey && activeFingerprintRequests.get(requestKey) === controller) {
+        activeFingerprintRequests.delete(requestKey);
+      }
+    }
+  });
+
+  const handleReadMediaMetadata = async (args) => {
+    let filePath;
+    try {
+      filePath = args?.filePath;
       if (!filePath) {
         return { success: false, error: 'No file path provided' };
       }
@@ -4643,6 +6662,29 @@ function setupFileOperationHandlers() {
       return { success: true, ...metadata };
     } catch (error) {
       const isBinaryMissing = error?.code === 'ENOENT' || error?.message?.includes('ffprobe');
+      const extension = typeof filePath === 'string' ? path.extname(filePath).toLowerCase() : '';
+      if (extension === '.mp4' || extension === '.mov' || extension === '.m4v') {
+        try {
+          const basic = await readBasicMp4Metadata(filePath);
+          if (basic) {
+            return {
+              success: true,
+              video: {
+                frame_rate: null,
+                frame_count: null,
+                duration_seconds: basic.duration_seconds,
+                width: basic.width,
+                height: basic.height,
+                codec: null,
+                format: 'mp4',
+              },
+              audio: null,
+            };
+          }
+        } catch {
+          // Return the original ffprobe failure below.
+        }
+      }
       return {
         success: false,
         error: isBinaryMissing ? 'FFPROBE_NOT_FOUND' : (error?.message || String(error)),
@@ -4652,6 +6694,18 @@ function setupFileOperationHandlers() {
 
   ipcMain.handle('read-media-metadata', async (event, args) => handleReadMediaMetadata(args));
   ipcMain.handle('read-video-metadata', async (event, args) => handleReadMediaMetadata(args));
+  ipcMain.handle('read-model3d-metadata', async (_event, { filePath }) => {
+    try {
+      const normalizedPath = path.resolve(filePath || '');
+      if (!filePath || !isModel3DFileName(normalizedPath) || !isPathAllowed(normalizedPath)) {
+        return { success: false, error: 'Access denied' };
+      }
+      const result = await readModel3DMetadata(normalizedPath);
+      return { success: true, ...result };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
 
   // Handle getting skipped versions
   ipcMain.handle('get-skipped-versions', () => {
@@ -4677,28 +6731,31 @@ function setupFileOperationHandlers() {
   });
 
   // Handle toggling fullscreen
-  ipcMain.handle('toggle-fullscreen', () => {
-    if (mainWindow) {
-      mainWindow.setFullScreen(!mainWindow.isFullScreen());
-      return { success: true, isFullscreen: mainWindow.isFullScreen() };
+  ipcMain.handle('toggle-fullscreen', (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (targetWindow && !targetWindow.isDestroyed()) {
+      targetWindow.setFullScreen(!targetWindow.isFullScreen());
+      return { success: true, isFullscreen: targetWindow.isFullScreen() };
     }
     return { success: false, error: 'Main window not available' };
   });
 
-  ipcMain.handle('get-fullscreen-state', () => {
-    if (mainWindow) {
-      return { success: true, isFullscreen: mainWindow.isFullScreen() };
+  ipcMain.handle('get-fullscreen-state', (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (targetWindow && !targetWindow.isDestroyed()) {
+      return { success: true, isFullscreen: targetWindow.isFullScreen() };
     }
     return { success: false, error: 'Main window not available' };
   });
 
   ipcMain.handle('set-fullscreen', (event, isFullscreen) => {
-    if (mainWindow) {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender);
+    if (targetWindow && !targetWindow.isDestroyed()) {
       const nextFullscreenState = Boolean(isFullscreen);
-      if (mainWindow.isFullScreen() !== nextFullscreenState) {
-        mainWindow.setFullScreen(nextFullscreenState);
+      if (targetWindow.isFullScreen() !== nextFullscreenState) {
+        targetWindow.setFullScreen(nextFullscreenState);
       }
-      return { success: true, isFullscreen: mainWindow.isFullScreen() };
+      return { success: true, isFullscreen: targetWindow.isFullScreen() };
     }
     return { success: false, error: 'Main window not available' };
   });
@@ -5001,6 +7058,21 @@ function setupFileOperationHandlers() {
     }
   });
 
+  // Handle copying text to clipboard (avoids the renderer's "Document is not focused" error)
+  ipcMain.handle('copy-text-to-clipboard', async (event, text) => {
+    try {
+      if (typeof text !== 'string') {
+        return { success: false, error: 'No text provided' };
+      }
+
+      electron.clipboard.writeText(text);
+      return { success: true };
+    } catch (error) {
+      console.error('Error copying text to clipboard:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // Handle getting file statistics (creation date, etc.)
   ipcMain.handle('get-file-stats', async (event, filePath) => {
     try {
@@ -5081,7 +7153,7 @@ function setupFileOperationHandlers() {
   });
 
   // Handle writing file content
-  ipcMain.handle('write-file', async (event, filePath, data) => {
+  ipcMain.handle('write-file', async (event, filePath, data, provenanceContext = null) => {
     try {
       if (!filePath) {
         return { success: false, error: 'No file path provided' };
@@ -5104,10 +7176,53 @@ function setupFileOperationHandlers() {
 
       console.log('Writing file to:', normalizedFilePath, 'Size:', data.length);
 
+      if (provenanceContext?.kind === 'save_as' || provenanceContext?.kind === 'overwrite') {
+        const expectedOutputSha256 = crypto.createHash('sha256').update(Buffer.from(data)).digest('hex');
+        const coordinated = await executeWithStableIdentity({
+          kind: provenanceContext.kind,
+          sourcePath: provenanceContext.sourcePath || null,
+          destinationPath: normalizedFilePath,
+          expectedOutputSha256,
+          userDataContext: stableFileUserDataContext({
+            legacyImageId: provenanceContext.userDataContext?.legacyImageId,
+            sourcePath: provenanceContext.sourcePath || normalizedFilePath,
+            destinationPath: normalizedFilePath,
+          }),
+          perform: () => fs.writeFile(normalizedFilePath, data),
+        });
+        return { success: true, provenance: coordinated.provenance };
+      }
+
       await fs.writeFile(normalizedFilePath, data);
       return { success: true };
     } catch (error) {
       console.error('Error writing file:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('write-model3d-export', async (_event, { filePath, modelData, sidecarData } = {}) => {
+    try {
+      if (!filePath || !modelData) {
+        return { success: false, error: 'Model export path and data are required.' };
+      }
+      const normalizedFilePath = path.normalize(filePath);
+      if (
+        !isModel3DFileName(normalizedFilePath)
+        || (!isAllowedOrInternal(normalizedFilePath) && !isApprovedWritePath(normalizedFilePath))
+      ) {
+        return { success: false, error: 'Access denied: Cannot write the 3D export outside approved directories.' };
+      }
+      const expectedOutputSha256 = crypto.createHash('sha256').update(Buffer.from(modelData)).digest('hex');
+      const coordinated = await executeWithStableIdentity({
+        kind: 'save_as',
+        destinationPath: normalizedFilePath,
+        expectedOutputSha256,
+        perform: () => writeModel3DExportDataWithSidecar(fs, normalizedFilePath, modelData, sidecarData),
+      });
+      return { success: true, provenance: coordinated.provenance };
+    } catch (error) {
+      console.error('Error writing 3D model export:', error);
       return { success: false, error: error.message };
     }
   });
@@ -5134,6 +7249,14 @@ function setupFileOperationHandlers() {
       }
       if (!destDir) {
         return { success: false, error: 'No destination directory provided.', exportedCount: 0, failedCount: 0 };
+      }
+      if (files.some((file) => isExternalResourceModel3DFileName(file?.relativePath))) {
+        return {
+          success: false,
+          error: 'GLTF, OBJ, and FBX batch export is not available because these models can depend on sibling files. Export or copy the containing folder instead.',
+          exportedCount: 0,
+          failedCount: files.length,
+        };
       }
 
       await fs.mkdir(destDir, { recursive: true });
@@ -5196,7 +7319,21 @@ function setupFileOperationHandlers() {
           });
           const uniqueName = getUniqueName(artifact.fileName, usedNames);
           const destPath = path.resolve(destDir, uniqueName);
-          await fs.writeFile(destPath, artifact.buffer);
+          const expectedOutputSha256 = crypto.createHash('sha256').update(artifact.buffer).digest('hex');
+          await executeWithStableIdentity({
+            kind: 'copy',
+            sourcePath,
+            destinationPath: destPath,
+            expectedOutputSha256,
+            perform: async () => {
+              if (metadataPolicy === 'preserve' && isModel3DFileName(sourcePath)) {
+                const sidecarPath = await getModel3DSidecarPathIfPresent(fs, sourcePath);
+                await writeModel3DExportWithSidecar(fs, destPath, artifact.buffer, sidecarPath);
+              } else {
+                await fs.writeFile(destPath, artifact.buffer);
+              }
+            },
+          });
           exportedCount += 1;
         } catch (error) {
           console.warn('[Electron] Failed to export file to folder:', file?.relativePath, error);
@@ -5252,6 +7389,14 @@ function setupFileOperationHandlers() {
       }
       if (!destZipPath) {
         return { success: false, error: 'No ZIP destination provided.', exportedCount: 0, failedCount: 0 };
+      }
+      if (files.some((file) => isExternalResourceModel3DFileName(file?.relativePath))) {
+        return {
+          success: false,
+          error: 'GLTF, OBJ, and FBX ZIP export is not available because these models can depend on sibling files. Export or copy the containing folder instead.',
+          exportedCount: 0,
+          failedCount: files.length,
+        };
       }
 
       await fs.mkdir(path.dirname(destZipPath), { recursive: true });
@@ -5318,11 +7463,16 @@ function setupFileOperationHandlers() {
             continue;
           }
 
-          const uniqueName = getUniqueName(path.basename(file.relativePath), usedNames);
-          
           // For preserved files, stream directly from disk to avoid buffering entire file in memory
           if (metadataPolicy === 'preserve') {
+            const uniqueName = getUniqueName(path.basename(file.relativePath), usedNames);
             archive.file(sourcePath, { name: uniqueName });
+            if (isModel3DFileName(sourcePath)) {
+              const sidecarPath = await getModel3DSidecarPathIfPresent(fs, sourcePath);
+              if (sidecarPath) {
+                archive.file(sidecarPath, { name: `${uniqueName}.imagemetahub.json` });
+              }
+            }
           } else {
             // For rewritten artifacts (strip, metahub_standard), process through createExportArtifact
             const artifact = await createExportArtifact({
@@ -5332,6 +7482,7 @@ function setupFileOperationHandlers() {
               targetFormat,
               effectiveMetadata: file.effectiveMetadata,
             });
+            const uniqueName = getUniqueName(artifact.fileName, usedNames);
             archive.append(artifact.buffer, { name: uniqueName });
           }
           exportedCount += 1;
@@ -5400,6 +7551,14 @@ function setupFileOperationHandlers() {
       }
       if (mode !== 'copy' && mode !== 'move') {
         return { success: false, transferred: [], failedCount: 0, error: 'Invalid transfer mode.' };
+      }
+      if (files.some((file) => isExternalResourceModel3DFileName(file?.relativePath))) {
+        return {
+          success: false,
+          transferred: [],
+          failedCount: files.length,
+          error: 'GLTF, OBJ, and FBX transfers are not available because these models can depend on sibling files. Move or copy the containing folder instead.',
+        };
       }
       if (!isPathAllowed(destDir)) {
         return { success: false, transferred: [], failedCount: 0, error: 'Access denied: Destination must be an indexed folder.' };
@@ -5472,7 +7631,8 @@ function setupFileOperationHandlers() {
             destinationDirectoryPath: destDir,
             destinationRelativePath: candidate,
             destinationAbsolutePath: candidatePath,
-            fileName: candidate
+            fileName: candidate,
+            legacyImageId: typeof file.legacyImageId === 'string' ? file.legacyImageId : null,
           });
         } catch {
           failedCount += 1;
@@ -5488,20 +7648,46 @@ function setupFileOperationHandlers() {
       const workerCount = Math.max(1, Math.min(TRANSFER_CONCURRENCY, plannedTransfers.length));
 
       const executeTransfer = async (task) => {
-        if (mode === 'move') {
-          try {
-            await fs.rename(task.sourceAbsolutePath, task.destinationAbsolutePath);
-          } catch (error) {
-            if (error?.code === 'EXDEV') {
-              await fs.copyFile(task.sourceAbsolutePath, task.destinationAbsolutePath);
-              await fs.unlink(task.sourceAbsolutePath);
-            } else {
-              throw error;
+        const transferPath = async (sourcePath, destinationPath) => {
+          if (mode === 'move') {
+            try {
+              await fs.rename(sourcePath, destinationPath);
+            } catch (error) {
+              if (error?.code === 'EXDEV') {
+                await copyFilePreservingTimestamps(fs, sourcePath, destinationPath);
+                await fs.unlink(sourcePath);
+              } else {
+                throw error;
+              }
             }
+          } else {
+            await copyFilePreservingTimestamps(fs, sourcePath, destinationPath);
           }
-        } else {
-          await fs.copyFile(task.sourceAbsolutePath, task.destinationAbsolutePath);
-        }
+        };
+
+        const coordinated = await executeWithStableIdentity({
+          kind: mode,
+          sourcePath: task.sourceAbsolutePath,
+          destinationPath: task.destinationAbsolutePath,
+          userDataContext: stableFileUserDataContext({
+            legacyImageId: task.legacyImageId,
+            sourcePath: task.sourceAbsolutePath,
+            destinationPath: task.destinationAbsolutePath,
+            copyUserData: mode === 'copy',
+          }),
+          perform: async () => {
+            if (isModel3DFileName(task.sourceAbsolutePath)) {
+              await transferModel3DWithSidecar(
+                fs,
+                task.sourceAbsolutePath,
+                task.destinationAbsolutePath,
+                mode,
+              );
+            } else {
+              await transferPath(task.sourceAbsolutePath, task.destinationAbsolutePath);
+            }
+          },
+        });
 
         const stats = await fs.stat(task.destinationAbsolutePath);
         transferred.push({
@@ -5513,7 +7699,9 @@ function setupFileOperationHandlers() {
           fileName: task.fileName,
           size: stats.size,
           lastModified: stats.mtimeMs,
+          birthtimeMs: normalizeBirthtimeMs(stats.birthtimeMs),
           type: getMimeTypeFromName(task.fileName),
+          provenance: coordinated.provenance,
         });
       };
 
@@ -5599,6 +7787,11 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // Stop all file watchers before quitting
   fileWatcher.stopAllWatchers();
+  licenseManager?.dispose?.();
+  stableIdentityIndexer?.stop();
+  stableIdentityFileOperationCoordinator = null;
+  stableIdentityUserDataService = null;
+  provenanceRepositoryLifecycle?.close();
 });
 
 app.on('activate', () => {

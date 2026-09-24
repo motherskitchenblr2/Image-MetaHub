@@ -1,27 +1,28 @@
 import { VariableSizeGrid as Grid, GridChildComponentProps, areEqual } from 'react-window';
 import AutoSizer from 'react-virtualized-auto-sizer';
 
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
+import { motion } from 'framer-motion';
 import { type IndexedImage, type BaseMetadata, type Directory, ImageStack, SmartCollection } from '../types';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { useImageStore } from '../store/useImageStore';
 import { useContextMenu } from '../hooks/useContextMenu';
-import { Heart, Info, Copy, CheckCircle, Folder, Download, Clipboard, Sparkles, GitCompare, Square, Search,
-  Archive,
+import { Heart, Info, Copy, CheckCircle, Folder, Clipboard, Sparkles, GitCompare, Square, Search,
   ChevronRight,
   CheckSquare,
-  Crown,
   EyeOff,
-  Package,
   Play,
   Music,
+  Package,
   Tag,
   RefreshCw,
-  Pencil,
   Image as ImageIcon,
-  Workflow
+  Workflow,
+  Trash2,
+  Bookmark
 } from 'lucide-react';
+import { copyTextToClipboard } from '../utils/imageUtils';
 import { useResolvedThumbnail } from '../hooks/useResolvedThumbnail';
 import { useGenerateWithA1111 } from '../hooks/useGenerateWithA1111';
 import { useGenerateWithComfyUI } from '../hooks/useGenerateWithComfyUI';
@@ -31,7 +32,14 @@ import { A1111GenerateModal, type GenerationParams as A1111GenerationParams } fr
 import { ComfyUIGenerateModal, type GenerationParams as ComfyUIGenerationParams } from './ComfyUIGenerateModal';
 import { RATING_VALUES, RatingValueIcons, getRatingChipClasses, getRatingLabel } from './RatingStars';
 import { useFeatureAccess } from '../hooks/useFeatureAccess';
+import { useGenerationProviderAvailability } from '../hooks/useGenerationProviderAvailability';
 import ProBadge from './ProBadge';
+import {
+  ContextMenuButton,
+  ContextMenuSubmenu,
+  ShowInFolderContextAction,
+  buildFileMenuItems,
+} from './contextMenu/ContextMenuPrimitives';
 import { useImageStacking } from '../hooks/useImageStacking';
 import TagManagerModal from './TagManagerModal';
 import TransferImagesModal, { type TransferDestination } from './TransferImagesModal';
@@ -40,7 +48,8 @@ import { transferIndexedImages } from '../services/fileTransferService';
 import { thumbnailManager } from '../services/thumbnailManager';
 import { getContextMenuRatingTargetIds } from '../utils/ratingSelection';
 import { getRenameBasename, renameIndexedImage } from '../services/imageRenameService';
-import { getFileExtension, isAudioFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { getFileExtension, isAudioFileName, isModel3DFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import Model3DThumbnail from './Model3DThumbnail';
 import { groupImages, type ImageGroup, type ImageGroupByMode, type ImageGroupingSortOrder } from '../utils/imageGrouping';
 import {
   beginPerformanceFlow,
@@ -51,6 +60,14 @@ import {
   recordPerformanceDuration,
 } from '../utils/performanceDiagnostics';
 import { clearInternalImageDragData, setInternalImageDragData } from '../utils/internalImageDrag';
+import { isMacPlatform } from '../utils/platform';
+import { canNativeDragIndexedFile } from '../utils/model3DTransfer';
+import { useSavePrompt } from '../hooks/useSavePrompt';
+
+// macOS ignores Electron's startDrag() unless it is invoked synchronously from the
+// dragstart handler, so native external drag has to be kicked off differently there
+// than on Windows (see handleDragStart / handleDrag).
+const IS_MAC_RENDERER = isMacPlatform();
 
 // Module-level variable to track internal image drag state (survives native file drag)
 let _activeDragImageIds: string[] = [];
@@ -79,8 +96,6 @@ interface ImageCardProps {
   baseWidth: number;
   isComparisonFirst?: boolean;
   cardRef?: (el: HTMLDivElement | null) => void;
-  isMarkedBest?: boolean;       // For deduplication: marked as best to keep
-  isMarkedArchived?: boolean;   // For deduplication: marked for archive
   isBlurred?: boolean;
 }
 
@@ -169,7 +184,7 @@ const getWarmupWindowImageKey = (images: IndexedImage[]): string =>
 
 const visibleGridThumbnailFlows = new Map<string, string>();
 
-const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, enableAuxClickOpen = true, isSelected, isFocused, onImageLoad, onContextMenu, onRenameRequest, onRenameComplete, isRenaming = false, baseWidth, isComparisonFirst, cardRef, isMarkedBest, isMarkedArchived, isBlurred }) => {
+const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, enableAuxClickOpen = true, isSelected, isFocused, onImageLoad, onContextMenu, onRenameRequest, onRenameComplete, isRenaming = false, baseWidth, isComparisonFirst, cardRef, isBlurred }) => {
   const [renameValue, setRenameValue] = useState('');
   const [isSubmittingRename, setIsSubmittingRename] = useState(false);
   const thumbnail = useResolvedThumbnail(image);
@@ -188,10 +203,13 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
   const doubleClickToOpen = useSettingsStore((state) => state.doubleClickToOpen);
   const [copied, setCopied] = useState(false);
   const toggleImageSelection = useImageStore((state) => state.toggleImageSelection);
-  const canDragExternally = typeof window !== 'undefined' && !!window.electronAPI?.startFileDrag;
+  const canDragExternally = typeof window !== 'undefined'
+    && !!window.electronAPI?.startFileDrag
+    && canNativeDragIndexedFile(image.name);
   const canDragImage = typeof window !== 'undefined';
   const isVideo = isVideoFileName(image.name, image.fileType);
   const isAudio = isAudioFileName(image.name, image.fileType);
+  const isModel3D = isModel3DFileName(image.name, image.fileType);
   const audioDuration = formatAudioDuration((image.metadata as any)?.normalizedMetadata?.audio?.duration_seconds);
   const resolvedThumbnailUrl =
 !thumbnailsDisabled && !isAudio && thumbnail?.thumbnailStatus === 'ready'
@@ -215,6 +233,12 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
     },
     [cardRef]
   );
+
+  useEffect(() => {
+    if (isModel3D) {
+      onImageLoad(image.id, 1);
+    }
+  }, [image.id, isModel3D, onImageLoad]);
 
   useEffect(() => {
     if (resolvedThumbnailUrl) {
@@ -332,12 +356,12 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
   const handleCopyClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (image.prompt) {
-      try {
-        await navigator.clipboard.writeText(image.prompt);
+      const result = await copyTextToClipboard(image.prompt);
+      if (result.success) {
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
-      } catch (err) {
-        console.error('Failed to copy prompt:', err);
+      } else {
+        console.error('Failed to copy prompt:', result.error);
       }
     }
   };
@@ -369,6 +393,23 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
       _activeExternalDragPayload = { directoryPath: image.directoryId, relativePath };
     } else {
       _activeExternalDragPayload = null;
+    }
+
+    // macOS: Electron's startDrag() only takes effect when called synchronously from
+    // dragstart. The Windows path (handleDrag) defers it until the cursor leaves the
+    // window, but macOS ignores a mid-drag startDrag — which is why dropping a card onto
+    // ComfyUI/Finder stopped working (#466). Hand the drag off to the OS now so the real
+    // file is dragged. This makes the drag OS-level, so the internal move-to-folder DnD is
+    // unavailable on macOS (right-click → Move/Copy still works).
+    if (IS_MAC_RENDERER && _activeExternalDragPayload && window.electronAPI?.startFileDrag) {
+      _nativeDragStarted = true;
+      e.preventDefault();
+      window.electronAPI.startFileDrag(_activeExternalDragPayload);
+      // The drag is now an OS-level native file drag; the in-app dragend won't fire and
+      // internal move-to-folder DnD doesn't apply on macOS. Clear the internal drag
+      // markers so the sidebar/header don't render as in-app drop targets.
+      clearActiveDragImageIds();
+      clearInternalImageDragData();
     }
   };
 
@@ -493,12 +534,13 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
         draggable={canDragImage}
       >
         {/* box for selection - always visible on hover or when selected */}
-        <button
+        <motion.button
           onClick={handleboxClick}
-          className={`absolute top-2 left-2 z-20 p-1 rounded transition-all focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+          whileTap={{ scale: 0.85 }}
+          className={`absolute top-2 left-2 z-20 p-1 rounded transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
             isSelected
               ? 'bg-blue-500 text-white opacity-100'
-              : 'bg-black/50 text-white opacity-0 group-hover:opacity-100 hover:bg-blue-500/80'
+              : `bg-black/50 text-white opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-blue-500/80 ${isFocused ? 'opacity-100' : ''}`
           }`}
           title={isSelected ? 'Deselect image' : 'Select image'}
           aria-label={isSelected ? 'Deselect image' : 'Select image'}
@@ -508,65 +550,59 @@ const ImageCard: React.FC<ImageCardProps> = React.memo(({ image, onImageClick, e
           ) : (
             <Square className="h-5 w-5" />
           )}
-        </button>
-
-        {/* Deduplication: Best badge */}
-        {isMarkedBest && (
-          <div className="absolute top-2 left-11 z-20 px-2 py-1 bg-yellow-500/90 rounded-lg text-white text-xs font-bold shadow-lg flex items-center gap-1">
-            <Crown className="h-3.5 w-3.5" />
-            Best
-          </div>
-        )}
-
-        {/* Deduplication: Archived badge */}
-        {isMarkedArchived && (
-          <div className="absolute top-2 left-11 z-20 px-2 py-1 bg-gray-600/90 rounded-lg text-white text-xs font-bold shadow-lg flex items-center gap-1">
-            <Archive className="h-3.5 w-3.5" />
-            Archive
-          </div>
-        )}
+        </motion.button>
 
         {isComparisonFirst && (
           <div className="absolute top-2 left-11 z-20 px-2 py-1 bg-purple-600 rounded-lg text-white text-xs font-bold shadow-lg">
             Compare #1
           </div>
         )}
-        <button
+        <motion.button
           onClick={handlePreviewClick}
-          className="absolute top-11 left-2 z-10 p-1.5 bg-black/50 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:opacity-100"
+          whileTap={{ scale: 0.85 }}
+          className={`absolute top-11 left-2 z-10 p-1.5 bg-black/50 rounded-full text-white transition-opacity hover:bg-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:opacity-100 opacity-0 group-hover:opacity-100 ${isFocused ? 'opacity-100' : ''}`}
           title="Show details"
           aria-label="Show details"
         >
           <Info className="h-4 w-4" />
-        </button>
+        </motion.button>
 
-        <button
+        <motion.button
           onClick={handleFavoriteClick}
-          className={`absolute top-2 right-2 z-10 p-1.5 rounded-full transition-all focus:outline-none focus:ring-2 focus:ring-rose-500 focus:opacity-100 ${
+          whileTap={{ scale: 0.85 }}
+          className={`absolute top-2 right-2 z-10 p-1.5 rounded-full transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:opacity-100 ${
             image.isFavorite
               ? 'bg-rose-500/85 text-white opacity-100 hover:bg-rose-600'
-              : 'bg-black/50 text-white opacity-0 group-hover:opacity-100 hover:bg-rose-500'
+              : `bg-black/50 text-white opacity-0 group-hover:opacity-100 hover:bg-rose-500 ${isFocused ? 'opacity-100' : ''}`
           }`}
           title={image.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
           aria-label={image.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
         >
           <Heart className={`h-4 w-4 ${image.isFavorite ? 'fill-current' : ''}`} />
-        </button>
-        <button
+        </motion.button>
+        <motion.button
           onClick={handleCopyClick}
-          className={`absolute top-2 right-11 z-10 p-1.5 rounded-full transition-all focus:outline-none focus:ring-2 focus:ring-green-500 focus:opacity-100 ${
+          whileTap={{ scale: 0.85 }}
+          className={`absolute top-2 right-11 z-10 p-1.5 rounded-full transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:opacity-100 ${
             copied
               ? 'bg-green-600 text-white opacity-100'
-              : 'bg-black/50 text-white opacity-0 group-hover:opacity-100 hover:bg-green-500'
+              : `bg-black/50 text-white opacity-0 group-hover:opacity-100 hover:bg-green-500 ${isFocused ? 'opacity-100' : ''}`
           }`}
           title={copied ? 'Copied!' : 'Copy Prompt'}
           aria-label={copied ? 'Copied!' : 'Copy Prompt'}
           disabled={!image.prompt}
         >
           {copied ? <CheckCircle className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-        </button>
+        </motion.button>
 
-        {hasThumbnailError ? (
+        {thumbnailsDisabled ? (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-gray-900 text-gray-500">
+            <Package className="h-8 w-8" />
+            <span className="text-xs">Preview disabled</span>
+          </div>
+        ) : isModel3D ? (
+          <Model3DThumbnail image={image} directoryPath={directoryPath} />
+        ) : hasThumbnailError ? (
           <div className="w-full h-full flex items-center justify-center bg-gray-900">
             <div className="text-center text-gray-400 px-4">
               <svg className="w-12 h-12 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -746,8 +782,6 @@ interface CellData {
   renamingImageId: string | null;
   comparisonFirstImageId?: string;
   createCardRef: (id: string) => (node: HTMLDivElement | null) => void;
-  markedBestIds?: Set<string>;
-  markedArchivedIds?: Set<string>;
   enableSafeMode?: boolean;
   sensitiveTagSet?: Set<string>;
   blurSensitiveImages?: boolean;
@@ -889,8 +923,6 @@ const Cell = React.memo(({ columnIndex, rowIndex, style, data }: GridChildCompon
     renamingImageId,
     comparisonFirstImageId,
     createCardRef,
-    markedBestIds,
-    markedArchivedIds,
     enableSafeMode,
     sensitiveTagSet,
     blurSensitiveImages,
@@ -967,8 +999,6 @@ const Cell = React.memo(({ columnIndex, rowIndex, style, data }: GridChildCompon
               baseWidth={imageSize}
               isComparisonFirst={false}
               cardRef={createCardRef(item.coverImage.id)}
-              isMarkedBest={markedBestIds?.has(item.coverImage.id)}
-              isMarkedArchived={markedArchivedIds?.has(item.coverImage.id)}
               isBlurred={isSensitive && enableSafeMode && blurSensitiveImages}
             />
 
@@ -1014,8 +1044,6 @@ const Cell = React.memo(({ columnIndex, rowIndex, style, data }: GridChildCompon
         baseWidth={imageSize}
         isComparisonFirst={comparisonFirstImageId === image.id}
         cardRef={createCardRef(image.id)}
-        isMarkedBest={markedBestIds?.has(image.id)}
-        isMarkedArchived={markedArchivedIds?.has(image.id)}
         isBlurred={isSensitive && enableSafeMode && blurSensitiveImages}
       />
     </div>
@@ -1031,20 +1059,24 @@ interface ImageGridProps {
   totalPages: number;
   onPageChange: (page: number) => void;
   onBatchExport: () => void;
+  onDeleteSelected?: () => void | Promise<void>;
   activeCollection?: SmartCollection | null;
   isCollectionsView?: boolean;
   onImageRenamed?: (oldImageId: string, newImageId: string) => void;
   onFindSimilar?: (image: IndexedImage) => void;
+  onFindVisuallySimilar?: (image: IndexedImage) => void;
+  /** Whether the visual-similar action is usable (feature on + model installed). */
+  canFindVisuallySimilar?: boolean;
   onOpenImageEditor?: (image: IndexedImage) => void;
   onOpenComfyUIWorkspace?: (image: IndexedImage) => void;
-  markedBestIds?: Set<string>;      // IDs of images marked as best
-  markedArchivedIds?: Set<string>;  // IDs of images marked for archive
   groupBy?: ImageGroupByMode;
   groupSortOrder?: ImageGroupingSortOrder;
+  clusterByImageId?: Map<string, { id: string; label: string }>;
   jumpToGroupRequest?: { groupId: string; requestId: number } | null;
   initialScrollTop?: number;
   onScrollPositionChange?: (scrollTop: number) => void;
   scrollResetKey?: string;
+  hasRightSidebar?: boolean;
 }
 
 const InnerGridElement = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>((props, ref) => (
@@ -1059,20 +1091,23 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   totalPages,
   onPageChange,
   onBatchExport,
+  onDeleteSelected,
   activeCollection = null,
   isCollectionsView = false,
   onImageRenamed,
   onFindSimilar,
+  onFindVisuallySimilar,
+  canFindVisuallySimilar = false,
   onOpenImageEditor,
   onOpenComfyUIWorkspace,
-  markedBestIds,
-  markedArchivedIds,
   groupBy = 'none',
   groupSortOrder = 'date-desc',
+  clusterByImageId,
   jumpToGroupRequest = null,
   initialScrollTop = 0,
   onScrollPositionChange,
   scrollResetKey,
+  hasRightSidebar = false,
 }) => {
   const imageSize = useSettingsStore((state) => state.imageSize);
   const itemsPerPage = useSettingsStore((state) => state.itemsPerPage);
@@ -1085,8 +1120,8 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const { stackedItems } = useImageStacking(images, isStackingEnabled);
   const effectiveGroupBy = !isStackingEnabled ? groupBy : 'none';
   const groupedImages = useMemo(
-    () => groupImages(images, effectiveGroupBy, { sortOrder: groupSortOrder }),
-    [effectiveGroupBy, groupSortOrder, images]
+    () => groupImages(images, effectiveGroupBy, { sortOrder: groupSortOrder, clusterByImageId }),
+    [effectiveGroupBy, groupSortOrder, images, clusterByImageId]
   );
   const itemsToRender: GridRenderItem[] = useMemo(() => {
     if (isStackingEnabled) {
@@ -1107,6 +1142,11 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const imageCardsRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const cardRefCallbacksRef = useRef<Map<string, (el: HTMLDivElement | null) => void>>(new Map());
   const columnCountRef = useRef<number>(1);
+  const lastFocusedRevealImageIdRef = useRef<string | null>(null);
+  const previousHasRightSidebarRef = useRef(hasRightSidebar);
+  const previewAnchorCandidateRef = useRef<{ imageId: string; viewportOffsetY: number } | null>(null);
+  const pendingPreviewAnchorRef = useRef<{ imageId: string; viewportOffsetY: number } | null>(null);
+  const previewAnchorFramesRef = useRef({ first: 0, second: 0 });
   const lastWarmupWindowRef = useRef<string>('');
   const lastScrollResetKeyRef = useRef<string | undefined>(scrollResetKey);
   const lastRestoredScrollKeyRef = useRef<string>('');
@@ -1120,6 +1160,9 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const blurSensitiveImages = useSettingsStore((state) => state.blurSensitiveImages);
   const enableSafeMode = useSettingsStore((state) => state.enableSafeMode);
   const directories = useImageStore((state) => state.directories);
+  const setSuccess = useImageStore((state) => state.setSuccess);
+  const setError = useImageStore((state) => state.setError);
+  const savePrompt = useSavePrompt();
   const filterAndSortImages = useImageStore((state) => state.filterAndSortImages);
 
   const focusedImageIndex = useImageStore((state) => state.focusedImageIndex);
@@ -1127,6 +1170,14 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const setPreviewImage = useImageStore((state) => state.setPreviewImage);
   const previewImage = useImageStore((state) => state.previewImage);
   const transferProgress = useImageStore((state) => state.transferProgress);
+  const previewAnchorDataRef = useRef({
+    itemsToRender,
+    isInfinite,
+  });
+  previewAnchorDataRef.current = {
+    itemsToRender,
+    isInfinite,
+  };
 
   const [isGenerateModalOpen, setIsGenerateModalOpen] = useState(false);
   const [isComfyUIGenerateModalOpen, setIsComfyUIGenerateModalOpen] = useState(false);
@@ -1145,6 +1196,8 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const [isCopySubmenuOpen, setIsCopySubmenuOpen] = useState(false);
   const [isCollectionSubmenuOpen, setIsCollectionSubmenuOpen] = useState(false);
   const [isAddToCollectionSubmenuOpen, setIsAddToCollectionSubmenuOpen] = useState(false);
+  const [isGenerateSubmenuOpen, setIsGenerateSubmenuOpen] = useState(false);
+  const [isFileSubmenuOpen, setIsFileSubmenuOpen] = useState(false);
   const [isCollectionModalOpen, setIsCollectionModalOpen] = useState(false);
   const [renamingImageId, setRenamingImageId] = useState<string | null>(null);
   const [transferStatusText, setTransferStatusText] = useState<string>('');
@@ -1153,7 +1206,10 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   const addImagesToCollection = useImageStore((state) => state.addImagesToCollection);
   const removeImagesFromCollection = useImageStore((state) => state.removeImagesFromCollection);
   const updateCollection = useImageStore((state) => state.updateCollection);
-  const { canUseComparison, showProModal, canUseA1111, canUseComfyUI, canUseBatchExport, canUseBulkTagging, canUseFileManagement, canUseImageEditor, initialized, canUseDuringTrialOrPro } = useFeatureAccess();
+  const { canUseComparison, showProModal, canUseA1111, canUseComfyUI, canUseBatchExport, canUseBulkTagging, canUseFileManagement, canUseImageEditor, initialized } = useFeatureAccess();
+  const { visibleProviders, singleVisibleProvider } = useGenerationProviderAvailability();
+  const isA1111ProviderVisible = visibleProviders.some((provider) => provider.id === 'a1111');
+  const isComfyUIProviderVisible = visibleProviders.some((provider) => provider.id === 'comfyui');
   const selectedCount = selectedImages.size;
   const sensitiveTagSet = useMemo(() => {
     return new Set(
@@ -1195,7 +1251,40 @@ const ImageGrid: React.FC<ImageGridProps> = ({
 
   const submenuHorizontalClass = contextMenu.horizontalDirection === 'left' ? 'right-full' : 'left-full';
 
+  const handleSaveContextPrompt = useCallback(async () => {
+    const target = contextMenu.image;
+    if (!target) return;
+    const directoryPath = directories.find((directory) => directory.id === target.directoryId)?.path;
+    hideContextMenu();
+    try {
+      const result = await savePrompt(target, { directoryPath, readAuthoritativeShadow: true });
+      setSuccess(result.status === 'already-saved' ? 'Already saved' : 'Prompt saved');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not save prompt.');
+    }
+  }, [contextMenu.image, directories, hideContextMenu, savePrompt, setError, setSuccess]);
+
   const getGridScrollElement = useCallback(() => gridScrollRef.current ?? gridScopeRef.current, []);
+
+  const capturePreviewAnchorCandidate = useCallback((event: React.MouseEvent) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const cardElement = (event.target as HTMLElement).closest<HTMLElement>('[data-image-id]');
+    const scrollElement = getGridScrollElement();
+    const imageId = cardElement?.dataset.imageId;
+    if (!cardElement || !scrollElement || !imageId) {
+      return;
+    }
+
+    const cardRect = cardElement.getBoundingClientRect();
+    const scrollRect = scrollElement.getBoundingClientRect();
+    previewAnchorCandidateRef.current = {
+      imageId,
+      viewportOffsetY: cardRect.top - scrollRect.top,
+    };
+  }, [getGridScrollElement]);
 
   const restoreGridScrollPosition = useCallback((scrollTop: number) => {
     const nextScrollTop = Math.max(0, scrollTop);
@@ -1349,7 +1438,13 @@ const ImageGrid: React.FC<ImageGridProps> = ({
     if (!contextMenu.visible && isAddToCollectionSubmenuOpen) {
       setIsAddToCollectionSubmenuOpen(false);
     }
-  }, [contextMenu.visible, isAddToCollectionSubmenuOpen, isCollectionSubmenuOpen, isCopySubmenuOpen]);
+    if (!contextMenu.visible && isGenerateSubmenuOpen) {
+      setIsGenerateSubmenuOpen(false);
+    }
+    if (!contextMenu.visible && isFileSubmenuOpen) {
+      setIsFileSubmenuOpen(false);
+    }
+  }, [contextMenu.visible, isAddToCollectionSubmenuOpen, isCollectionSubmenuOpen, isCopySubmenuOpen, isFileSubmenuOpen, isGenerateSubmenuOpen]);
 
   const queuedComparisonFirstImageId = queuedComparisonImages[0]?.id;
   const imageGridProfilerOnRender = useMemo(() => createProfilerOnRender('ImageGrid'), []);
@@ -1411,6 +1506,7 @@ const ImageGrid: React.FC<ImageGridProps> = ({
     if (
       isVideoFileName(contextMenu.image.name, contextMenu.image.fileType) ||
       isAudioFileName(contextMenu.image.name, contextMenu.image.fileType) ||
+      isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType) ||
       getFileExtension(contextMenu.image.name) === '.gif'
     ) {
       return;
@@ -1426,6 +1522,7 @@ const ImageGrid: React.FC<ImageGridProps> = ({
 
   const selectForComparison = useCallback(() => {
     if (!contextMenu.image) return;
+    if (isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType)) return;
     if (!canUseComparison) {
       showProModal('comparison');
       hideContextMenu();
@@ -1457,18 +1554,29 @@ const ImageGrid: React.FC<ImageGridProps> = ({
     hideContextMenu();
   }, [contextMenu.image, hideContextMenu, onFindSimilar]);
 
+  const openFindVisuallySimilar = useCallback(() => {
+    if (!contextMenu.image || !onFindVisuallySimilar) {
+      return;
+    }
+
+    onFindVisuallySimilar(contextMenu.image);
+    hideContextMenu();
+  }, [contextMenu.image, hideContextMenu, onFindVisuallySimilar]);
+
   const handleBatchExport = useCallback(() => {
     hideContextMenu();
     onBatchExport();
   }, [hideContextMenu, onBatchExport]);
 
   const contextImagePrompt = contextMenu.image?.prompt || contextMenu.image?.metadata?.normalizedMetadata?.prompt;
+  const isContextModel3D = Boolean(contextMenu.image && isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType));
   const canFindSimilar = Boolean(contextImagePrompt) && Boolean(onFindSimilar);
   const canOpenContextImageEditor = Boolean(
     onOpenImageEditor &&
     contextMenu.image &&
     !isVideoFileName(contextMenu.image.name, contextMenu.image.fileType) &&
     !isAudioFileName(contextMenu.image.name, contextMenu.image.fileType) &&
+    !isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType) &&
     getFileExtension(contextMenu.image.name) !== '.gif',
   );
 
@@ -1483,6 +1591,9 @@ const ImageGrid: React.FC<ImageGridProps> = ({
 
     return [contextMenu.image];
   }, [contextMenu.image, images, selectedImages]);
+  const deleteTargetCount = contextMenu.image && selectedImages.has(contextMenu.image.id)
+    ? selectedImages.size
+    : contextMenu.image ? 1 : 0;
 
   const handleAddToExistingCollection = useCallback(async (collection: SmartCollection) => {
     const targetImages = getContextTargetImages();
@@ -1595,15 +1706,24 @@ const ImageGrid: React.FC<ImageGridProps> = ({
       hideContextMenu();
       return;
     }
-    if (!canUseFileManagement) {
-      showProModal('file_management');
+
+    setRenamingImageId(image.id);
+    hideContextMenu();
+  }, [hideContextMenu]);
+
+  const handleDeleteFromContextMenu = useCallback(() => {
+    if (!contextMenu.image || !onDeleteSelected) {
       hideContextMenu();
       return;
     }
 
-    setRenamingImageId(image.id);
+    if (!selectedImages.has(contextMenu.image.id)) {
+      useImageStore.setState({ selectedImages: new Set([contextMenu.image.id]) });
+    }
+
     hideContextMenu();
-  }, [canUseFileManagement, hideContextMenu, showProModal]);
+    void onDeleteSelected();
+  }, [contextMenu.image, hideContextMenu, onDeleteSelected, selectedImages]);
 
   const closeInlineRename = useCallback((result?: ImageRenameResult) => {
     if (result) {
@@ -2018,9 +2138,20 @@ const ImageGrid: React.FC<ImageGridProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!gridKeyboardActiveRef.current || focusedImageIndex == null || focusedImageIndex < 0) {
+    const focusedImageId = focusedImageIndex != null && focusedImageIndex >= 0
+      ? images[focusedImageIndex]?.id ?? null
+      : null;
+
+    if (!gridKeyboardActiveRef.current || !focusedImageId) {
+      lastFocusedRevealImageIdRef.current = null;
       return;
     }
+
+    // A rerender must not pull the viewport back to an unchanged focused card.
+    if (lastFocusedRevealImageIdRef.current === focusedImageId) {
+      return;
+    }
+    lastFocusedRevealImageIdRef.current = focusedImageId;
 
     const columnCount = Math.max(1, columnCountRef.current);
     const activeItems = isInfinite
@@ -2052,7 +2183,126 @@ const ImageGrid: React.FC<ImageGridProps> = ({
         inline: 'nearest',
       });
     }
-  }, [focusedImageIndex, getRenderedIndexInItems, isInfinite, itemsToRender]);
+  }, [focusedImageIndex, getRenderedIndexInItems, images, isInfinite, itemsToRender]);
+
+  const cancelScheduledPreviewAnchor = useCallback(() => {
+    window.cancelAnimationFrame(previewAnchorFramesRef.current.first);
+    window.cancelAnimationFrame(previewAnchorFramesRef.current.second);
+    previewAnchorFramesRef.current = { first: 0, second: 0 };
+  }, []);
+
+  const revealPendingPreviewAnchor = useCallback(() => {
+    const anchor = pendingPreviewAnchorRef.current;
+    if (!anchor) {
+      return;
+    }
+
+    const latest = previewAnchorDataRef.current;
+    const columnCount = Math.max(1, columnCountRef.current);
+    const activeItems = latest.isInfinite
+      ? expandGroupedItemsForColumns(latest.itemsToRender, columnCount)
+      : latest.itemsToRender;
+    const renderedIndex = activeItems.findIndex((item) =>
+      isImageRenderItem(item) && (isImageStack(item)
+        ? item.images.some((stackImage) => stackImage.id === anchor.imageId)
+        : item.id === anchor.imageId)
+    );
+    if (renderedIndex < 0) {
+      pendingPreviewAnchorRef.current = null;
+      return;
+    }
+
+    const anchoredItem = activeItems[renderedIndex];
+    if (!anchoredItem || !isImageRenderItem(anchoredItem)) {
+      pendingPreviewAnchorRef.current = null;
+      return;
+    }
+
+    const anchoredElement = imageCardsRef.current.get(getWarmupImage(anchoredItem).id);
+    const scrollElement = getGridScrollElement();
+    if (!anchoredElement || !scrollElement) {
+      if (latest.isInfinite) {
+        virtualGridRef.current?.scrollToItem({
+          rowIndex: Math.floor(renderedIndex / columnCount),
+          columnIndex: renderedIndex % columnCount,
+          align: 'smart',
+        });
+        return;
+      }
+
+      pendingPreviewAnchorRef.current = null;
+      return;
+    }
+
+    const currentOffsetY = anchoredElement.getBoundingClientRect().top - scrollElement.getBoundingClientRect().top;
+    const nextScrollTop = Math.max(0, scrollElement.scrollTop + currentOffsetY - anchor.viewportOffsetY);
+    if (latest.isInfinite) {
+      virtualGridRef.current?.scrollTo({ scrollTop: nextScrollTop, scrollLeft: scrollElement.scrollLeft });
+    } else {
+      scrollElement.scrollTop = nextScrollTop;
+    }
+    pendingPreviewAnchorRef.current = null;
+  }, [getGridScrollElement]);
+
+  const schedulePendingPreviewAnchor = useCallback(() => {
+    if (!pendingPreviewAnchorRef.current) {
+      return;
+    }
+
+    cancelScheduledPreviewAnchor();
+    previewAnchorFramesRef.current.first = window.requestAnimationFrame(() => {
+      previewAnchorFramesRef.current.second = window.requestAnimationFrame(() => {
+        previewAnchorFramesRef.current = { first: 0, second: 0 };
+        revealPendingPreviewAnchor();
+      });
+    });
+  }, [cancelScheduledPreviewAnchor, revealPendingPreviewAnchor]);
+
+  useLayoutEffect(() => {
+    const wasOpen = previousHasRightSidebarRef.current;
+    previousHasRightSidebarRef.current = hasRightSidebar;
+
+    if (!hasRightSidebar) {
+      if (wasOpen) {
+        previewAnchorCandidateRef.current = null;
+        pendingPreviewAnchorRef.current = null;
+        cancelScheduledPreviewAnchor();
+      }
+      return;
+    }
+
+    if (!wasOpen && previewImage) {
+      const candidate = previewAnchorCandidateRef.current;
+      previewAnchorCandidateRef.current = null;
+      if (candidate?.imageId === previewImage.id) {
+        pendingPreviewAnchorRef.current = candidate;
+      }
+    }
+  }, [cancelScheduledPreviewAnchor, hasRightSidebar, previewImage]);
+
+  const handleVirtualGridResize = useCallback(() => {
+    schedulePendingPreviewAnchor();
+  }, [schedulePendingPreviewAnchor]);
+
+  useEffect(() => {
+    if (isInfinite || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const gridElement = gridScopeRef.current;
+    if (!gridElement) {
+      return;
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      schedulePendingPreviewAnchor();
+    });
+    resizeObserver.observe(gridElement);
+
+    return () => resizeObserver.disconnect();
+  }, [isInfinite, schedulePendingPreviewAnchor]);
+
+  useEffect(() => cancelScheduledPreviewAnchor, [cancelScheduledPreviewAnchor]);
 
   useEffect(() => {
     if (!jumpToGroupRequest || effectiveGroupBy === 'none') {
@@ -2071,24 +2321,42 @@ const ImageGrid: React.FC<ImageGridProps> = ({
       setPreviewImage(images[targetImageIndex]);
     }
 
-    const virtualItems = expandGroupedItemsForColumns(itemsToRender, Math.max(1, columnCountRef.current));
-    const renderedIndex = virtualItems.findIndex((item) => !isImageRenderItem(item) && item.type === 'group-header' && item.group.id === jumpToGroupRequest.groupId);
-    if (renderedIndex < 0) {
-      return;
-    }
-
-    if (isInfinite) {
+    // Defer the scroll until after the focus/preview state commits and the grid
+    // re-lays out. Running it synchronously here scrolls against a pre-commit
+    // layout (the focus ring / preview sidebar can shift the grid), which made
+    // the very first jump land in the wrong place — it only worked on the second
+    // click once the layout was already settled. A double rAF waits for paint.
+    let firstFrame = 0;
+    let secondFrame = 0;
+    const performScroll = () => {
       const columnCount = Math.max(1, columnCountRef.current);
-      virtualGridRef.current?.scrollToItem({
-        rowIndex: Math.floor(renderedIndex / columnCount),
-        columnIndex: 0,
-        align: 'start',
-      });
-      return;
-    }
+      const virtualItems = expandGroupedItemsForColumns(itemsToRender, columnCount);
+      const renderedIndex = virtualItems.findIndex((item) => !isImageRenderItem(item) && item.type === 'group-header' && item.group.id === jumpToGroupRequest.groupId);
+      if (renderedIndex < 0) {
+        return;
+      }
 
-    const header = gridScopeRef.current?.querySelector<HTMLElement>(`[data-group-id="${CSS.escape(jumpToGroupRequest.groupId)}"]`);
-    header?.scrollIntoView({ block: 'start', inline: 'nearest' });
+      if (isInfinite) {
+        virtualGridRef.current?.scrollToItem({
+          rowIndex: Math.floor(renderedIndex / columnCount),
+          columnIndex: 0,
+          align: 'start',
+        });
+        return;
+      }
+
+      const header = gridScopeRef.current?.querySelector<HTMLElement>(`[data-group-id="${CSS.escape(jumpToGroupRequest.groupId)}"]`);
+      header?.scrollIntoView({ block: 'start', inline: 'nearest' });
+    };
+
+    firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(performScroll);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
   }, [effectiveGroupBy, groupedImages.groups, images, isInfinite, itemsToRender, jumpToGroupRequest, setFocusedImageIndex, setPreviewImage]);
 
   // Add global mouseup listener to handle selection end even outside the grid
@@ -2151,6 +2419,14 @@ const ImageGrid: React.FC<ImageGridProps> = ({
             Copy to Clipboard
           </button>
 
+          <button
+            onClick={() => void handleSaveContextPrompt()}
+            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
+          >
+            <Bookmark className="w-4 h-4" />
+            Save Prompt
+          </button>
+
           <div className="border-t border-gray-600 my-1"></div>
 
           <button
@@ -2159,7 +2435,7 @@ const ImageGrid: React.FC<ImageGridProps> = ({
           >
             <Tag className="w-4 h-4" />
             <span className="flex-1">Add/Remove Tags</span>
-            {!canUseBulkTagging && selectedCount > 1 && initialized && !canUseDuringTrialOrPro && <ProBadge size="sm" />}
+            {!canUseBulkTagging && selectedCount > 1 && initialized && <ProBadge size="sm" variant="subtle" tooltip="Pro feature" />}
           </button>
 
           <div
@@ -2326,17 +2602,19 @@ const ImageGrid: React.FC<ImageGridProps> = ({
 
           <div className="border-t border-gray-600 my-1"></div>
 
-          <button
-            onClick={selectForComparison}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseComparison && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <GitCompare className="w-4 h-4" />
-            <span className="flex-1">
-              Add to Compare {canUseComparison && comparisonCount > 0 ? `(${comparisonCount}/4)` : ''}
-            </span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+          {!isContextModel3D && (
+            <button
+              onClick={selectForComparison}
+              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
+              title={!canUseComparison && initialized ? 'Pro feature' : undefined}
+            >
+              <GitCompare className="w-4 h-4" />
+              <span className="flex-1">
+                Add to Compare {canUseComparison && comparisonCount > 0 ? `(${comparisonCount}/4)` : ''}
+              </span>
+              {!canUseComparison && <ProBadge size="sm" variant="subtle" tooltip="Pro feature" />}
+            </button>
+          )}
 
           <button
             onClick={openFindSimilar}
@@ -2345,18 +2623,32 @@ const ImageGrid: React.FC<ImageGridProps> = ({
             title={canFindSimilar ? 'Find images with matching prompt and metadata' : 'Requires prompt metadata'}
           >
             <Search className="w-4 h-4" />
-            <span className="flex-1">Find similar...</span>
+            <span className="flex-1">Find by metadata...</span>
           </button>
+
+          {onFindVisuallySimilar && (
+            <button
+              onClick={openFindVisuallySimilar}
+              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={!canFindVisuallySimilar}
+              title={canFindVisuallySimilar
+                ? 'Find images that look like this one'
+                : 'Enable Visual Search and download the model in Settings first'}
+            >
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              <span className="flex-1">Find Similar</span>
+            </button>
+          )}
 
           {canOpenContextImageEditor && (
             <button
               onClick={openImageEditor}
               className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-              title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature) - start trial' : 'Open this image in the editor workspace'}
+              title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature)' : 'Open this image in the editor workspace'}
             >
               <ImageIcon className="w-4 h-4" />
               <span className="flex-1">Open in Editor</span>
-              {!canUseDuringTrialOrPro && initialized && <ProBadge size="sm" />}
+              {!canUseImageEditor && initialized && <ProBadge size="sm" variant="subtle" tooltip="Image Editor (Pro Feature)" />}
             </button>
           )}
 
@@ -2382,109 +2674,172 @@ const ImageGrid: React.FC<ImageGridProps> = ({
 
           <div className="border-t border-gray-600 my-1"></div>
 
-          <button
-            onClick={showInFolder}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-          >
-            <Folder className="w-4 h-4" />
-            Show in Folder
-          </button>
+          <ShowInFolderContextAction onClick={showInFolder} />
 
-          <button
-            onClick={() => openInlineRename(contextMenu.image)}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Pencil className="w-4 h-4" />
-            <span className="flex-1">Rename...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+          {(() => {
+            const fileMenuItems = buildFileMenuItems({
+              onRename: () => openInlineRename(contextMenu.image),
+              onCopyTo: () => openTransferModal('copy'),
+              onMoveTo: () => openTransferModal('move'),
+              onExport: exportImage,
+              onBatchExport: handleBatchExport,
+              selectedCount,
+              canUseFileManagement,
+              canUseBatchExport,
+            });
+            const fileHasProItem = fileMenuItems.some((item) => item.isPro);
 
-          <button
-            onClick={() => openTransferModal('copy')}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Folder className="w-4 h-4" />
-            <span className="flex-1">Copy To...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
-
-          <button
-            onClick={() => openTransferModal('move')}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Folder className="w-4 h-4" />
-            <span className="flex-1">Move To...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
-
-            <button
-              onClick={exportImage}
-              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            >
-              <Download className="w-4 h-4" />
-              Export Image
-            </button>
-
-            {selectedCount > 1 && (
-              <button
-                onClick={handleBatchExport}
-                className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-                title={!canUseBatchExport && initialized ? 'Pro feature - start trial' : undefined}
+            return (
+              <ContextMenuSubmenu
+                label="File"
+                icon={<Folder className="w-4 h-4" />}
+                isOpen={isFileSubmenuOpen}
+                onOpenChange={setIsFileSubmenuOpen}
+                horizontalClass={submenuHorizontalClass}
+                showProBadge={fileHasProItem && initialized}
+                proBadgeTooltip="Pro feature"
               >
-                <Package className="w-4 h-4" />
-                <span className="flex-1">Batch Export Selected ({selectedCount})</span>
-                {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-              </button>
-            )}
+                {fileMenuItems.map((item) => (
+                  <ContextMenuButton
+                    key={item.key}
+                    onClick={item.onClick}
+                    icon={item.icon}
+                    label={item.label}
+                    title={item.isPro && initialized ? 'Pro feature' : undefined}
+                    showProBadge={item.isPro}
+                    proBadgeTooltip="Pro feature"
+                  />
+                ))}
+              </ContextMenuSubmenu>
+            );
+          })()}
 
-            <div className="border-t border-gray-600 my-1"></div>
+          {(() => {
+            if (isContextModel3D) {
+              if (!onOpenComfyUIWorkspace || !isComfyUIProviderVisible) return null;
+              return (
+                <>
+                  <div className="border-t border-gray-600 my-1"></div>
+                  <ContextMenuButton
+                    onClick={openComfyUIWorkspace}
+                    icon={<Workflow className="w-4 h-4" />}
+                    label="Open in ComfyUI Workspace"
+                    showProBadge={!canUseComfyUI}
+                    proBadgeTooltip="Pro feature"
+                  />
+                </>
+              );
+            }
+            const hasPromptMetadata = Boolean(contextMenu.image?.metadata?.normalizedMetadata?.prompt);
+            const generateMenuItems: Array<{
+              key: string;
+              icon: React.ReactNode;
+              label: string;
+              onClick: () => void;
+              disabled?: boolean;
+              isPro: boolean;
+              title?: string;
+            }> = [];
 
-          <button
-            onClick={copyMetadataToA1111}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            disabled={!contextMenu.image?.metadata?.normalizedMetadata?.prompt}
-            title={!canUseA1111 && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Clipboard className="w-4 h-4" />
-            <span className="flex-1">Copy to A1111</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+            if (isA1111ProviderVisible) {
+              generateMenuItems.push({
+                key: 'copy-a1111',
+                icon: <Clipboard className="w-4 h-4" />,
+                label: 'Copy to A1111',
+                onClick: copyMetadataToA1111,
+                disabled: !hasPromptMetadata,
+                isPro: !canUseA1111,
+              });
+              generateMenuItems.push({
+                key: 'generate-a1111',
+                icon: <Sparkles className="w-4 h-4" />,
+                label: singleVisibleProvider ? 'Generate' : 'Generate with A1111',
+                onClick: openGenerateModal,
+                disabled: !hasPromptMetadata,
+                isPro: !canUseA1111,
+              });
+            }
 
-          <button
-            onClick={openGenerateModal}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            disabled={!contextMenu.image?.metadata?.normalizedMetadata?.prompt}
-            title={!canUseA1111 && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Sparkles className="w-4 h-4" />
-            <span className="flex-1">Generate with A1111</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+            if (isComfyUIProviderVisible) {
+              generateMenuItems.push({
+                key: 'generate-comfyui',
+                icon: <Sparkles className="w-4 h-4" />,
+                label: singleVisibleProvider ? 'Generate' : 'Generate with ComfyUI',
+                onClick: openComfyUIGenerateModal,
+                disabled: !hasPromptMetadata,
+                isPro: !canUseComfyUI,
+              });
 
-          <button
-            onClick={openComfyUIGenerateModal}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            disabled={!contextMenu.image?.metadata?.normalizedMetadata?.prompt}
-            title={!canUseComfyUI && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Sparkles className="w-4 h-4" />
-            <span className="flex-1">Generate with ComfyUI</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+              if (onOpenComfyUIWorkspace) {
+                generateMenuItems.push({
+                  key: 'comfyui-workspace',
+                  icon: <Workflow className="w-4 h-4" />,
+                  label: 'Open in ComfyUI Workspace',
+                  onClick: openComfyUIWorkspace,
+                  isPro: !canUseComfyUI,
+                  title: 'Open this image workflow in the ComfyUI workspace',
+                });
+              }
+            }
 
-          {onOpenComfyUIWorkspace && (
-            <button
-              onClick={openComfyUIWorkspace}
-              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-              title={!canUseComfyUI && initialized ? 'Pro feature - start trial' : 'Open this image workflow in the ComfyUI workspace'}
-            >
-              <Workflow className="w-4 h-4" />
-              <span className="flex-1">Open in ComfyUI Workspace</span>
-              {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-            </button>
+            if (generateMenuItems.length === 0) {
+              return null;
+            }
+
+            const generateHasProItem = generateMenuItems.some((item) => item.isPro);
+
+            return (
+              <>
+                <div className="border-t border-gray-600 my-1"></div>
+                {generateMenuItems.length === 1 ? (
+                  <ContextMenuButton
+                    onClick={generateMenuItems[0].onClick}
+                    icon={generateMenuItems[0].icon}
+                    label={generateMenuItems[0].label}
+                    disabled={generateMenuItems[0].disabled}
+                    title={generateMenuItems[0].isPro && initialized ? 'Pro feature' : generateMenuItems[0].title}
+                    showProBadge={generateMenuItems[0].isPro}
+                    proBadgeTooltip="Pro feature"
+                  />
+                ) : (
+                  <ContextMenuSubmenu
+                    label="Generate"
+                    icon={<Sparkles className="w-4 h-4" />}
+                    isOpen={isGenerateSubmenuOpen}
+                    onOpenChange={setIsGenerateSubmenuOpen}
+                    horizontalClass={submenuHorizontalClass}
+                    showProBadge={generateHasProItem && initialized}
+                    proBadgeTooltip="Pro feature"
+                  >
+                    {generateMenuItems.map((item) => (
+                      <ContextMenuButton
+                        key={item.key}
+                        onClick={item.onClick}
+                        icon={item.icon}
+                        label={item.label}
+                        disabled={item.disabled}
+                        title={item.isPro && initialized ? 'Pro feature' : item.title}
+                        showProBadge={item.isPro}
+                        proBadgeTooltip="Pro feature"
+                      />
+                    ))}
+                  </ContextMenuSubmenu>
+                )}
+              </>
+            );
+          })()}
+
+          {onDeleteSelected && (
+            <>
+              <div className="border-t border-gray-600 my-1"></div>
+              <ContextMenuButton
+                onClick={handleDeleteFromContextMenu}
+                icon={<Trash2 className="w-4 h-4" />}
+                label={deleteTargetCount > 1
+                  ? `Delete Selected (${deleteTargetCount})`
+                  : 'Delete'}
+              />
+            </>
           )}
         </div>,
         document.body,
@@ -2699,13 +3054,14 @@ const ImageGrid: React.FC<ImageGridProps> = ({
             onMouseDownCapture={(event) => {
               if (!isTypingTarget(event.target)) {
                 gridKeyboardActiveRef.current = true;
+                capturePreviewAnchorCandidate(event);
               }
             }}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
           >
-            <AutoSizer>
+            <AutoSizer onResize={handleVirtualGridResize}>
               {({ height, width }) => {
                 const columnCount = Math.floor(width / (imageSize + GAP_SIZE));
                 const safeColumnCount = columnCount > 0 ? columnCount : 1;
@@ -2729,8 +3085,6 @@ const ImageGrid: React.FC<ImageGridProps> = ({
                     renamingImageId,
                     comparisonFirstImageId: queuedComparisonFirstImageId,
                     createCardRef,
-                    markedBestIds,
-                    markedArchivedIds,
                     enableSafeMode,
                     sensitiveTagSet,
                     blurSensitiveImages,
@@ -2783,6 +3137,7 @@ const ImageGrid: React.FC<ImageGridProps> = ({
                       });
                     }}
                     onItemsRendered={({ visibleColumnStartIndex, visibleColumnStopIndex, visibleRowStartIndex, visibleRowStopIndex, overscanRowStopIndex }) => {
+                      schedulePendingPreviewAnchor();
                       const itemsRenderedStartedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
                       const visibleStartIndex = (visibleRowStartIndex * safeColumnCount) + visibleColumnStartIndex;
                       const visibleStopIndex = Math.min(
@@ -2906,6 +3261,7 @@ const ImageGrid: React.FC<ImageGridProps> = ({
         onMouseDownCapture={(event) => {
           if (!isTypingTarget(event.target)) {
             gridKeyboardActiveRef.current = true;
+            capturePreviewAnchorCandidate(event);
           }
         }}
         onClick={() => {
@@ -2969,8 +3325,6 @@ const ImageGrid: React.FC<ImageGridProps> = ({
                 baseWidth={imageSize}
                                 isComparisonFirst={false}
                                 cardRef={createCardRef(item.coverImage.id)}
-                                isMarkedBest={markedBestIds?.has(item.coverImage.id)}
-                                isMarkedArchived={markedArchivedIds?.has(item.coverImage.id)}
                                 isBlurred={isSensitive && enableSafeMode && blurSensitiveImages}
                             />
                             {/* Low prominence Stack Badge */}
@@ -3006,8 +3360,6 @@ const ImageGrid: React.FC<ImageGridProps> = ({
                 baseWidth={imageSize}
                 isComparisonFirst={queuedComparisonFirstImageId === image.id}
                 cardRef={createCardRef(image.id)}
-                isMarkedBest={markedBestIds?.has(image.id)}
-                isMarkedArchived={markedArchivedIds?.has(image.id)}
                 isBlurred={isSensitive && enableSafeMode && blurSensitiveImages}
               />
             );

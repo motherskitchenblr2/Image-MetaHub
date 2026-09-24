@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { X, ExternalLink } from 'lucide-react';
+import { useSettingsStore } from '../store/useSettingsStore';
+import { ProPlanSelectorModal } from './ProPlanSelector';
 
 interface ChangelogModalProps {
   isOpen: boolean;
@@ -10,6 +12,8 @@ interface ChangelogModalProps {
 const ChangelogModal: React.FC<ChangelogModalProps> = ({ isOpen, onClose, currentVersion }) => {
   const [changelog, setChangelog] = useState<string>('');
   const [loading, setLoading] = useState(true);
+  const [isPlanSelectorOpen, setIsPlanSelectorOpen] = useState(false);
+  const creatorAttributionToken = useSettingsStore((state) => state.creatorAttributionToken);
 
   useEffect(() => {
     if (isOpen) {
@@ -68,6 +72,40 @@ const ChangelogModal: React.FC<ChangelogModalProps> = ({ isOpen, onClose, curren
     window.open(url, '_blank', 'noopener,noreferrer');
   };
 
+  const renderMarkdownLink = (text: string | React.ReactNode) => {
+    if (typeof text !== 'string') return text;
+
+    // Parse markdown links [text](url)
+    const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+    const parts: (string | React.JSX.Element)[] = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = linkRegex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push(text.substring(lastIndex, match.index));
+      }
+      parts.push(
+        <a
+          key={`link-${match.index}`}
+          href={match[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-accent hover:underline"
+        >
+          {match[1]}
+        </a>
+      );
+      lastIndex = linkRegex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      parts.push(text.substring(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : text;
+  };
+
   const renderMarkdown = (text: string) => {
     // Simple markdown rendering
     const lines = text.split('\n');
@@ -81,24 +119,25 @@ const ChangelogModal: React.FC<ChangelogModalProps> = ({ isOpen, onClose, curren
       }
       // List items
       if (line.startsWith('- **')) {
-        const content = line.replace(/^- \*\*([^*]+)\*\*:\s*(.*)/, '<strong>$1</strong>: $2');
-        return <li key={index} className="text-gray-300" dangerouslySetInnerHTML={{ __html: content }} />;
+        const content = line.replace(/^- \*\*([^*]+)\*\*:\s*/, '');
+        return <li key={index} className="text-gray-300"><strong>{line.match(/^- \*\*([^*]+)\*\*/)![1]}</strong>: {renderMarkdownLink(content)}</li>;
       }
       if (line.startsWith('- ')) {
-        return <li key={index} className="text-gray-300">{line.replace('- ', '')}</li>;
+        return <li key={index} className="text-gray-300">{renderMarkdownLink(line.replace('- ', ''))}</li>;
       }
       // Empty lines
       if (line.trim() === '') {
         return <div key={index} className="h-2" />;
       }
       // Regular text
-      return <p key={index} className="text-gray-300 mb-2">{line}</p>;
+      return <p key={index} className="text-gray-300 mb-2">{renderMarkdownLink(line)}</p>;
     });
   };
 
   if (!isOpen) return null;
 
   return (
+    <>
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
       <div 
         className="bg-gray-800 rounded-xl shadow-2xl w-full max-w-3xl max-h-[80vh] flex flex-col border border-gray-700"
@@ -128,6 +167,59 @@ const ChangelogModal: React.FC<ChangelogModalProps> = ({ isOpen, onClose, curren
             </div>
           ) : (
             <>
+              {/* Message for the Dev */}
+              <div className="mb-6 p-4 bg-gradient-to-br from-blue-900/20 to-purple-900/20 border border-blue-500/30 rounded-lg">
+                <h3 className="text-lg font-semibold text-blue-300 mb-3">Message from the Dev</h3>
+                <div className="space-y-3 text-sm leading-relaxed">
+                  <p className="text-gray-300">
+                    Hey there, this is Lucas - the solo dev behind Image MetaHub
+                  </p>
+                  <p className="text-gray-300">
+                    v0.19 is a pretty big update with the main new features being local visual search (CLIP) and support to 3D assets. If you use ComfyUI, please update the MetaHub Save Node and use the 3D Save Node so Image MetaHub can keep track of the original image and related metadata. As usual, its a first implementation that, although functional, might still need a bit of trimming around the edges. Let me know what you think.
+                  </p>
+                  <p className="text-gray-300">
+                    There's also an important change to licensing that IMH now uses a new license format; if you already own a license, a replacement license has been sent to the e-mail address used for your purchase. Your existing purchase is still valid, you'll just need to activate using the new key.{' '}
+                  </p>
+                  <p className="text-gray-300">
+                    One other change worth calling out: the Pro Trial is no longer available in the Portable version. It can still be accessed in the regular installed version of IMH.
+                  </p>
+                  <p className="text-gray-300">
+                    Before you go, I’d really appreciate it if you could {renderMarkdownLink('[answer the short anonymous survey](https://forms.gle/7WKvUC5RVf9Mx9jF7)')}. It directly helps me figure out what’s worth working on next.
+                  </p>
+                  <p className="text-gray-300">
+                    And if you want to chat, share feedback, show what you’re working on, or just make the place feel a little less abandoned, {renderMarkdownLink('[come join the Discord](https://discord.gg/2MXWxjKyJ5)')}. It’s been a bit quiet in there lately. 😅
+                  </p>
+                  <p className="text-gray-300">
+                    Thanks for sticking around, and if you have any issues, suggestions, criticism or feature request, please open an Issue on GitHub or contact me directly on  {renderMarkdownLink('[Discord](https://discord.gg/2MXWxjKyJ5)')} or through imagemetahub@gmail.com
+                  </p>
+                  <p className="text-gray-300">
+                    Back to shipping
+                  </p>
+                  <p className="text-gray-300">
+                    - Lucas
+                  </p>
+
+                  {/* Badges */}
+                  <div className="flex gap-3 mt-6 pt-4 border-t border-blue-500/20 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => setIsPlanSelectorOpen(true)}
+                      className="inline-flex items-center px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+                    >
+                      Get Pro
+                    </button>
+                    <a
+                      href="https://discord.gg/2MXWxjKyJ5"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium transition-colors"
+                    >
+                      Join Discord
+                    </a>
+                  </div>
+                </div>
+              </div>
+
               {/* Changelog Content */}
               <div className="prose prose-invert prose-sm max-w-none">
                 <ul className="list-disc list-inside space-y-1">
@@ -155,7 +247,14 @@ const ChangelogModal: React.FC<ChangelogModalProps> = ({ isOpen, onClose, curren
           </button>
         </div>
       </div>
-    </div>
+      </div>
+      <ProPlanSelectorModal
+        isOpen={isPlanSelectorOpen}
+        onClose={() => setIsPlanSelectorOpen(false)}
+        token={creatorAttributionToken}
+        ctx="about"
+      />
+    </>
   );
 };
 

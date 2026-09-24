@@ -5,12 +5,19 @@ import AutoSizer from 'react-virtualized-auto-sizer';
 import { type IndexedImage, type Directory, SmartCollection } from '../types';
 import { useContextMenu } from '../hooks/useContextMenu';
 import { useImageStore } from '../store/useImageStore';
-import { Copy, Folder, Download, ArrowUpDown, ArrowUp, ArrowDown, ChevronRight, Info, Package, Play, Music, RefreshCw, Search, Star, Pencil, Workflow, Image as ImageIcon } from 'lucide-react';
+import { Copy, Folder, ArrowUpDown, ArrowUp, ArrowDown, ChevronRight, Info, Package, Play, Music, RefreshCw, Search, Sparkles, Star, Workflow, Image as ImageIcon, Bookmark } from 'lucide-react';
 import { useThumbnail } from '../hooks/useThumbnail';
 import { useResolvedThumbnail } from '../hooks/useResolvedThumbnail';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { useFeatureAccess } from '../hooks/useFeatureAccess';
+import { useGenerationProviderAvailability } from '../hooks/useGenerationProviderAvailability';
 import ProBadge from './ProBadge';
+import {
+  ContextMenuButton,
+  ContextMenuSubmenu,
+  ShowInFolderContextAction,
+  buildFileMenuItems,
+} from './contextMenu/ContextMenuPrimitives';
 import TransferImagesModal, { type TransferDestination } from './TransferImagesModal';
 import { transferIndexedImages } from '../services/fileTransferService';
 import { RATING_VALUES, RatingValueIcons, getRatingBadgeClasses, getRatingChipClasses, getRatingLabel } from './RatingStars';
@@ -18,9 +25,11 @@ import { getContextMenuRatingTargetIds } from '../utils/ratingSelection';
 import { useReparseMetadata } from '../hooks/useReparseMetadata';
 import CollectionFormModal, { CollectionFormValues } from './CollectionFormModal';
 import RenameImageModal from './RenameImageModal';
-import { getFileExtension, isAudioFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { getFileExtension, isAudioFileName, isModel3DFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import Model3DThumbnail from './Model3DThumbnail';
 import { groupImages, type ImageGroupByMode, type ImageGroupingSortOrder, type ImageGroupRenderItem } from '../utils/imageGrouping';
 import { clearInternalImageDragData, setInternalImageDragData } from '../utils/internalImageDrag';
+import { useSavePrompt } from '../hooks/useSavePrompt';
 
 interface ImageTableProps {
   images: IndexedImage[];
@@ -31,10 +40,13 @@ interface ImageTableProps {
   isCollectionsView?: boolean;
   onImageRenamed?: (oldImageId: string, newImageId: string) => void;
   onFindSimilar?: (image: IndexedImage) => void;
+  onFindVisuallySimilar?: (image: IndexedImage) => void;
+  canFindVisuallySimilar?: boolean;
   onOpenImageEditor?: (image: IndexedImage) => void;
   onOpenComfyUIWorkspace?: (image: IndexedImage) => void;
   groupBy?: ImageGroupByMode;
   groupSortOrder?: ImageGroupingSortOrder;
+  clusterByImageId?: Map<string, { id: string; label: string }>;
   jumpToGroupRequest?: { groupId: string; requestId: number } | null;
 }
 
@@ -80,13 +92,19 @@ const ImageTable: React.FC<ImageTableProps> = ({
   isCollectionsView = false,
   onImageRenamed,
   onFindSimilar,
+  onFindVisuallySimilar,
+  canFindVisuallySimilar = false,
   onOpenImageEditor,
   onOpenComfyUIWorkspace,
   groupBy = 'none',
   groupSortOrder = 'date-desc',
+  clusterByImageId,
   jumpToGroupRequest = null,
 }) => {
   const directories = useImageStore((state) => state.directories);
+  const setSuccess = useImageStore((state) => state.setSuccess);
+  const setError = useImageStore((state) => state.setError);
+  const savePrompt = useSavePrompt();
   const transferProgress = useImageStore((state) => state.transferProgress);
   const [sortField, setSortField] = useState<SortField | null>(null);
   const [sortDirection, setSortDirection] = useState<SortDirection>(null);
@@ -96,6 +114,7 @@ const ImageTable: React.FC<ImageTableProps> = ({
   const [isCopySubmenuOpen, setIsCopySubmenuOpen] = useState(false);
   const [isCollectionSubmenuOpen, setIsCollectionSubmenuOpen] = useState(false);
   const [isAddToCollectionSubmenuOpen, setIsAddToCollectionSubmenuOpen] = useState(false);
+  const [isFileSubmenuOpen, setIsFileSubmenuOpen] = useState(false);
   const [isCollectionModalOpen, setIsCollectionModalOpen] = useState(false);
   const [renameImage, setRenameImage] = useState<IndexedImage | null>(null);
   const [transferStatusText, setTransferStatusText] = useState<string>('');
@@ -106,7 +125,9 @@ const ImageTable: React.FC<ImageTableProps> = ({
   const addImagesToCollection = useImageStore((state) => state.addImagesToCollection);
   const removeImagesFromCollection = useImageStore((state) => state.removeImagesFromCollection);
   const updateCollection = useImageStore((state) => state.updateCollection);
-  const { canUseComfyUI, canUseFileManagement, canUseImageEditor, showProModal, initialized, canUseDuringTrialOrPro } = useFeatureAccess();
+  const { canUseComfyUI, canUseFileManagement, canUseImageEditor, canUseBatchExport, showProModal, initialized } = useFeatureAccess();
+  const { visibleProviders } = useGenerationProviderAvailability();
+  const isComfyUIProviderVisible = visibleProviders.some((provider) => provider.id === 'comfyui');
   const { isReparsing, reparseImages } = useReparseMetadata();
 
   const {
@@ -126,6 +147,19 @@ const ImageTable: React.FC<ImageTableProps> = ({
 
   const submenuHorizontalClass = contextMenu.horizontalDirection === 'left' ? 'right-full' : 'left-full';
 
+  const handleSaveContextPrompt = useCallback(async () => {
+    const target = contextMenu.image;
+    if (!target) return;
+    const directoryPath = directories.find((directory) => directory.id === target.directoryId)?.path;
+    hideContextMenu();
+    try {
+      const result = await savePrompt(target, { directoryPath, readAuthoritativeShadow: true });
+      setSuccess(result.status === 'already-saved' ? 'Already saved' : 'Prompt saved');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not save prompt.');
+    }
+  }, [contextMenu.image, directories, hideContextMenu, savePrompt, setError, setSuccess]);
+
   useEffect(() => {
     if (!contextMenu.visible && isCopySubmenuOpen) {
       setIsCopySubmenuOpen(false);
@@ -136,7 +170,10 @@ const ImageTable: React.FC<ImageTableProps> = ({
     if (!contextMenu.visible && isAddToCollectionSubmenuOpen) {
       setIsAddToCollectionSubmenuOpen(false);
     }
-  }, [contextMenu.visible, isAddToCollectionSubmenuOpen, isCollectionSubmenuOpen, isCopySubmenuOpen]);
+    if (!contextMenu.visible && isFileSubmenuOpen) {
+      setIsFileSubmenuOpen(false);
+    }
+  }, [contextMenu.visible, isAddToCollectionSubmenuOpen, isCollectionSubmenuOpen, isCopySubmenuOpen, isFileSubmenuOpen]);
 
   const selectedCount = selectedImages.size;
 
@@ -158,6 +195,15 @@ const ImageTable: React.FC<ImageTableProps> = ({
     onFindSimilar(contextMenu.image);
     hideContextMenu();
   }, [contextMenu.image, hideContextMenu, onFindSimilar]);
+
+  const openFindVisuallySimilar = useCallback(() => {
+    if (!contextMenu.image || !onFindVisuallySimilar) {
+      return;
+    }
+
+    onFindVisuallySimilar(contextMenu.image);
+    hideContextMenu();
+  }, [contextMenu.image, hideContextMenu, onFindVisuallySimilar]);
 
   const openComfyUIWorkspace = useCallback(() => {
     if (!contextMenu.image || !onOpenComfyUIWorkspace) {
@@ -181,6 +227,7 @@ const ImageTable: React.FC<ImageTableProps> = ({
     if (
       isVideoFileName(contextMenu.image.name, contextMenu.image.fileType) ||
       isAudioFileName(contextMenu.image.name, contextMenu.image.fileType) ||
+      isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType) ||
       getFileExtension(contextMenu.image.name) === '.gif'
     ) {
       return;
@@ -214,6 +261,7 @@ const ImageTable: React.FC<ImageTableProps> = ({
     contextMenu.image &&
     !isVideoFileName(contextMenu.image.name, contextMenu.image.fileType) &&
     !isAudioFileName(contextMenu.image.name, contextMenu.image.fileType) &&
+    !isModel3DFileName(contextMenu.image.name, contextMenu.image.fileType) &&
     getFileExtension(contextMenu.image.name) !== '.gif',
   );
 
@@ -328,15 +376,10 @@ const ImageTable: React.FC<ImageTableProps> = ({
       hideContextMenu();
       return;
     }
-    if (!canUseFileManagement) {
-      showProModal('file_management');
-      hideContextMenu();
-      return;
-    }
 
     setRenameImage(image);
     hideContextMenu();
-  }, [canUseFileManagement, hideContextMenu, showProModal]);
+  }, [hideContextMenu]);
 
   const handleTransferConfirm = useCallback(async (directory: TransferDestination) => {
     if (!transferMode) {
@@ -461,8 +504,8 @@ const ImageTable: React.FC<ImageTableProps> = ({
     [images, sortField, sortDirection, applySorting]
   );
   const groupedRows = useMemo<ImageGroupRenderItem[]>(
-    () => groupImages(sortedImages, groupBy, { sortOrder: groupSortOrder }).items,
-    [groupBy, groupSortOrder, sortedImages]
+    () => groupImages(sortedImages, groupBy, { sortOrder: groupSortOrder, clusterByImageId }).items,
+    [groupBy, groupSortOrder, sortedImages, clusterByImageId]
   );
   const enableRowThumbnails = sortedImages.length <= 5000;
 
@@ -620,6 +663,14 @@ const ImageTable: React.FC<ImageTableProps> = ({
           >
             <Copy className="w-4 h-4" />
             Copy to Clipboard
+          </button>
+
+          <button
+            onClick={() => void handleSaveContextPrompt()}
+            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
+          >
+            <Bookmark className="w-4 h-4" />
+            Save Prompt
           </button>
 
           <div className="border-t border-gray-600 my-1"></div>
@@ -804,29 +855,44 @@ const ImageTable: React.FC<ImageTableProps> = ({
             title={canFindSimilar ? 'Find images with matching prompt and metadata' : 'Requires prompt metadata'}
           >
             <Search className="w-4 h-4" />
-            Find similar...
+            Find by metadata...
           </button>
+
+          {onFindVisuallySimilar && (
+            <button
+              onClick={openFindVisuallySimilar}
+              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={!canFindVisuallySimilar}
+              title={canFindVisuallySimilar
+                ? 'Find images that look like this one'
+                : 'Enable Visual Search and download the model in Settings first'}
+            >
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              Find Similar
+            </button>
+          )}
 
           {canOpenContextImageEditor && (
             <button
               onClick={openImageEditor}
               className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-              title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature) - start trial' : 'Open this image in the Image Editor workspace'}
+              title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature)' : 'Open this image in the Image Editor workspace'}
             >
               <ImageIcon className="w-4 h-4" />
               <span className="flex-1">Edit Image</span>
-              {!canUseDuringTrialOrPro && initialized && <ProBadge size="sm" />}
+              {!canUseImageEditor && initialized && <ProBadge size="sm" variant="subtle" tooltip="Image Editor (Pro Feature)" />}
             </button>
           )}
 
-          {onOpenComfyUIWorkspace && (
+          {onOpenComfyUIWorkspace && isComfyUIProviderVisible && (
             <button
               onClick={openComfyUIWorkspace}
               className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-              title="Open this image in the ComfyUI workspace context panel"
+              title={canUseComfyUI ? 'Open this image in the ComfyUI workspace context panel' : 'Pro feature'}
             >
               <Workflow className="w-4 h-4" />
-              Open ComfyUI Workspace
+              <span className="flex-1">Open ComfyUI Workspace</span>
+              {!canUseComfyUI && <ProBadge size="sm" variant="subtle" tooltip="Pro feature" />}
             </button>
           )}
 
@@ -841,60 +907,45 @@ const ImageTable: React.FC<ImageTableProps> = ({
 
           <div className="border-t border-gray-600 my-1"></div>
 
-          <button
-            onClick={showInFolder}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-          >
-            <Folder className="w-4 h-4" />
-            Show in Folder
-          </button>
+          <ShowInFolderContextAction onClick={showInFolder} />
 
-          <button
-            onClick={() => openRenameModal(contextMenu.image)}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Pencil className="w-4 h-4" />
-            <span className="flex-1">Rename...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
+          {(() => {
+            const fileMenuItems = buildFileMenuItems({
+              onRename: () => openRenameModal(contextMenu.image),
+              onCopyTo: () => openTransferModal('copy'),
+              onMoveTo: () => openTransferModal('move'),
+              onExport: exportImage,
+              onBatchExport: handleBatchExport,
+              selectedCount,
+              canUseFileManagement,
+              canUseBatchExport,
+            });
+            const fileHasProItem = fileMenuItems.some((item) => item.isPro);
 
-          <button
-            onClick={() => openTransferModal('copy')}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Folder className="w-4 h-4" />
-            <span className="flex-1">Copy To...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
-
-          <button
-            onClick={() => openTransferModal('move')}
-            className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            title={!canUseFileManagement && initialized ? 'Pro feature - start trial' : undefined}
-          >
-            <Folder className="w-4 h-4" />
-            <span className="flex-1">Move To...</span>
-            {!canUseDuringTrialOrPro && <ProBadge size="sm" />}
-          </button>
-
-            <button
-              onClick={exportImage}
-              className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-            >
-              <Download className="w-4 h-4" />
-              Export Image
-            </button>
-            {selectedCount > 1 && (
-              <button
-                onClick={handleBatchExport}
-                className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
+            return (
+              <ContextMenuSubmenu
+                label="File"
+                icon={<Folder className="w-4 h-4" />}
+                isOpen={isFileSubmenuOpen}
+                onOpenChange={setIsFileSubmenuOpen}
+                horizontalClass={submenuHorizontalClass}
+                showProBadge={fileHasProItem && initialized}
+                proBadgeTooltip="Pro feature"
               >
-                <Package className="w-4 h-4" />
-                Batch Export Selected ({selectedCount})
-              </button>
-            )}
+                {fileMenuItems.map((item) => (
+                  <ContextMenuButton
+                    key={item.key}
+                    onClick={item.onClick}
+                    icon={item.icon}
+                    label={item.label}
+                    title={item.isPro && initialized ? 'Pro feature' : undefined}
+                    showProBadge={item.isPro}
+                    proBadgeTooltip="Pro feature"
+                  />
+                ))}
+              </ContextMenuSubmenu>
+            );
+          })()}
           </div>,
           document.body,
         )}
@@ -959,6 +1010,7 @@ const ImageTableRow: React.FC<ImageTableRowProps> = React.memo(({ image, onImage
   const showFullFilePath = useSettingsStore((state) => state.showFullFilePath);
   const isVideo = isVideoFileName(image.name, image.fileType);
   const isAudio = isAudioFileName(image.name, image.fileType);
+  const isModel3D = isModel3DFileName(image.name, image.fileType);
   const audioDuration = formatAudioDuration((image.metadata as any)?.normalizedMetadata?.audio?.duration_seconds);
   const relativeImagePath = getRelativeImagePath(image);
   const directoryPath = directories.find((dir) => dir.id === image.directoryId)?.path || '';
@@ -980,7 +1032,7 @@ const ImageTableRow: React.FC<ImageTableRowProps> = React.memo(({ image, onImage
       return;
     }
 
-    if (isVideo || isAudio) {
+    if (isVideo || isAudio || isModel3D) {
       setImageUrl(null);
       setIsLoading(false);
       return;
@@ -994,7 +1046,7 @@ const ImageTableRow: React.FC<ImageTableRowProps> = React.memo(({ image, onImage
 
     setImageUrl(null);
     setIsLoading(true);
-  }, [thumbnail?.thumbnailHandle, image.handle, thumbnail?.thumbnailStatus, thumbnail?.thumbnailUrl, thumbnailsDisabled, enableThumbnail, isVideo, isAudio]);
+  }, [thumbnail?.thumbnailHandle, image.handle, thumbnail?.thumbnailStatus, thumbnail?.thumbnailUrl, thumbnailsDisabled, enableThumbnail, isVideo, isAudio, isModel3D]);
 
   const handlePreviewClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1031,7 +1083,20 @@ const ImageTableRow: React.FC<ImageTableRowProps> = React.memo(({ image, onImage
     >
       <div className="px-3 py-2">
         <div className="relative w-12 h-12 bg-gray-700 rounded overflow-hidden flex items-center justify-center">
-          {isLoading ? (
+          {thumbnailsDisabled || !enableThumbnail ? (
+            <>
+              <Package className="h-4 w-4 text-gray-500" aria-label="Preview disabled" />
+              <button
+                onClick={handlePreviewClick}
+                className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500/70"
+                title="Show details"
+              >
+                <Info className="h-4 w-4 text-white" />
+              </button>
+            </>
+          ) : isModel3D ? (
+            <Model3DThumbnail image={image} directoryPath={directoryPath} variant="table" />
+          ) : isLoading ? (
             <div className="w-4 h-4 border-2 border-gray-500 border-t-transparent rounded-full animate-spin"></div>
           ) : isAudio ? (
             <>
@@ -1069,17 +1134,6 @@ const ImageTableRow: React.FC<ImageTableRowProps> = React.memo(({ image, onImage
                   </div>
                 </div>
               )}
-              <button
-                onClick={handlePreviewClick}
-                className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500/70"
-                title="Show details"
-              >
-                <Info className="h-4 w-4 text-white" />
-              </button>
-            </>
-          ) : thumbnailsDisabled || !enableThumbnail ? (
-            <>
-              <Package className="h-4 w-4 text-gray-500" />
               <button
                 onClick={handlePreviewClick}
                 className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500/70"

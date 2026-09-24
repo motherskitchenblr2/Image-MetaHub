@@ -1,6 +1,6 @@
 import { IndexedImage, ThumbnailStatus } from '../types';
 import cacheManager from './cacheManager';
-import { isAudioFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { getFileExtension, isAudioFileName, isModel3DFileName, isVideoFileName } from '../utils/mediaTypes.js';
 import {
   getLegacyThumbnailId,
   getThumbnailCacheCandidate,
@@ -17,6 +17,8 @@ const MAX_CONCURRENT_HIGH_PRIORITY_THUMBNAILS = 3;
 const MAX_CONCURRENT_BACKGROUND_THUMBNAILS = 1;
 const MAX_ACTIVE_THUMBNAIL_URLS = 200;
 const MAX_RENDERER_VIDEO_THUMBNAIL_BYTES = 80 * 1024 * 1024;
+const THUMBNAIL_RETRY_BASE_DELAY_MS = 30_000;
+const THUMBNAIL_RETRY_MAX_DELAY_MS = 5 * 60_000;
 
 type ElectronFileHandle = FileSystemFileHandle & { _filePath?: string };
 
@@ -25,6 +27,12 @@ type RuntimeThumbnailState = {
   thumbnailUrl: string | null;
   thumbnailStatus: ThumbnailStatus;
   thumbnailError: string | null;
+};
+
+type ThumbnailFailureState = {
+  lastModified: number;
+  failures: number;
+  retryAfter: number;
 };
 
 type ThumbnailJob = {
@@ -50,6 +58,10 @@ const isVideoAsset = (image: IndexedImage, file?: File): boolean => {
 
 const isAudioAsset = (image: IndexedImage, file?: File): boolean => {
   return isAudioFileName(image.name, image.fileType) || (file ? isAudioFileName(file.name, file.type) : false);
+};
+
+const isModel3DAsset = (image: IndexedImage, file?: File): boolean => {
+  return isModel3DFileName(image.name, image.fileType) || (file ? isModel3DFileName(file.name, file.type) : false);
 };
 
 const waitForVideoEvent = (video: HTMLVideoElement, eventName: string): Promise<void> =>
@@ -178,6 +190,12 @@ class ThumbnailManager {
   private inflight = new Map<string, Promise<void>>();
   private activeUrls = new Map<string, string>();
   private runtimeState = new Map<string, RuntimeThumbnailState>();
+  private failureState = new Map<string, ThumbnailFailureState>();
+  private retryTimers = new Map<string, {
+    lastModified: number;
+    retryAt: number;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   private resolvedStateCache = new Map<string, {
     lastModified: number;
     thumbnailUrl: string | null;
@@ -222,6 +240,7 @@ class ThumbnailManager {
       currentListeners.delete(listener);
       if (currentListeners.size === 0) {
         this.listeners.delete(imageId);
+        this.clearRetryTimer(imageId);
       }
     };
   }
@@ -497,9 +516,26 @@ class ThumbnailManager {
       return;
     }
 
+    // 3D previews are rendered lazily by Model3DThumbnail so the raster thumbnail
+    // pipeline never attempts to decode model bytes as an image.
+    if (isModel3DAsset(image)) {
+      return;
+    }
+
     const activeState = this.getActiveRuntimeState(image);
     if (activeState?.thumbnailStatus === 'ready' && activeState.thumbnailUrl) {
       this.touchObjectUrl(image.id);
+      return;
+    }
+
+    // Avoid retry storms while still allowing transient file, IPC and cache
+    // failures to recover. Repeated failures back off to a bounded five-minute
+    // cooldown; a changed file version retries immediately.
+    const retryDelayMs = this.getFailureRetryDelay(image);
+    if (retryDelayMs !== null) {
+      if (priority === 'high') {
+        this.scheduleRetry(image, retryDelayMs);
+      }
       return;
     }
 
@@ -566,7 +602,19 @@ class ThumbnailManager {
     detail: { priority: 'visible' | 'overscan' | 'single' }
   ): Promise<IndexedImage[]> {
     const candidates = this.dedupeImages(images)
-      .filter((image) => !this.hasReadyThumbnail(image) && !isAudioAsset(image))
+      .filter((image) => {
+        const retryDelayMs = this.getFailureRetryDelay(image);
+        if (retryDelayMs !== null) {
+          if (detail.priority !== 'overscan') {
+            this.scheduleRetry(image, retryDelayMs);
+          }
+          return false;
+        }
+
+        return !this.hasReadyThumbnail(image) &&
+          !isAudioAsset(image) &&
+          !isModel3DAsset(image);
+      })
       .map((image) => getThumbnailCacheCandidate(image));
 
     if (candidates.length === 0) {
@@ -680,6 +728,90 @@ class ThumbnailManager {
     return runtimeState;
   }
 
+  private getFailureRetryDelay(image: IndexedImage): number | null {
+    const failure = this.failureState.get(image.id);
+    if (!failure) {
+      return null;
+    }
+
+    if (failure.lastModified !== image.lastModified) {
+      this.failureState.delete(image.id);
+      this.clearRetryTimer(image.id);
+      return null;
+    }
+
+    const remainingMs = failure.retryAfter - Date.now();
+    return remainingMs > 0 ? remainingMs : null;
+  }
+
+  private recordFailure(image: IndexedImage): number {
+    const current = this.failureState.get(image.id);
+    const failures = current?.lastModified === image.lastModified
+      ? current.failures + 1
+      : 1;
+    const delayMs = Math.min(
+      THUMBNAIL_RETRY_BASE_DELAY_MS * (2 ** Math.min(failures - 1, 4)),
+      THUMBNAIL_RETRY_MAX_DELAY_MS
+    );
+
+    this.failureState.set(image.id, {
+      lastModified: image.lastModified,
+      failures,
+      retryAfter: Date.now() + delayMs,
+    });
+
+    return delayMs;
+  }
+
+  private scheduleRetry(image: IndexedImage, delayMs: number): void {
+    if (!this.listeners.has(image.id)) {
+      return;
+    }
+
+    const retryAt = Date.now() + Math.max(0, delayMs);
+    const existing = this.retryTimers.get(image.id);
+    if (
+      existing?.lastModified === image.lastModified &&
+      existing.retryAt <= retryAt
+    ) {
+      return;
+    }
+
+    this.clearRetryTimer(image.id);
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(image.id);
+      const failure = this.failureState.get(image.id);
+      if (
+        !failure ||
+        failure.lastModified !== image.lastModified ||
+        !this.listeners.has(image.id)
+      ) {
+        return;
+      }
+
+      void this.ensureThumbnail(image, 'high', { markLoading: false }).catch(() => {
+        // A subsequent failure records a longer cooldown and schedules the next
+        // retry while the thumbnail still has an active UI consumer.
+      });
+    }, Math.max(0, retryAt - Date.now()));
+
+    this.retryTimers.set(image.id, {
+      lastModified: image.lastModified,
+      retryAt,
+      timer,
+    });
+  }
+
+  private clearRetryTimer(imageId: string): void {
+    const existing = this.retryTimers.get(imageId);
+    if (!existing) {
+      return;
+    }
+
+    clearTimeout(existing.timer);
+    this.retryTimers.delete(imageId);
+  }
+
   private setRuntimeState(
     image: IndexedImage,
     payload: {
@@ -697,6 +829,11 @@ class ThumbnailManager {
         ? 'Failed to load thumbnail'
         : currentState?.thumbnailError ?? image.thumbnailError ?? null),
     };
+
+    if (payload.thumbnailStatus === 'ready') {
+      this.failureState.delete(image.id);
+      this.clearRetryTimer(image.id);
+    }
 
     if (
       currentState &&
@@ -886,6 +1023,7 @@ class ThumbnailManager {
 
       let blob: Blob | null = null;
       const isVideo = isVideoAsset(image);
+      const isAvif = getFileExtension(image.name) === '.avif';
       const fileSize = image.fileSize;
 
       if (isElectron && isVideo && (!fileSize || fileSize > MAX_RENDERER_VIDEO_THUMBNAIL_BYTES)) {
@@ -893,7 +1031,9 @@ class ThumbnailManager {
         return;
       }
 
-      if (isElectron && !isVideo) {
+      // Electron's renderer supports AVIF through Chromium, but nativeImage does
+      // not decode it on every platform. Route AVIF directly to createImageBitmap.
+      if (isElectron && !isVideo && !isAvif) {
         const fileHandle = (image.thumbnailHandle ?? image.handle) as ElectronFileHandle | undefined;
         const filePath = fileHandle?._filePath;
         if (filePath) {
@@ -936,6 +1076,10 @@ class ThumbnailManager {
       setSafe({ thumbnailStatus: 'ready', thumbnailUrl: url, thumbnailError: null });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown thumbnail error';
+      if (!this.isStale(image.id, token)) {
+        const retryDelayMs = this.recordFailure(image);
+        this.scheduleRetry(image, retryDelayMs);
+      }
       setSafe({ thumbnailStatus: 'error', thumbnailError: message });
     }
   }

@@ -25,7 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all' }}
     env:
-      IMH_LICENSE_SECRET: ${{ secrets.IMH_LICENSE_SECRET }}
+      IMH_LICENSE_SERVER_URL: ${{ vars.LICENSE_SERVER_URL }}
+      IMH_LICENSE_PUBLIC_KEY: ${{ vars.LICENSE_SERVER_PUBLIC_KEY }}
 
     steps:
       - name: Checkout repository
@@ -42,6 +43,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Configure public license client
+        run: node scripts/configureLicenseClient.mjs
 
       - name: Build Linux AppImage
         run: |
@@ -65,7 +69,8 @@ jobs:
     runs-on: windows-latest
     if: ${{ github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all' }}
     env:
-      IMH_LICENSE_SECRET: ${{ secrets.IMH_LICENSE_SECRET }}
+      IMH_LICENSE_SERVER_URL: ${{ vars.LICENSE_SERVER_URL }}
+      IMH_LICENSE_PUBLIC_KEY: ${{ vars.LICENSE_SERVER_PUBLIC_KEY }}
 
     steps:
       - name: Checkout repository
@@ -82,6 +87,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Configure public license client
+        run: node scripts/configureLicenseClient.mjs
 
       - name: Build Windows installer
         shell: bash
@@ -107,7 +115,8 @@ jobs:
     runs-on: macos-latest
     if: ${{ github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all' }}
     env:
-      IMH_LICENSE_SECRET: ${{ secrets.IMH_LICENSE_SECRET }}
+      IMH_LICENSE_SERVER_URL: ${{ vars.LICENSE_SERVER_URL }}
+      IMH_LICENSE_PUBLIC_KEY: ${{ vars.LICENSE_SERVER_PUBLIC_KEY }}
 
     steps:
       - name: Checkout repository
@@ -125,6 +134,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Configure public license client
+        run: node scripts/configureLicenseClient.mjs
+
       - name: Build macOS App
         run: |
           echo "Building macOS app..."
@@ -132,6 +144,26 @@ jobs:
           npx electron-builder --mac --publish=never
           echo "macOS build completed!"
           ls -la dist-electron/
+
+      - name: Smoke test packaged detached viewer
+        run: |
+          SMOKE_IMAGE="$RUNNER_TEMP/imh-detached-viewer-smoke.png"
+          SMOKE_LOG="$RUNNER_TEMP/imh-detached-viewer-smoke.log"
+          node -e "require('fs').writeFileSync(process.argv[1], Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'))" "$SMOKE_IMAGE"
+
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            APP_PATH="dist-electron/mac-arm64/Image MetaHub.app"
+          else
+            APP_PATH="dist-electron/mac/Image MetaHub.app"
+          fi
+
+          if ! GITHUB_ACTIONS=true IMH_PACKAGED_DETACHED_VIEWER_SMOKE_IMAGE="$SMOKE_IMAGE" "$APP_PATH/Contents/MacOS/Image MetaHub" > "$SMOKE_LOG" 2>&1; then
+            cat "$SMOKE_LOG"
+            exit 1
+          fi
+
+          cat "$SMOKE_LOG"
+          grep -F "[packaged-detached-viewer-smoke] renderer-ready" "$SMOKE_LOG"
 
       - name: Upload macOS app as artifact
         uses: actions/upload-artifact@v4

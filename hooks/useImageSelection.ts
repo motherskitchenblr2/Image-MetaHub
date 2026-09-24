@@ -3,6 +3,7 @@ import { useImageStore } from '../store/useImageStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { IndexedImage } from '../types';
 import { FileOperations } from '../services/fileOperations';
+import cacheManager from '../services/cacheManager';
 
 let isDeletingSelectedImages = false;
 
@@ -18,14 +19,15 @@ export function useImageSelection() {
 
     const handleImageSelection = useCallback((image: IndexedImage, event: React.MouseEvent) => {
         const {
-            activeImageScope,
-            filteredImages,
             focusedImageIndex,
             previewImage,
             selectedImage,
             selectedImages,
+            getScopedFilteredImages,
         } = useImageStore.getState();
-        const selectionScope = activeImageScope ?? filteredImages;
+        // The displayed set (filtered ∩ node filter ∩ scope), so shift-click ranges never
+        // include images hidden by the active filters.
+        const selectionScope = getScopedFilteredImages();
 
         // Update focused index
         const clickedIndex = selectionScope.findIndex(img => img.id === image.id);
@@ -77,7 +79,7 @@ export function useImageSelection() {
     }, [toggleImageSelection, setSelectedImage, setFocusedImageIndex]);
 
     const handleDeleteSelectedImages = useCallback(async () => {
-        const { selectedImages, images, directories } = useImageStore.getState();
+        const { selectedImages, images } = useImageStore.getState();
         const { skipDeleteConfirmation } = useSettingsStore.getState();
         if (selectedImages.size === 0) return;
         if (isDeletingSelectedImages) return;
@@ -86,57 +88,63 @@ export function useImageSelection() {
 
         try {
             if (!skipDeleteConfirmation) {
-                const confirmMessage = `Are you sure you want to delete ${selectedImages.size} image(s)?`;
+                const confirmMessage = `Move ${selectedImages.size} selected image(s) to the Recycle Bin?`;
                 if (!window.confirm(confirmMessage)) return;
             }
 
             const imagesToDelete = Array.from(selectedImages);
-            const deletedIdsHandledLocally: string[] = [];
-            const deletedIdsAwaitingWatcher: string[] = [];
+            const imageById = new Map(images.map((img) => [img.id, img]));
 
-            for (const imageId of imagesToDelete) {
-                const image = images.find(img => img.id === imageId);
-                if (image) {
-                    try {
-                        const result = await FileOperations.deleteFile(image);
-                        if (result.success) {
-                            const watchedDirectory = directories.find((directory) => directory.id === image.directoryId);
-                            const shouldAwaitWatcherRemoval = Boolean(window.electronAPI && watchedDirectory?.autoWatch);
+            // Directories are no longer consulted to decide whether to wait for the
+            // watcher: removeImages is a no-op when the ids are already gone (see
+            // useImageStore), so removing locally right away and letting a later
+            // watcher event land as a harmless no-op is strictly faster than waiting.
+            const validTargets = imagesToDelete
+                .map((imageId) => imageById.get(imageId))
+                .filter((image): image is IndexedImage => Boolean(image));
+            const results = await FileOperations.deleteFiles(validTargets);
+            const deletions = validTargets.map((image, index) => {
+                const result = results[index];
+                if (result?.success) return image.id;
+                setError(`Failed to delete ${image.name}: ${result?.error || 'Unknown error'}`);
+                return null;
+            });
 
-                            if (shouldAwaitWatcherRemoval) {
-                                deletedIdsAwaitingWatcher.push(imageId);
-                            } else {
-                                deletedIdsHandledLocally.push(imageId);
-                            }
-                        } else {
-                            setError(`Failed to delete ${image.name}: ${result.error}`);
-                        }
-                    } catch (err) {
-                        setError(`Error deleting ${image.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
-                    }
-                }
-            }
-
-            if (deletedIdsHandledLocally.length > 0) {
-                removeImages(deletedIdsHandledLocally);
-            }
-
-            const deletedIds = [...deletedIdsHandledLocally, ...deletedIdsAwaitingWatcher];
+            const deletedIds = deletions.filter((id): id is string => id !== null);
             if (deletedIds.length > 0) {
                 const deletedIdSet = new Set(deletedIds);
+                removeImages(deletedIds);
                 useImageStore.setState((state) => ({
                     selectedImages: new Set(Array.from(state.selectedImages).filter((id) => !deletedIdSet.has(id))),
                     previewImage: state.previewImage && deletedIdSet.has(state.previewImage.id) ? null : state.previewImage,
                     selectedImage: state.selectedImage && deletedIdSet.has(state.selectedImage.id) ? null : state.selectedImage,
                     comparisonImages: state.comparisonImages.filter((image) => !deletedIdSet.has(image.id)),
                 }));
-            } else {
-                clearImageSelection();
+
+                // Keep the on-disk cache in sync right away (by id, while we still
+                // know it), instead of waiting on the watcher event to prune it —
+                // see cacheManager.removeCachedImages for the chunk-scoped fast path.
+                const { directories, scanSubfolders } = useImageStore.getState();
+                const idsByDirectory = new Map<string, string[]>();
+                for (const imageId of deletedIds) {
+                    const image = imageById.get(imageId);
+                    if (!image?.directoryId) continue;
+                    const list = idsByDirectory.get(image.directoryId);
+                    if (list) list.push(imageId);
+                    else idsByDirectory.set(image.directoryId, [imageId]);
+                }
+                for (const [directoryId, ids] of idsByDirectory) {
+                    const directory = directories.find((dir) => dir.id === directoryId);
+                    if (!directory) continue;
+                    void cacheManager
+                        .removeCachedImages(directory.path, directory.name, ids, [], scanSubfolders)
+                        .catch((err) => console.error('Failed to update cache after delete:', err));
+                }
             }
         } finally {
             isDeletingSelectedImages = false;
         }
-    }, [removeImages, setError, clearImageSelection]);
+    }, [removeImages, setError]);
 
     return { handleImageSelection, handleDeleteSelectedImages, clearSelection: clearImageSelection };
 }

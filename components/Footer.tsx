@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import ImageSizeSlider from './ImageSizeSlider';
 import Tooltip from './Tooltip';
-import { Grid3X3, List, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ListChecks, X } from 'lucide-react';
+import { Grid3X3, List, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ListChecks, X, RefreshCw } from 'lucide-react';
 import { A1111ProgressState } from '../hooks/useA1111Progress';
 import { useFeatureAccess } from '../hooks/useFeatureAccess';
+import { useSemanticStore } from '../store/useSemanticStore';
 import { IndexedImage, IndexedImageTransferProgress } from '../types';
+import type { ImageGroupByMode, ImageGroupingSortOrder } from '../utils/imageGrouping';
 import { useResolvedThumbnail } from '../hooks/useResolvedThumbnail';
 import { useThumbnail } from '../hooks/useThumbnail';
 
@@ -36,6 +38,15 @@ interface FooterProps {
   onWindowSelect?: (id: string) => void;
   onWindowClose?: (id: string) => void;
   sticky?: boolean;
+  // Sort/Group controls (shown in groupable views; moved here from the Sidebar).
+  showSortControls?: boolean;
+  sortOrder?: ImageGroupingSortOrder;
+  onSortOrderChange?: (order: ImageGroupingSortOrder) => void;
+  onReshuffle?: () => void;
+  groupBy?: ImageGroupByMode;
+  onGroupByChange?: (mode: ImageGroupByMode) => void;
+  /** When grouping by model/cluster, pagination is suspended and the page-size control hidden. */
+  hidePageSize?: boolean;
 }
 
 const Token: React.FC<{ children: React.ReactNode; title?: string }> = ({ children, title }) => (
@@ -69,8 +80,20 @@ const Footer: React.FC<FooterProps> = ({
   onWindowSelect,
   onWindowClose,
   sticky = true,
+  showSortControls = false,
+  sortOrder,
+  onSortOrderChange,
+  onReshuffle,
+  groupBy,
+  onGroupByChange,
+  hidePageSize = false,
 }) => {
   const { canUseA1111 } = useFeatureAccess();
+  const semanticModelDownloading = useSemanticStore((s) => s.modelDownloading);
+  const semanticModelProgress = useSemanticStore((s) => s.modelProgress);
+  const semanticBackfilling = useSemanticStore((s) => s.isBackfilling);
+  const semanticPaused = useSemanticStore((s) => s.isPaused);
+  const semanticIndexProgress = useSemanticStore((s) => s.indexProgress);
   const [isEditingPage, setIsEditingPage] = useState(false);
   const [pageInput, setPageInput] = useState(currentPage.toString());
   const windowStripRef = useRef<HTMLDivElement | null>(null);
@@ -135,7 +158,22 @@ const Footer: React.FC<FooterProps> = ({
   const hasEnrichmentJob = enrichmentProgress && enrichmentProgress.total > 0;
   const hasA1111Job = canUseA1111 && a1111Progress && a1111Progress.isGenerating; // Only show if feature is available
   const hasTransferJob = transferProgress && transferProgress.total > 0 && transferProgress.stage !== 'done';
-  const hasAnyJob = hasEnrichmentJob || hasA1111Job || hasTransferJob;
+
+  const semanticDownloadPercent = semanticModelProgress?.totalBytes
+    ? Math.min(100, Math.round(((semanticModelProgress.receivedBytes ?? 0) / semanticModelProgress.totalBytes) * 100))
+    : 0;
+  const semanticIndexPercent = semanticIndexProgress?.total
+    ? Math.min(100, Math.round((semanticIndexProgress.current / semanticIndexProgress.total) * 100))
+    : 0;
+  const hasSemanticJob = semanticModelDownloading || semanticBackfilling;
+  const semanticJobLabel = semanticModelDownloading
+    ? `Model ${semanticDownloadPercent}%`
+    : semanticPaused
+      ? 'Index paused'
+      : `Index ${semanticIndexPercent}%`;
+  const semanticJobPercent = semanticModelDownloading ? semanticDownloadPercent : semanticIndexPercent;
+
+  const hasAnyJob = hasEnrichmentJob || hasA1111Job || hasTransferJob || hasSemanticJob;
 
   return (
     <footer className={`${sticky ? 'sticky bottom-0' : 'relative'} z-[55] bg-gray-900/90 backdrop-blur-md border-t border-gray-800/60 transition-all duration-300 shadow-footer-up`}>
@@ -261,6 +299,20 @@ const Footer: React.FC<FooterProps> = ({
             </div>
           </div>
         )}
+        {hasSemanticJob && (
+          <div className="flex items-center gap-3 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs shadow-sm animate-in fade-in slide-in-from-bottom-2">
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2 w-2">
+                {!semanticPaused && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>}
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+              </span>
+              <span className="font-medium">{semanticJobLabel}</span>
+            </div>
+            <div className="w-20 h-1.5 bg-gray-700/50 rounded-full overflow-hidden">
+              <div className="h-full bg-indigo-500 transition-all duration-500 ease-out" style={{ width: `${semanticJobPercent}%` }} />
+            </div>
+          </div>
+        )}
         {hasA1111Job && (
           <div className="flex items-center gap-3 px-3 py-1.5 rounded-full bg-green-500/10 border border-green-500/20 text-green-400 text-xs shadow-sm animate-in fade-in slide-in-from-bottom-2">
             <div className="flex items-center gap-2">
@@ -304,16 +356,69 @@ const Footer: React.FC<FooterProps> = ({
         )}
       </div>
       <nav className="flex items-center gap-4 text-xs">
-        <div className="flex items-center gap-2">
-          <label htmlFor="items-per-page" className="text-gray-500 hidden md:inline font-medium">Show:</label>
-          <select id="items-per-page" value={itemsPerPage} onChange={handleItemsPerPageChange} className="bg-gray-800/80 border border-gray-700/60 rounded-lg px-2.5 py-1.5 text-gray-200 hover:bg-gray-700 hover:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer">
-            <option value={10}>10</option>
-            <option value={20}>20</option>
-            <option value={50}>50</option>
-            <option value={100}>100</option>
-            <option value={-1}>All</option>
-          </select>
-        </div>
+        {showSortControls && (
+          <div className="flex items-center gap-2">
+            <label htmlFor="footer-sort" className="text-gray-500 hidden md:inline font-medium">Sort:</label>
+            <select
+              id="footer-sort"
+              value={sortOrder}
+              onChange={(event) => onSortOrderChange?.(event.target.value as ImageGroupingSortOrder)}
+              className="bg-gray-800/80 border border-gray-700/60 rounded-lg px-2.5 py-1.5 text-gray-200 hover:bg-gray-700 hover:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer"
+            >
+              <option value="date-desc">Newest First</option>
+              <option value="date-asc">Oldest First</option>
+              <option value="asc">A-Z</option>
+              <option value="desc">Z-A</option>
+              <option value="random">Random</option>
+              {/* Not user-selectable; shown only so the control reflects an
+                  active visual search instead of rendering blank. */}
+              {sortOrder === 'relevance' && <option value="relevance">Relevance</option>}
+            </select>
+            {sortOrder === 'random' && onReshuffle && (
+              <Tooltip label="Reshuffle random order">
+                <button
+                  onClick={onReshuffle}
+                  className="p-1.5 text-gray-400 hover:text-white bg-gray-800/80 hover:bg-gray-700 rounded-lg border border-gray-700/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                  title="Reshuffle random order"
+                  aria-label="Reshuffle random order"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                </button>
+              </Tooltip>
+            )}
+            {sortOrder !== 'random' && (
+              <>
+                <label htmlFor="footer-group" className="text-gray-500 hidden md:inline font-medium">Group:</label>
+                <select
+                  id="footer-group"
+                  value={groupBy}
+                  onChange={(event) => onGroupByChange?.(event.target.value as ImageGroupByMode)}
+                  className="bg-gray-800/80 border border-gray-700/60 rounded-lg px-2.5 py-1.5 text-gray-200 hover:bg-gray-700 hover:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer"
+                >
+                  <option value="none">None</option>
+                  <option value="date">Date</option>
+                  <option value="name">Name</option>
+                  <option value="session">Session</option>
+                  <option value="model">Model</option>
+                  <option value="cluster">Cluster</option>
+                </select>
+              </>
+            )}
+            <div className="w-px h-4 bg-gray-700/50"></div>
+          </div>
+        )}
+        {!hidePageSize && (
+          <div className="flex items-center gap-2">
+            <label htmlFor="items-per-page" className="text-gray-500 hidden md:inline font-medium">Show:</label>
+            <select id="items-per-page" value={itemsPerPage} onChange={handleItemsPerPageChange} className="bg-gray-800/80 border border-gray-700/60 rounded-lg px-2.5 py-1.5 text-gray-200 hover:bg-gray-700 hover:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer">
+              <option value={10}>10</option>
+              <option value={20}>20</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={-1}>All</option>
+            </select>
+          </div>
+        )}
         {showPageControls && (
           <>
             <div className="w-px h-4 bg-gray-700/50"></div>

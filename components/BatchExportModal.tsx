@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Download, X } from 'lucide-react';
-import { getShadowMetadata } from '../services/imageAnnotationsStorage';
+import { getPersistedShadowMetadata } from '../services/userDataPersistenceAdapter';
 import { buildEffectiveMetadata } from '../utils/editableMetadata';
 import {
   type ExportFileDescriptor,
@@ -8,6 +8,8 @@ import {
   type IndexedImage,
   type MetadataExportPolicy,
 } from '../types';
+import { getUnsupportedModel3DBatchExportError } from '../utils/model3DTransfer';
+import { getRelativeImagePath } from '../utils/imagePaths';
 
 interface BatchExportModalProps {
   isOpen: boolean;
@@ -24,7 +26,7 @@ interface BatchExportModalProps {
 type BatchSource = 'selected' | 'filtered';
 type BatchOutput = 'folder' | 'zip';
 
-const PNG_REWRITE_SUPPORTED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const METADATA_REWRITE_SUPPORTED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.avif']);
 
 const getScopeFromSelection = (source: BatchSource, count: number) => {
   if (source === 'selected') {
@@ -136,7 +138,7 @@ const BatchExportModal: React.FC<BatchExportModalProps> = ({
   const unsupportedRewriteCount = useMemo(() => (
     imagesToExport.filter((image) => {
       const ext = image.name.includes('.') ? image.name.slice(image.name.lastIndexOf('.')).toLowerCase() : '';
-      return !PNG_REWRITE_SUPPORTED_EXTENSIONS.has(ext);
+      return !METADATA_REWRITE_SUPPORTED_EXTENSIONS.has(ext);
     }).length
   ), [imagesToExport]);
   const progressPercent = progress && progress.total > 0
@@ -206,6 +208,12 @@ const BatchExportModal: React.FC<BatchExportModalProps> = ({
       return;
     }
 
+    const unsupportedModelError = getUnsupportedModel3DBatchExportError(imagesToExport);
+    if (unsupportedModelError) {
+      setStatus({ type: 'error', message: unsupportedModelError });
+      return;
+    }
+
     const directoryMap = new Map(directories.map(dir => [dir.id, dir.path]));
     const files = (await Promise.all(imagesToExport.map(async (image) => {
         const dirPath = directoryMap.get(image.directoryId || '');
@@ -213,7 +221,7 @@ const BatchExportModal: React.FC<BatchExportModalProps> = ({
           return null;
         }
 
-        const shadowMetadata = applyShadowEdits ? await getShadowMetadata(image.id) : null;
+        const shadowMetadata = applyShadowEdits ? await getPersistedShadowMetadata(image) : null;
         const effectiveMetadata = metadataPolicy === 'metahub_standard'
           ? buildEffectiveMetadata(image.metadata?.normalizedMetadata, shadowMetadata)
           : null;
@@ -221,7 +229,7 @@ const BatchExportModal: React.FC<BatchExportModalProps> = ({
         return {
           imageId: image.id,
           directoryPath: dirPath,
-          relativePath: image.name,
+          relativePath: getRelativeImagePath(image),
           effectiveMetadata,
         };
       })))
@@ -490,12 +498,12 @@ const BatchExportModal: React.FC<BatchExportModalProps> = ({
             )}
             {metadataPolicy !== 'preserve' && (
               <span className="block text-xs text-amber-300/90 mt-1">
-                Metadata stripping keeps the original format for PNG, JPEG, and WebP when possible. MetaHub metadata export still saves PNG copies for compatibility.
+                Metadata stripping keeps PNG, JPEG, WebP, and AVIF in their original format. MetaHub export keeps AVIF as AVIF with compact XMP; other supported formats are saved as PNG copies.
               </span>
             )}
             {metadataPolicy !== 'preserve' && unsupportedRewriteCount > 0 && (
               <span className="block text-xs text-amber-300/90 mt-1">
-                {unsupportedRewriteCount} file{unsupportedRewriteCount === 1 ? '' : 's'} in this export can only be preserved in v1 and may fail if rewritten.
+                {unsupportedRewriteCount} file{unsupportedRewriteCount === 1 ? '' : 's'} in this export can only be preserved and may fail if rewritten.
               </span>
             )}
             {isExporting && progress && (

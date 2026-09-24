@@ -5,19 +5,169 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.17.4] - [Unreleased]
+## [0.19.3] - [09-12-2026]
+
+### Added
+
+- **Prompt Library**: Save prompts from your library into a dedicated collection, then search, sort, copy, remove, or jump back to the source image. Random lets you rediscover saved prompts with their positive and negative text and source preview.
+- **Image Provenance**: Added a read-only provenance view for inspecting available source and lineage information, with on-demand SHA-256 fingerprinting and copyable provenance summaries.
 
 ### Improved
 
-- **Filter Recovery**: Added a clearer empty state when filters return no images, with convenient Clear All actions beside active filters and in the results area.
-- **Accessibility and UI Feedback**: Improved visible keyboard focus across toolbar, search, rating, pagination, view, and queue controls, with smoother active-filter and rating interactions.
-- **Large Library Performance**: Reduced temporary allocations and repeated keyword processing in analytics, prompt similarity, and Smart Library clustering.
-- **ComfyUI Workflow Tools**: Simplified the Image Modal workflow experience around the embedded original workflow, combining parameters with the visual graph and adding a dedicated node list with editable parameters.
+- **Image Viewer Navigation**: Arrow-key navigation is more responsive, with better neighboring-image preloading and smoother browsing while moving quickly through images.
+- **Viewer Zoom**: Choose Fit or 1:1 as the default image zoom. Images configured for 1:1 open directly at their native zoom, and mouse-wheel zoom uses more consistent increments.
+- **ComfyUI Workspace Navigation**: Viewer navigation from the ComfyUI workspace follows the workspace's newest-first order independently from the main Library sort and stays current as new images arrive.
+- **Library Startup and Refreshing**: Library caches remain valid across launches when their parser version matches, while startup enrichment and background refreshes perform fewer unnecessary recomputations.
+- **Thumbnail Loading**: Failed thumbnail decodes are cached for the current file version, avoiding repeated decode attempts while browsing.
+
+### Fixed
+
+- **ComfyUI Krea2 Workflows**: Prompt, negative prompt, and LoRA extraction follows the executed Krea2 workflow route, including grounded encode nodes and switch-based workflows.
+- **Detached Viewer on macOS**: Packaged viewer windows load application paths containing spaces or Unicode characters correctly.
+- **3D Model Preview**: Switching between 3D models recreates the preview for the currently selected item.
+- **Library Cache Persistence**: Compatible parser caches are reused on subsequent launches instead of triggering a full library reindex.
+- **ComfyUI Workspace Thumbnails**: Single-clicking a thumbnail opens it in the workspace inspector, while double-clicking or pressing Enter opens the configured full viewer and keeps the workspace active.
+- **Detached Viewer Deletion**: Deleting the current image advances directly to the next available image in the same viewer window.
+- **Image Grid Deletion**: The image-grid context menu includes Delete, applying to the clicked image or the current multi-selection.
+- **Light Mode and Viewer Themes**: Text, headings, surfaces, and viewer actions maintain appropriate contrast across Light, Dark, Dracula, Nord, and Ocean themes.
+
+## [0.19.2] - [2026-08-27]
+
+### Improved
+
+- **Bundled Dependencies**: Updated bundled dependencies with the available non-breaking security fixes while keeping the current Electron version unchanged.
+- **Viewer Theme Consistency**: Improved Light Mode contrast and visual hierarchy across the Image Modal, Image Preview sidebar, main sidebar, and Support / License settings, with clearer A1111 and ComfyUI actions and theme-aware surfaces for Dark, Dracula, Nord, and Ocean.
+
+### Fixed
+
+- **ComfyUI Workspace Thumbnails**: Single-clicking a thumbnail now opens it in the workspace inspector, while double-clicking or pressing Enter opens the full image viewer according to the configured inline or detached viewer setting without returning to the Library grid.
+- **Detached Viewer Deletion**: Deleting the current image now advances to the next available image without closing, flashing, or reopening the detached viewer window.
+- **Image Grid Deletion**: Added a Delete action to the image grid context menu, applying to the clicked image or the current multi-selection.
+- **Light Mode Image Preview**: The preview title, file name, and metadata section headings now remain readable against the preview panel when using Light Mode.
+
+## [0.19.1] - [2026-08-26]
+
+### Added
+
+- **Stripe Billing for Pro Plans**: Added production billing support for Monthly, Annual, and Lifetime purchases through Stripe, with automatic license provisioning and email delivery.
+- **Subscription License Lifecycle**: Monthly and Annual licenses now follow their paid-through period automatically. Renewals extend access from paid invoices, while cancellations or payment failures do not cut off time that has already been paid for.
+- **Refund Handling**: Full refunds now automatically revoke affected Lifetime purchases or the matching paid subscription period, with safe recovery when a refund later fails or is reversed.
+
+### Improved
+
+- **Playback Controls**: Repeat modes now show their current Off, All, or 1 state directly in the player.
+- **License Delivery Reliability**: Stripe events and license emails are processed idempotently with durable retries and recovery safeguards, reducing the risk of duplicate licenses, duplicate delivery, or out-of-order billing events changing entitlement incorrectly.
+
+### Fixed
+
+- **Detached Viewer on macOS**: Separate viewer windows now load packaged file paths containing spaces or Unicode correctly.
+- **Viewer Navigation After Deletion**: Deleting the current file now advances to the next available item even if the active filter or scope changed while the viewer was open, including in detached viewer windows.
+- **3D Viewing**: Switching models no longer lets stale WebGL cleanup clear the active viewer, controls remain accessible outside the model viewport, errors stay readable, and OBJ/GLTF/FBX cards use stable placeholders instead of starting WebGL previews in the grid.
+- **Startup Library State**: The library no longer flashes a false “no images match” state while its initial data is loading.
+- **Krea2 Prompts**: MetaHub Save Node payloads containing `False` now recover the actual prompt from the embedded ComfyUI workflow.
+
+## [0.19.0] - [2026-08-20]
+
+### Added
+
+- **Find Similar — Local Visual Search**: Added opt-in, fully local visual similarity search, including for images without generation metadata. Model download is a separate explicit action; indexing is resumable, supports optional WebGPU acceleration with WASM fallback, and covers the 2,000 newest images on Free or the full library on Pro. Experimental text-to-image queries remain separate from deterministic metadata search.
+- **3D Model Library**: Added initial support for indexing, filtering, thumbnailing, viewing, and exporting GLB, GLTF, OBJ, FBX, and STL models, with Image MetaHub sidecars for formats that cannot embed the metadata.
+- **Native Viewer Windows**: Images can now open in separate desktop windows with always-on-top, drag-and-drop, navigation, editing, metadata, and generation actions. Settings → Viewer → Behavior can restore the legacy in-app viewer.
+
+### Improved
+
+- **Portable Windows Build**: Added a dedicated Portable executable that keeps settings and caches beside the app, separate from the standard Windows installation.
+- **License Activation**: Pro activation now uses signed IMH2 certificates verified by the desktop app, while lifetime licenses remain usable offline after activation. Historical license keys require a reissued IMH2 key.
+
+### Fixed
+
+- **Dates on Network Shares**: Files on SMB/CIFS shares no longer appear as December 31, 1969 when creation time is unavailable. Sorting, grouping, and the viewer now fall back to modification time, and existing cached entries are corrected on load.
+- **Desktop File Actions**: Restored direct Show in Folder actions, preserved original timestamps when copying or moving files, and added an explicitly confirmed permanent-delete fallback when the Recycle Bin is unavailable.
+- **ComfyUI EXIF Metadata**: JPEG and WebP exports with canonical ComfyUI workflow/prompt data are no longer misidentified as A1111 when a `parameters` field is also present, while empty graphs now fall through to `UserComment` and `Parameters` metadata.
+- **Packaged MP4 Metadata**: Restored basic MP4 dimensions and duration when `ffprobe` is unavailable in the packaged app.
+- **CLI Metadata Parsing**: Restored CLI parsing after the metadata engine's module boundary caused ESM/CJS loading failures.
+- **Card View Preview**: Opening the preview sidebar no longer moves the focused card out of view when the grid reflows.
+
+## [0.18.1] - 2026-08-01
+
+### Added
+
+- **Auto-play Toggle**: A new Settings → Viewer → Playback option controls whether videos and audio start playing as soon as they open. It stays on by default; turning it off means the media viewer waits for you to press Play, both when opening a file and when moving to another one with the navigation arrows.
+- **Repeat Modes and Shuffle**: The video player now supports three repeat modes (off, repeat all, repeat one) plus shuffle playback. Like VLC, repeat controls whether playback continues, while shuffle controls the playback order. Both settings are remembered, and slideshows are unaffected.
+
+### Improved
+
+- **Deleting Images**: Deleting one file could freeze the app for ~25 seconds on a large ComfyUI library, and the grid and viewer stayed unresponsive the whole time. Deleting now takes a fraction of a second on the same library, and no longer gets slower as the library grows: the folder cache is no longer rewritten around the removed entry, which is instead marked as gone and cleared out for good in a single pass once enough images have been deleted, or the next time the folder is reindexed. Cache chunks are also capped by size instead of only by entry count.
+- **Cache File Size**: Cached entries no longer duplicate large raw metadata alongside its parsed form; the full text is re-read from the file when you open the metadata or workflow views. Applies as folders are reindexed.
+- **New Images While Watching a Folder**: Adding, removing or enriching images no longer re-runs the whole filter and sort pipeline per event, so generating into a watched folder doesn't drop frames or block scrolling.
+- **Search Responsiveness**: Search text is computed once per image and reused instead of rebuilt on every keystroke.
+- **Image Lineage Rebuilds**: Lineage is no longer written to disk mid-interaction — rebuilds are coalesced and saved once things go quiet.
+- **Viewer Navigation**: Moving between images in the viewer no longer flashes a low-resolution thumbnail or a loading placeholder before the full image lands. The neighbouring images — two ahead in the direction you're browsing, one behind — are now read and fully decoded in the background while you look at the current one, so stepping onto them is immediate. The viewer previously only worked out a neighbour's file path in advance, which left the actual read and decode to happen at the moment you pressed the key. Holding an arrow key still scrubs through previews, and any image that hasn't been prepared yet behaves as before.
+
+### Fixed
+
+- **Video Controls Click Targets**: Fixed the play/pause, mute, volume and loop controls near the edges of the video player triggering next/previous navigation instead of their own action, because the navigation hover zones painted on top of them.
+- **Copy Metadata to Clipboard**: Fixed "Failed to copy..." errors on Copy Prompt, Copy Negative Prompt, Copy to A1111/ComfyUI and other clipboard actions that could occur after clearing the library cache or reindexing a folder, until the app was restarted. Text copies now go through Electron's native clipboard API, the same way image copies already did, instead of the browser API that could lose focus after a reload.
+
+## [0.18.0] - 2026-07-21
+ 
+### Added
+ 
+- **Unified Explore Surface**: Model View, Smart Library and Collections are replaced by a single Explore workspace with Models / Clusters / Collections dimensions and card-based drill-in. Opening a card scopes the Library grid to it, shown as a dedicated chip in Active Filters that stays combinable with every other filter.
+- **Classic Mode**: A new Settings → Appearance toggle restores the old Model View / Smart Library / Collections / Node View labels as shortcuts into Explore, for anyone who prefers the previous navigation.
+- **ComfyUI Nodes Filter**: Node View is retired in favor of a multi-select "ComfyUI Nodes" filter in the sidebar's Generation Parameters, combinable with every other filter and the active scope instead of being a separate screen.
+- **Header Tools Menu**: Automation rules and Auto-tag library moved into a new header "Tools" menu, since they're library-wide operations rather than tied to a specific collection or cluster.
+- **Live Generation Preview**: The Queue now shows a live, KSampler-style preview image that updates step-by-step during ComfyUI generation — both for generations started from MetaHub's own workspace and from the embedded ComfyUI UI. The preview/output image box can be dragged taller for portrait images, and the size is remembered across sessions.
+- **Run Current Workflow**: Added a "Run" button to the top of the Queue that queues whatever workflow is currently loaded in the embedded ComfyUI workspace, so you can trigger a generation from anywhere in the app.
+- **First-Class AVIF Metadata**: Added AVIF discovery, Chromium-backed previews and thumbnails, dimensions, ComfyUI XMP prompt/workflow parsing, legacy AVIF EXIF compatibility, CLI parsing, bounded full-file fallback for late XMP, metadata stripping, and metadata-preserving AVIF export. Exports keep the full prompt and workflow graph in standard ComfyUI XMP fields, while MetaHub's own tags, notes, attribution and an extracted parameter snapshot (model, seed, steps, cfg, sampler, scheduler, negative prompt) live in a compact private extension. Thanks to @austintraver.
+
+### Improved
+ 
+- **Group By Model/Cluster**: Sort Order and Group By moved from the sidebar to the persistent grid footer, with new Group By options for checkpoint model and cluster.
+- **Reparse Metadata Performance**: "Reparse Metadata" no longer rewrites the entire folder cache for a single image, so it stays fast regardless of library size. It patches only the cache chunk(s) that hold the reparsed images instead of re-serializing every entry, and uses a persistent id→chunk index to read just the target chunk directly rather than scanning the whole cache — a big win on large ComfyUI libraries where each chunk can be tens of MB. The index is validated on every use and rebuilt automatically if the cache changed, so it never serves stale data.
+- **Compare Mode Metadata Panels**: Metadata panels in Compare now expand and collapse together and scroll in sync, so one click reveals every image's metadata. Simplified the Standard/Diff toggle and fixed the Flicker view mode, which was rendering both images stacked instead of alternating.
+- **Library Toolbar**: Added a Back button that returns to the matching Explore dimension from a drill-in scope, and moved the Library Tools menu and Analytics button out of the global header into the library toolbar.
+### Fixed
+ 
+- **A1111 Sampler/Schedule Parsing**: Fixed the Sampler value being written to the Schedule field instead of Sampler, which left the Generation Details pane showing the sampler name under the wrong heading.
+- **Group By Navigation**: Fixed the Group By date/session calendar getting stuck on the active month, and Jump to Group requiring two clicks to scroll correctly on the first try.
+- **Light Theme Contrast**: Fixed accent-colored text that stayed light in the light theme and washed out — the update dialog's download-error message, the active Settings navigation item, and the startup-verification info box are now readable. These colors were hardcoded for the dark themes; a dedicated light-theme override keeps the dark, Dracula, Nord and Ocean themes unchanged.
+- **ComfyUI Workspace Folder Selector**: The folder dropdown in the thumbnail rail now gives its options an explicit background and text color, fixing folder names rendering as white-on-white in the native dropdown.
+
+
+## [0.17.5] - 2026-07-13
+
+### Added
+
+- **Civitai Links**: Model and LoRA hashes in the Image Modal are now clickable and open the matching Civitai page. The lookup happens only when you click — a single request to Civitai's public API, with the result cached locally so each hash is only ever looked up once. Works with A1111, Forge, SD.Next and Fooocus images, plus ComfyUI images saved with the MetaHub Save Node. Can be fully disabled under Settings → Privacy. Indexing and browsing remain 100% offline, as always.
+
+### Fixed
+
+- **Generator Detection Priority**: Reordered metadata parser dispatch so DreamStudio, Draw Things, Midjourney, Niji and Forge images are correctly identified instead of being swallowed by the generic Automatic1111 catch-all.
+- **MetaHub Save Node Tags/Notes**: Tags and notes from MetaHub Save Node images are no longer dropped during metadata normalization.
+- **Large Library Metadata Re-reads**: Files that overflowed the batch read budget are now re-read consistently, and truncated WebP metadata is detected and re-read the same way PNG already was.
+- **Folder Tree Sorting**: Subfolders now sort case-insensitively and naturally (matching Finder/Windows Explorer) instead of raw filesystem order.
+- **macOS External File Drag**: Dragging grid cards onto ComfyUI or into Finder on macOS now transfers the actual file instead of a text clipping.
+
+## [0.17.4] - 2026-07-11
+
+### Improved
+
+- **Create New Folder in Move/Copy**: Added a "Create New Folder" option to the Move/Copy To panel, with folder-tree navigation for picking or creating the destination.
+- **ComfyUI Workspace Drag & Drop**: Added drag-and-drop for bringing images into the ComfyUI workspace.
+- **ComfyUI Workflow Tools**: Simplified the Image Modal workflow experience around the embedded original workflow, combining parameters with the visual graph, adding a dedicated node list with editable parameters, and a metadata-only workflow option.
 - **ComfyUI Workflow Preview**: Enlarged the visual workflow canvas with an expandable view, opaque node cards, collision-aware positioning, draggable node arrangement, and a clear Restore Layout action.
+- **Filter Recovery**: Added a clearer empty state when filters return no images, with convenient Clear All actions beside active filters and in the results area.
+- **Accessibility and UI Feedback**: Improved visible keyboard focus and tactile feedback across toolbar, search, modal, facet filter, rating, pagination, view, and queue controls, added copy-confirmation feedback in the Image Modal and Image Card, a keyboard shortcut hint in the search bar, and keyboard access for the ComfyUI metadata toggle.
+- **Large Library Performance**: Reduced temporary allocations and repeated processing across analytics, prompt similarity, Smart Library clustering, the search/filter worker, image grouping and stacking, path filtering, and the image store.
 
 ### Fixed
 
 - **Collections Grouping**: Fixed Group By inside open Collections so date, name, and generation-session grouping work in both grid and table views, including Jump To navigation.
+- **ComfyUI Metadata Truncation**: Fixed metadata loss for large embedded ComfyUI workflows in PNG files by re-reading the full file when a head-read truncates metadata chunks.
+- **Checkpoint Facets**: Fixed checkpoint facets so they stay scoped to the current library.
+- **Folder Filters**: Fixed folder filters so they derive correctly from the selected directory prefix.
+- **macOS Audio Playback**: Fixed macOS audio playback mitigation for embedded media.
 
 ## [0.17.3] - 2026-06-19
 
@@ -1073,7 +1223,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Type-Safe Metadata Handling**: New TypeScript interfaces for Automatic1111Metadata and ComfyUIMetadata with proper type guards
 - **Dynamic Metadata Extraction**: Re-extraction of models, LoRAs, and schedulers during cache reconstruction for data consistency
 - **Backward Compatibility**: Maintained full compatibility with existing InvokeAI metadata and caching system
-- **Cross-Format Filtering**: Unified filtering system that works seamlessly with images from different generation tools
+- **Cross-Format Filtering**: Unified filtering system that works seamlessly across images from different generation tools
 - **Workflow Automation**: Improved GitHub Actions workflows with separate jobs for Windows, macOS, and Linux builds
 - **Build System Optimization**: Cleaned up duplicate workflow configurations and ensured proper artifact generation
 

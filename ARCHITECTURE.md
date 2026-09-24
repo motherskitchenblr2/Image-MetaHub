@@ -6,7 +6,7 @@
 
 ### Current Stack
 
-* **Version:** 0.17.3
+* **Version:** 0.19.3
 * **Renderer:** React 18 + TypeScript
 * **Desktop shell:** Electron 38
 * **State management:** Zustand
@@ -15,16 +15,25 @@
 
 ## Application Shape
 
-The renderer is centered around `App.tsx`, which coordinates:
+The renderer is centered around `App.tsx`, which coordinates four primary
+navigation contexts — **Library**, **Explore**, **Image Editor**, and
+**ComfyUI** — plus:
 
-* the main **Library** view
-* the **Smart Library** view
-* the **Model View**
+* the main **Library** grid (grid/list)
+* the **Explore** surface, which unifies model, cluster, and collection
+  browsing behind one dimension picker (`components/ExploreWorkspace.tsx`)
 * the **multi-window image viewer**
 * the **comparison modal**
 * the **analytics modal**
 * the **embedded ComfyUI Workspace**
 * generation modals and the shared generation queue sidebar
+
+Drilling into a model/cluster/collection sets an **image scope** (a
+`{ type, id, label }` descriptor in `useImageStore`) that filters the Library
+grid and appears as a fixed chip in `components/ActiveFilters.tsx`; cumulative
+filters continue to apply within the scope. "Classic mode" (a setting) restores
+the old Model View / Smart Library / Collections / Node View labels as
+deep-links into Explore — it changes navigation labels only, never surfaces.
 
 The app is designed so the heavy work happens outside the tight render loop:
 
@@ -40,18 +49,20 @@ The app is designed so the heavy work happens outside the tight render loop:
 **Core entry points**
 
 * `App.tsx` orchestrates folders, library state, global modals, and top-level view switching.
-* `components/Header.tsx` exposes view mode switching, generation entry points, analytics access, safe mode, and Smart Library actions.
-* `components/Sidebar.tsx` contains the current sidebar filter experience:
+* `components/Header.tsx` exposes the four-context navigation (plus optional Classic-mode deep-links), generation entry points, analytics access, and safe mode.
+* `components/Sidebar.tsx` contains the sidebar experience, organized into **Navigate** (Folders, Collections, Clusters actions) and **Filter** categories:
   * search
-  * active filter chips
+  * active filter chips (including the scope chip)
   * tags, favorites, and auto-tags
-  * faceted include/exclude sections for checkpoints, LoRAs, samplers, and schedulers
+  * faceted include/exclude sections for checkpoints, LoRAs, samplers, and schedulers, plus an include-only **ComfyUI Nodes** (OR) facet
   * advanced numeric/date filters
+* Sort Order and Group By live in the grid **Footer** (`components/Footer.tsx`); Group By supports date/name/session and now **model**/**cluster** sectioning (which sections over the whole filtered set and suspends pagination).
 * `components/DirectoryList.tsx` handles indexed folder navigation, subfolder visibility, exclusion, and auto-watch controls.
 
 **Main browsing surfaces**
 
 * `components/ImageGrid.tsx` and `components/ImageTable.tsx` render the main library in grid/list form.
+* `components/ExploreWorkspace.tsx` is the unified browsing surface (Models | Clusters | Collections) built on the generic `components/ScopeCard.tsx` (which owns the shared hover-scrub via `hooks/useHoverScrub.ts`). Card clicks set the active scope and navigate to the Library.
 * `components/ImageModal.tsx` is now a windowed viewer surface with move, resize, minimize/maximize, and dock/collapse behavior.
 * `components/ImageAdjustmentPanel.tsx` provides metadata-preserving PNG adjustment/export controls for brightness, contrast, saturation, and hue.
 * `components/ImagePreviewSidebar.tsx` shows metadata, telemetry, and generation actions in the side preview flow.
@@ -91,6 +102,13 @@ It also contains the central filter pipeline, including:
 * safe mode
 * advanced filters such as dimensions, steps, CFG, dates, and verified telemetry
 
+The pipeline has two paths:
+
+* **Full recompute** (`filterAndSort`) runs the whole filter chain and re-sorts. Used for structural changes — setting or clearing images, replacing a directory, and any change to a filter or sort parameter.
+* **Incremental** (`_updateStateIncremental`) handles add / remove / merge. It compiles the active filters into a single-image predicate, evaluates only the touched images, and inserts matches into the already-sorted list rather than re-sorting. Facet counts, collection counts and available-filter lists are reconciled on a debounced pass afterwards, capped so a sustained burst still gets periodic updates. That pass compares its result against a full recompute and falls back to it on any divergence.
+
+Two consequences worth knowing before changing this area: `compileImageFilter` duplicates `filterAndSort`'s filter chain, so a new filter has to be added in both or the two silently disagree; and search text is memoized in a `WeakMap` keyed by the image object, which is only sound because every store path replaces `IndexedImage` objects instead of mutating them in place.
+
 **`store/useSettingsStore.ts`**
 
 Persists user preferences such as:
@@ -109,11 +127,11 @@ In Electron, this store persists through the settings IPC bridge rather than pla
 
 **`store/useLicenseStore.ts`**
 
-Owns the offline license and trial state:
+Owns renderer-side trial state and the license status received from Electron main:
 
 * free / trial / expired / pro / lifetime status
-* 3-day trial activation
-* offline license key validation
+* 7-day trial activation
+* authority-derived paid status; license keys and signed activation certificates are validated by `electron/licenseManager.mjs`, not by the renderer
 
 **`store/useGenerationQueueStore.ts`**
 
@@ -125,6 +143,17 @@ Tracks generation jobs across providers:
 * ComfyUI jobs detected from outside Image MetaHub
 
 The queue is synchronized by `hooks/useGenerationQueueSync.ts`.
+
+**`store/useSemanticStore.ts`**
+
+Orchestrates the opt-in local visual-search feature, kept out of `useImageStore` so its heavy, opt-in machinery does not weigh on the hot filter/render path:
+
+* CLIP model download and installed/GPU-installed status
+* the resumable backfill job (progress, pause/resume/cancel)
+* running a text or "find similar" query and publishing the score map
+* backend selection (WASM/CPU baseline vs. opt-in WebGPU/fp16)
+
+The only thing it pushes into `useImageStore` is the finished result, via `applySemanticResult(scoreById)`. See [Visual (Semantic) Search](#visual-semantic-search) below.
 
 ## Indexing and Metadata Pipeline
 
@@ -155,6 +184,7 @@ It reads:
 
 * PNG `tEXt` / `iTXt`
 * JPEG/WEBP EXIF/XMP/comment payloads
+* AVIF XMP item extents and legacy AVIF EXIF workflow fields
 * sidecar-style embedded JSON where applicable
 * video/audio container metadata and `ffprobe` output for supported media formats
 
@@ -167,6 +197,8 @@ The output is then normalized by `services/parsers/metadataParserFactory.ts`, wh
 * `services/parsers/sdNextParser.ts`
 * `services/parsers/drawThingsParser.ts`
 * `services/parsers/videoMetaHubParser.ts`
+
+AVIF container behavior is isolated in `utils/avifMetadata.mjs`. The module resolves ISO-BMFF item locations, joins split metadata extents, delegates raw XMP/EXIF parsing to `exifr`, and reports disagreements between standalone and legacy nested workflow documents. `utils/imageMetaHubAvifExtension.mjs` owns the compact Image MetaHub extension schema. AVIF rewrites reuse the existing XMP extent when the compact payload fits, or append a new payload and repoint the item location when it does not, without decoding or re-encoding AV1 pixels. Files without exactly one writable standard XMP item are rejected instead of being rewritten unsafely.
 
 ### ComfyUI Parser
 
@@ -199,13 +231,29 @@ Metadata and thumbnails are cached separately.
 * `services/cacheManager.ts` stores normalized image metadata in chunked cache files.
 * Parser/cache versioning is used to invalidate stale cache when metadata logic changes.
 * Writes are incremental to avoid large all-at-once cache flushes.
-* Oversized raw payloads can be compacted and hydrated on demand to reduce renderer memory pressure.
+* Chunks are bounded by **both** an entry count and a byte budget. The byte budget is the load-bearing one: a single ComfyUI entry carries a whole workflow graph, so sizing purely by entry count produced chunk files of tens of MB. Chunk files are always read and rewritten whole, so their size directly sets the cost of every single-image edit.
+* A sidecar `{cacheId}_index.json` maps image id → chunk index, so patching an image reads just the chunk holding it instead of scanning the cache. The index is validated against the record's `chunkCount` and `lastScan` on every use, and rejected if either differs. **Every path that finalizes a cache write must rewrite the index with the same `lastScan` it finalized the record with** — an index left behind at an older `lastScan` is silently rejected forever, which quietly degrades every later edit into a full rewrite. The one deliberate exception is a tombstoned delete (below): it moves no entry between chunks, so it leaves both `lastScan` and the index alone and stays valid by not changing anything.
+* Removals resolve bare filenames against the index keys (entry ids encode the relative path) rather than reading chunks, so watcher-driven removals also take the fast path.
+* **Deletes are tombstoned, not applied.** Removing an image appends its id to a second sidecar, `{cacheId}_removed.json`, and adjusts the record — no chunk file is touched, so a delete costs the same on any library size. Read paths (`getCachedData`, `iterateCachedMetadata`) skip the listed ids. The entries are physically dropped by the next full rewrite, which is forced once the sidecar passes `MAX_TOMBSTONES_BEFORE_COMPACTION` ids and also happens on any reindex. `imageCount` counts live entries, so the chunks physically hold `imageCount + tombstoneCount`.
+* The invariant that holds the two files together is that the record's `tombstoneCount` equals the sidecar's length; readers also require the sidecar's `chunkCount` to match. **On any disagreement the sidecar is ignored and the cache is served exactly as it sits on disk** — an already-deleted image can reappear until the next scan removes it again, which is the acceptable direction; trusting a stale sidecar would hide images that are still on disk, which is not. The mismatch is left visible on purpose so the next delete or append still forces the repairing rewrite, which recomputes `imageCount` from the actual chunk contents.
+* Because of that, `finalize-cache-write` makes every caller declare what happens to the sidecar: omitted drops it (a full rewrite), `'preserve'` touches neither file and carries the record's existing count forward, and an explicit `{ chunkCount, ids }` replaces it. The main process derives `tombstoneCount` from what it actually wrote, so the two cannot disagree by accident, and the default for a caller that says nothing is the safe one. The rule lives in `utils/cacheTombstones.mjs` — **nothing may quietly make a broken pair agree again**, including by mapping a failed read to zero. Both bugs found in review of this design were exactly that.
+* Appending cannot undo a tombstone, since the dead entry is still in its chunk: re-adding a still-tombstoned id would leave two entries for it. `appendToCache` detects this before writing anything and hands the whole append to the full rewrite instead.
+* Raw metadata above a small threshold is not stored inline. Entries keep `normalizedMetadata` plus previews, and `services/rawMetadataHydration.ts` re-reads the full text from the image file on demand for the metadata, editor and ComfyUI workflow views. This keeps both the on-disk cache and renderer memory small; the derived fields the cache does keep are what drive search, filters and facets.
 
 **Thumbnail cache**
 
 * `services/thumbnailManager.ts` generates and reuses thumbnails.
 * Video thumbnails are generated from captured frames.
 * Thumbnail state is intentionally decoupled from the main image collection to avoid full-list re-renders as thumbnails arrive.
+
+**Viewer media cache**
+
+* `services/mediaSourceCache.ts` turns an image into a URL the renderer can display — an `imh-media://` stream URL in Electron, an object or data URL otherwise — keyed by `directoryPath::id::lastModified` and LRU-capped separately per kind.
+* **Resolving a source yields a string, not bytes.** On the Electron path it is a path resolution plus an `fs.access`; nothing is read and nothing is decoded. That fetch and decode is precisely what cannot fit in the frame where the viewer's `<img src>` changes, so warming a neighbour means decoding it, not resolving it.
+* `services/mediaDecodeCache.ts` is that second layer: a small LRU of decoded bitmaps keyed **by URL only**, with no knowledge of `IndexedImage` or directories. Holding the `HTMLImageElement` is what keeps Chromium from dropping the decoded copy. `ImageModal` warms two neighbours ahead in the direction of travel and one behind, serialized on `requestIdleCallback`, and deliberately without `prioritize` so it never pauses the grid's background thumbnail work. It only does so when the store's navigation list is the one the viewer is actually walking — a modal opened from Find Similar, a ComfyUI workflow or a scope steps through its own id list, and `currentIndex`/`totalImages` are what say so.
+* The viewer reads `mediaSourceCache.peek()` and `mediaDecodeCache.isWarm()` **during render**, not in an effect: an effect runs after paint, which would cost the frame the whole path exists to save. A warm source is swapped in the same commit as the image id change, skipping the thumbnail step entirely; a cold one falls back to thumbnail-then-full as before.
+* Both `peek()` and `isWarm()` are side-effect free on purpose. They run on every render, and touching LRU recency there would rank entries by how often a component re-rendered rather than by use.
+* The decode cache is refcounted (`retain`/`release`) because several viewer windows can be open at once — the last one to close is what drops the bitmaps.
 
 ## Filtering, Tags, and Curation
 
@@ -254,16 +302,24 @@ This layer allows:
 * shadow metadata overrides without overwriting the original file metadata
 * image adjustment export metadata for edited PNG copies
 
-## Smart Library
+## Clustering (Clusters dimension)
 
-The Smart Library is a separate browsing mode for similarity-based organization.
+Similarity-based organization is exposed through the **Clusters** dimension of
+the Explore surface (it was previously a standalone Smart Library view). Cluster
+cards are rendered via `ScopeCard`; opening one scopes the Library to that
+cluster. Cluster generation and auto-tagging are triggered from Explore's
+Clusters dimension and the sidebar's Navigate → Clusters section.
 
 **Main pieces**
 
-* `components/SmartLibrary.tsx`
-* `components/StackCard.tsx`
-* `components/StackExpandedView.tsx`
-* `components/DeduplicationHelper.tsx`
+* `components/ExploreWorkspace.tsx` (Clusters dimension)
+* `components/ClusterUpgradeBanner.tsx` (free-tier upsell shown in the Clusters
+  dimension when `clusteringMetadata.isLimited`)
+* `utils/smartLibraryClusterState.ts` (access gating, cluster state signatures)
+
+> The in-cluster deduplication workflow (mark best / archive) was removed when
+> cluster drill-in moved to the scoped Library grid; only the free-tier upgrade
+> banner is retained.
 
 **Engines**
 
@@ -272,9 +328,40 @@ The Smart Library is a separate browsing mode for similarity-based organization.
 * `services/clusterCacheManager.ts`
 * `services/autoTaggingEngine.ts`
 * `services/workers/autoTaggingWorker.ts`
-* `services/deduplicationEngine.ts`
 
 Clustering and auto-tagging are deliberately offloaded to workers because they are CPU-heavy and operate over the full filtered image set.
+
+## Local Visual Search
+
+Find Similar (image-to-image retrieval) is the primary supported Local Visual Search path for v0.19. It reuses an image embedding to find visually related files, including images with no prompt, workflow, or normalized metadata. The text encoder is retained only for experimental text-to-image queries.
+
+The implementation uses `Xenova/clip-vit-base-patch32` by default, with `Xenova/clip-vit-base-patch16` as the higher-detail option. The master switch (`settings.semanticSearchEnabled`) defaults **off**: while off, no model status check runs, no index is opened, and no file is written. Enabling the feature is consent to initialize the local index, but the model download remains a separate explicit action.
+
+**Storage**
+
+* `services/embeddings/embeddingFormat.ts` defines the on-disk layout: vectors are int8-quantized with a per-vector scale, written into append-only binary segments (`${safeCacheId}_emb_seg_*.bin`, ~4MB each), JSON row-index chunks, and a manifest that is the durability source of truth. These files are separate from the metadata cache even though both live under the authorized cache root.
+* `services/embeddings/embeddingStore.ts` (`EmbeddingIndex`) owns one library-wide index per model. It handles append-only segment writes, flush, tombstone, and rename. Row-index chunks and the manifest use temp-file + rename replacement; the manifest is committed last. If a write is interrupted, the last committed manifest bounds valid rows and trailing, uncommitted segment bytes or row entries are ignored on recovery.
+* A manifest from a different model, vector dimension, or embedding format is invalidated and rebuilt rather than migrated. Embeddings are derived, reconstructible data; index format changes do not require a `PARSER_VERSION` bump because parser output and the metadata cache contract are independent.
+* Reconciling the index against images that have left the library (tombstoning their vectors) happens **only** from the backfill job below, which is the only caller holding the authoritative, fully-hydrated image array. It deliberately does not run from a mount effect, where a still-loading (empty or partial) image list would otherwise read as "the library is empty" and wipe every live vector.
+
+**Indexing**
+
+* `services/embeddings/embeddingIndexer.ts` (`runBackfill`) is a resumable, newest-first backfill: pause/resume/cancel, periodic flush so a crash costs at most one flush window, and a Free-tier cap (`SEMANTIC_FREE_TIER_LIMIT` = 2,000 most-recent images, `hooks/useFeatureAccess.ts`) that Pro removes.
+* `services/workers/embeddingWorker.ts` + `services/embeddings/embeddingService.ts` run the CLIP towers (`@huggingface/transformers`) off the main thread. WASM/q8 is the always-present CPU baseline so the app never competes with an image generator for VRAM by default; an opt-in WebGPU/fp16 accelerator (`settings.semanticSearchDevice`) falls back to CPU automatically on adapter or `shader-f16` load failure.
+* Model weights are downloaded from Hugging Face only after the user presses the explicit download action (`download-embedding-model` IPC handler in `electron.mjs`). LFS weight files are verified with SHA-256 against the object hash reported in the `x-linked-etag` header before they are accepted under `<userData>/models/`; corrupt or adulterated payloads are removed. The main process accepts only the supported model catalog and fixed Hugging Face origin. After that download, embedding and retrieval remain local and work offline.
+* Electron owns model download, integrity verification, cache-sidecar I/O, and the `imh-model://` protocol; preload exposes narrow IPC methods; the renderer orchestrates consent, indexing, and queries without receiving arbitrary filesystem authority. Electron packaging must include the renderer worker chunks, transformers.js runtime, ONNX/WASM assets, and the model protocol code. Model files themselves remain user-downloaded data, not bundled application payloads.
+
+**Search**
+
+* `services/embeddings/semanticSearchEngine.ts` + `services/workers/vectorSearchWorker.ts`: a long-lived dedicated worker holds the quantized vector matrix in memory and ranks it by brute-force cosine, returning top-K results through a fixed-size min-heap. Only segments whose row count changed since the last sync are re-read and re-sent.
+* Relevance is decided by a z-score cutoff over the query's own score distribution rather than a fixed cosine threshold — CLIP text↔image cosines are compressed and query-dependent (roughly 0.22–0.25 regardless of the query), so an absolute floor cannot separate a real match from noise.
+* Experimental text queries may use negative terms (`beach -people`) to push the query embedding away from unwanted concepts before ranking. CLIP text queries are approximate visual retrieval and do not replace the deterministic metadata, prompt, model, LoRA, and workflow search paths.
+* Find Similar (grid/table/viewer entry points) reuses the selected image's embedding with the same ranking worker. If the source has no stored vector, it is embedded on demand, which also supports files beyond a partial or Free-tier backfill.
+
+**UI and store integration**
+
+* `components/SemanticSearchBar.tsx` (sidebar toggle + query input), `components/settings/VisualSearchSettingsPanel.tsx` (model download, index build/pause/resume, GPU toggle), `components/VisualSearchOnboarding.tsx` (dismissible intro card).
+* An active Local Visual Search result lives in `useImageStore.semanticResult.scoreById` — a `Map`, never written onto `IndexedImage` — and drives a `'relevance'` sort order. Traditional metadata search retains its existing deterministic semantics; the experimental visual-text mode is explicitly separate and never replaces that implementation.
 
 ## Comparison and Analytics
 
@@ -360,6 +447,7 @@ The current behavior supports:
 * metadata-preserving edited image save/overwrite operations
 * video metadata reading via `ffprobe`
 * clipboard and drag-and-drop helpers
+* visual-search embedding sidecar IPC (read/write/append segment, stat, delete) and CLIP model download/status/delete, plus the `imh-model://` protocol that serves the downloaded weights to the embedding worker
 
 ### Preload Bridge
 
@@ -371,6 +459,7 @@ The current behavior supports:
 * watcher events
 * settings persistence
 * export, transfer, and drag/drop helpers
+* visual-search embedding storage and model download/progress
 
 The renderer does not access Node APIs directly.
 
@@ -412,7 +501,7 @@ Both commands reuse the same metadata engine as the desktop app.
 
 Top-level release automation lives in:
 
-* `generate-release.js`
+* `scripts/generate-release.js`
 * `scripts/auto-release.js`
 * `scripts/release-workflow.js`
 * `scripts/sync-changelog.js`

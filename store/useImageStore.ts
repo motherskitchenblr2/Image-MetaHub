@@ -1,11 +1,8 @@
 import { create } from 'zustand';
-import { IndexedImage, Directory, ThumbnailStatus, ImageAnnotations, TagInfo, ImageCluster, TFIDFModel, AutoTag, IndexedImageTransferProgress, InclusionFilterMode, ImageRating, SmartCollection, AutomationRule, type AdvancedFilters, type FilterOptions, type SelectedFiltersUpdate, type TagMatchMode } from '../types';
+import { IndexedImage, Directory, ThumbnailStatus, ImageAnnotations, TagInfo, ImageCluster, TFIDFModel, IndexedImageTransferProgress, InclusionFilterMode, ImageRating, SmartCollection, AutomationRule, type AdvancedFilters, type FilterOptions, type SelectedFiltersUpdate, type TagMatchMode, type ImageScope, type ExploreDimension, type SortOrder, type SemanticSearchResult, type UserDataSemanticPatch } from '../types';
+import { resolveScopeImageIds, filterImagesByScope, getScopeToastMessage } from '../utils/imageScope';
 import { loadSelectedFolders, saveSelectedFolders, loadExcludedFolders, saveExcludedFolders } from '../services/folderSelectionStorage';
 import {
-  loadAllAnnotations,
-  saveAnnotation,
-  bulkSaveAnnotations,
-  getAllTags,
   ensureManualTagExists,
   renameManualTag,
   deleteManualTag,
@@ -21,6 +18,18 @@ import {
   resolveSmartCollectionImages,
   saveSmartCollection,
 } from '../services/imageAnnotationsStorage';
+import {
+  annotationFromStableRecord,
+  getAllAuthoritativeTags,
+  hydrateUserDataForImages,
+  loadAnnotationsForImages,
+  mutateAnnotationTagGlobally,
+  patchAnnotation,
+  registerStableUserDataImages,
+  saveAnnotations,
+  subscribeStableUserDataChanges,
+  UserDataBatchPersistenceError,
+} from '../services/userDataPersistenceAdapter';
 import {
     deleteAutomationRule,
     getAllAutomationRules,
@@ -40,8 +49,9 @@ import { resolveMediaType } from '../utils/mediaTypes.js';
 import { createCacheDebugSnapshot, traceCacheDebug } from '../utils/cacheDebugTrace';
 import { useLicenseStore } from './useLicenseStore';
 import { useSettingsStore } from './useSettingsStore';
-import { CLUSTERING_FREE_TIER_LIMIT, CLUSTERING_PREVIEW_LIMIT } from '../hooks/useFeatureAccess';
+import { CLUSTERING_FREE_TIER_LIMIT, CLUSTERING_PREVIEW_LIMIT, isDevProLicenseOverride } from '../hooks/useFeatureAccess';
 import { buildClusterSourceSignature } from '../utils/smartLibraryClusterState';
+import { filterImagesByWorkflowNodes } from '../services/comfyUIWorkflowNodes';
 import {
     type LineageBuildState,
     type LineageDirectorySignature,
@@ -60,9 +70,27 @@ import {
     recordPerformanceDuration,
 } from '../utils/performanceDiagnostics';
 import { inferMimeTypeFromName } from '../utils/mediaTypes.js';
+import { semanticSearchScopeRevision } from './semanticSearchState';
 
 const RECENT_TAGS_STORAGE_KEY = 'image-metahub-recent-tags';
 const MAX_RECENT_TAGS = MAX_RECENT_TAG_HISTORY;
+
+// The set of images the user actually sees: filteredImages narrowed by the ComfyUI-node
+// filter (OR, when active) and then by the active scope. Keeps select-all and prev/next
+// navigation aligned with the grid (App.displayImages), so they never touch hidden images.
+const resolveDisplayedImages = (state: {
+  filteredImages: IndexedImage[];
+  selectedNodes: string[];
+  activeImageScope: ImageScope | null;
+  images: IndexedImage[];
+  clusters: ImageCluster[];
+  collections: SmartCollection[];
+}): IndexedImage[] => {
+  const nodeFiltered = state.selectedNodes.length > 0
+    ? filterImagesByWorkflowNodes(state.filteredImages, state.selectedNodes)
+    : state.filteredImages;
+  return filterImagesByScope(nodeFiltered, resolveScopeImageIds(state.activeImageScope, state));
+};
 
 type ThumbnailEntryState = {
     lastModified: number;
@@ -111,7 +139,7 @@ type SearchWorkerImage = {
     steps: number | null;
     cfgScale: number | null;
     generationType: 'txt2img' | 'img2img' | null;
-    mediaType: 'image' | 'video' | 'audio';
+    mediaType: 'image' | 'video' | 'audio' | 'model3d';
     generator: string;
     gpuDevice: string | null;
     hasTelemetry: boolean;
@@ -176,6 +204,10 @@ type SearchWorkerResultPayload = {
         schedulerFacetCounts: Array<[string, number]>;
     };
 };
+
+// Global collators to avoid redundant allocations and high overhead of localeCompare in hot loops.
+const baseCollator = new Intl.Collator(undefined, { sensitivity: 'base' });
+const accentCollator = new Intl.Collator(undefined, { sensitivity: 'accent' });
 
 const DEFAULT_LINEAGE_BUILD_STATE: LineageBuildState = {
     status: 'idle',
@@ -277,6 +309,21 @@ const replaceRecentTag = (currentTags: string[], sourceTag: string, targetTag: s
     return Array.from(new Set(mapped));
 };
 
+/**
+ * Compares two tag arrays for equality without allocating intermediate strings.
+ * Optimization: Replaces JSON.stringify() in hot loops to reduce GC pressure.
+ */
+const areTagsEqual = (a: string[] | null | undefined, b: string[] | null | undefined): boolean => {
+    if (a === b) return true;
+    const arrA = a || [];
+    const arrB = b || [];
+    if (arrA.length !== arrB.length) return false;
+    for (let i = 0; i < arrA.length; i++) {
+        if (arrA[i] !== arrB[i]) return false;
+    }
+    return true;
+};
+
 const normalizeTagName = (tag: string) => tag.trim().toLowerCase();
 const pendingMetadataTagImportMap = new Map<string, IndexedImage>();
 
@@ -292,25 +339,6 @@ const drainPendingMetadataTagImports = (): IndexedImage[] => {
     const images = Array.from(pendingMetadataTagImportMap.values());
     pendingMetadataTagImportMap.clear();
     return images;
-};
-
-const buildAnnotationRecord = (
-    imageId: string,
-    currentAnnotation: ImageAnnotations | undefined,
-    overrides: Partial<Pick<ImageAnnotations, 'isFavorite' | 'tags' | 'rating'>>,
-): ImageAnnotations => {
-    const hasFavoriteOverride = Object.prototype.hasOwnProperty.call(overrides, 'isFavorite');
-    const hasTagsOverride = Object.prototype.hasOwnProperty.call(overrides, 'tags');
-    const hasRatingOverride = Object.prototype.hasOwnProperty.call(overrides, 'rating');
-
-    return {
-        imageId,
-        isFavorite: hasFavoriteOverride ? overrides.isFavorite ?? false : currentAnnotation?.isFavorite ?? false,
-        tags: hasTagsOverride ? overrides.tags ?? [] : currentAnnotation?.tags ?? [],
-        rating: hasRatingOverride ? overrides.rating : currentAnnotation?.rating,
-        addedAt: currentAnnotation?.addedAt ?? Date.now(),
-        updatedAt: Date.now(),
-    };
 };
 
 type ManualTagFilterState = Pick<ImageState, 'selectedTags' | 'excludedTags'>;
@@ -374,7 +402,7 @@ const sortCollections = (collections: SmartCollection[]): SmartCollection[] =>
             return sortDelta;
         }
 
-        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+        return baseCollator.compare(a.name, b.name);
     });
 
 const getNextCollectionSortIndex = (collections: SmartCollection[]): number =>
@@ -528,21 +556,15 @@ const normalizePath = (path: string) => {
 };
 
 const getImageFolderPath = (image: IndexedImage, directoryPath: string): string => {
-    const normalizedDirectory = normalizePath(directoryPath);
-    const idParts = image.id.split('::');
-    if (idParts.length !== 2) {
-        return normalizedDirectory;
+    const relativePath = getRelativeImagePath(image);
+    const lastSlashIndex = Math.max(relativePath.lastIndexOf('/'), relativePath.lastIndexOf('\\'));
+
+    if (lastSlashIndex === -1) {
+        return normalizePath(directoryPath);
     }
 
-    const relativePath = idParts[1];
-    const segments = relativePath.split(/[/\\]/).filter(Boolean);
-    if (segments.length <= 1) {
-        return normalizedDirectory;
-    }
-
-    const folderSegments = segments.slice(0, -1);
-    const folderRelativePath = folderSegments.join('/');
-    return joinPath(normalizedDirectory, folderRelativePath);
+    const folderRelativePath = relativePath.slice(0, lastSlashIndex);
+    return joinPath(directoryPath, folderRelativePath);
 };
 
 const joinPath = (base: string, relative: string) => {
@@ -563,20 +585,50 @@ const joinPath = (base: string, relative: string) => {
 
 const getRelativeImagePath = (image: IndexedImage): string => {
     if (!image?.id) return image?.name ?? '';
-    const [, relative = ''] = image.id.split('::');
+    if (image.directoryId) {
+        const prefix = `${image.directoryId}::`;
+        if (image.id.startsWith(prefix)) {
+            return image.id.slice(prefix.length) || image.name;
+        }
+    }
+
+    const sepIndex = image.id.lastIndexOf('::');
+    const relative = sepIndex === -1 ? '' : image.id.slice(sepIndex + 2);
     return relative || image.name;
 };
 
+// Memoized by object identity, so that repeated filterAndSort /
+// buildSearchWorkerDataset passes (e.g. one per keystroke of a search query)
+// don't rebuild the same strings for the whole library.
+//
+// LOAD-BEARING INVARIANT: IndexedImage objects are treated as immutable —
+// every content change must produce a *new* object. That holds today across
+// every producer (sanitizeIndexedImageFacets and applyAnnotationsToImages
+// return the input unchanged when nothing differs and a spread copy when it
+// does; processEnrichmentResult, updateImage, the tag/auto-tag actions and the
+// cache loader all spread as well), which is why no manual invalidation is
+// needed. If any path ever mutates an image in place instead, these caches
+// will silently serve stale text and search will return wrong results with no
+// other symptom — see the regression test in useImageStore.filters.test.ts.
+const catalogSearchTextCache = new WeakMap<IndexedImage, string>();
+const compactSearchTextCache = new WeakMap<IndexedImage, string>();
+
 const buildCatalogSearchText = (image: IndexedImage): string => {
+    const cached = catalogSearchTextCache.get(image);
+    if (cached !== undefined) {
+        return cached;
+    }
     const relativePath = getRelativeImagePath(image).replace(/\\/g, '/').toLowerCase();
     const name = (image.name || '').toLowerCase();
     const directory = (image.directoryName || '').replace(/\\/g, '/').toLowerCase();
-    return [name, relativePath, directory].filter(Boolean).join(' ');
+    const text = [name, relativePath, directory].filter(Boolean).join(' ');
+    catalogSearchTextCache.set(image, text);
+    return text;
 };
 
 const MAX_SEARCH_TEXT_LENGTH = 8192;
 
-const buildCompactSearchText = (image: IndexedImage): string => {
+const buildCompactSearchTextUncached = (image: IndexedImage): string => {
     const segments: string[] = [];
     const pushValue = (value: unknown) => {
         if (typeof value === 'number') {
@@ -597,8 +649,19 @@ const buildCompactSearchText = (image: IndexedImage): string => {
     pushValue(image.prompt);
     pushValue(image.negativePrompt);
 
-    image.models?.forEach(model => pushValue(normalizeFacetValue(model)));
-    image.loras?.forEach(lora => pushValue(normalizeLoraName(typeof lora === 'string' ? lora : lora)));
+    const models = image.models;
+    if (models) {
+        for (let i = 0; i < models.length; i++) {
+            pushValue(normalizeFacetValue(models[i]));
+        }
+    }
+
+    const loras = image.loras;
+    if (loras) {
+        for (let i = 0; i < loras.length; i++) {
+            pushValue(normalizeLoraName(loras[i]));
+        }
+    }
 
     pushValue(normalizeFacetValue(image.sampler));
     pushValue(normalizeFacetValue(image.scheduler));
@@ -616,9 +679,26 @@ const buildCompactSearchText = (image: IndexedImage): string => {
         pushValue(image.cfgScale);
     }
 
-    image.tags?.forEach(tag => pushValue(tag));
-    image.autoTags?.forEach(tag => pushValue(tag));
-    image.workflowNodes?.forEach(nodeType => pushValue(nodeType));
+    const tags = image.tags;
+    if (tags) {
+        for (let i = 0; i < tags.length; i++) {
+            pushValue(tags[i]);
+        }
+    }
+
+    const autoTags = image.autoTags;
+    if (autoTags) {
+        for (let i = 0; i < autoTags.length; i++) {
+            pushValue(autoTags[i]);
+        }
+    }
+
+    const workflowNodes = image.workflowNodes;
+    if (workflowNodes) {
+        for (let i = 0; i < workflowNodes.length; i++) {
+            pushValue(workflowNodes[i]);
+        }
+    }
 
     pushValue(getImageGpuDevice(image));
 
@@ -628,6 +708,16 @@ const buildCompactSearchText = (image: IndexedImage): string => {
     }
 
     return searchText.slice(0, MAX_SEARCH_TEXT_LENGTH);
+};
+
+const buildCompactSearchText = (image: IndexedImage): string => {
+    const cached = compactSearchTextCache.get(image);
+    if (cached !== undefined) {
+        return cached;
+    }
+    const text = buildCompactSearchTextUncached(image);
+    compactSearchTextCache.set(image, text);
+    return text;
 };
 
 const getImageAnalyticsSnapshot = (image: IndexedImage) => {
@@ -702,9 +792,9 @@ const toSearchWorkerImage = (image: IndexedImage): SearchWorkerImage => {
     const metadataMediaType = image.metadata?.normalizedMetadata?.media_type;
     const inferredMediaType = resolveMediaType(image.name, image.fileType);
     const mediaType =
-        metadataMediaType === 'video' || metadataMediaType === 'audio' || metadataMediaType === 'image'
+        metadataMediaType === 'video' || metadataMediaType === 'audio' || metadataMediaType === 'model3d' || metadataMediaType === 'image'
             ? metadataMediaType
-            : inferredMediaType === 'video' || inferredMediaType === 'audio'
+            : inferredMediaType === 'video' || inferredMediaType === 'audio' || inferredMediaType === 'model3d'
                 ? inferredMediaType
                 : 'image';
 
@@ -745,6 +835,12 @@ const toSearchWorkerImage = (image: IndexedImage): SearchWorkerImage => {
     };
 };
 
+export interface SemanticSearchScopeSnapshot {
+  images: IndexedImage[];
+  imageIds: ReadonlySet<string>;
+  revision: string;
+}
+
 interface ImageState {
   // Core Data
   images: IndexedImage[];
@@ -773,7 +869,8 @@ interface ImageState {
   transferProgress: IndexedImageTransferProgress | null;
   selectedImage: IndexedImage | null;
   selectedImages: Set<string>;
-  activeImageScope: IndexedImage[] | null;
+  activeImageScope: ImageScope | null;
+  exploreDimension: ExploreDimension;
   collections: SmartCollection[];
   automationRules: AutomationRule[];
   isAutomationRulesLoaded: boolean;
@@ -815,15 +912,26 @@ interface ImageState {
   excludedGenerators: string[];
   selectedGpuDevices: string[];
   excludedGpuDevices: string[];
-  sortOrder: 'asc' | 'desc' | 'date-asc' | 'date-desc' | 'random';
+  sortOrder: SortOrder;
   randomSeed: number;
   advancedFilters: AdvancedFilters;
+
+  // Visual (semantic) search. Set only while a visual query is active; when
+  // present it replaces the text-search predicate and drives the 'relevance'
+  // sort. Scores live here in a Map keyed by id, never on the image objects, so
+  // the search-text WeakMap caches and the "never persisted" cache contract are
+  // both untouched.
+  semanticResult: SemanticSearchResult | null;
+  /** Sort order to restore when a visual search is cleared. */
+  preSemanticSortOrder: SortOrder | null;
 
   // Annotations State
   annotations: Map<string, ImageAnnotations>;
   availableTags: TagInfo[];
   availableAutoTags: TagInfo[]; // Top auto-tags by frequency
   recentTags: string[];
+  /** ComfyUI workflow-node filter (OR): keep images whose workflowNodes include any selected node. */
+  selectedNodes: string[];
   selectedTags: string[];
   excludedTags: string[];
   selectedTagsMatchMode: TagMatchMode;
@@ -903,8 +1011,13 @@ interface ImageState {
   setSearchQuery: (query: string) => void;
   setFilterOptions: (options: Pick<FilterOptions, 'models' | 'loras' | 'samplers' | 'schedulers' | 'generators' | 'gpuDevices' | 'dimensions'>) => void;
   setSelectedFilters: (filters: SelectedFiltersUpdate) => void;
-  setSortOrder: (order: 'asc' | 'desc' | 'date-asc' | 'date-desc' | 'random') => void;
+  setSortOrder: (order: SortOrder) => void;
   reshuffle: () => void;
+  /**
+   * Applies visual-search ranking: filters to the scored ids and sorts by
+   * relevance. Passing null clears it and restores the previous sort order.
+   */
+  applySemanticResult: (result: SemanticSearchResult | null) => void;
   setAdvancedFilters: (filters: AdvancedFilters) => void;
   filterAndSortImages: () => void;
   recomputeDerivedState: () => void;
@@ -912,7 +1025,19 @@ interface ImageState {
   // Selection Actions
   setPreviewImage: (image: IndexedImage | null) => void;
   setSelectedImage: (image: IndexedImage | null) => void;
-  setActiveImageScope: (images: IndexedImage[] | null) => void;
+  setActiveImageScope: (scope: ImageScope | null) => void;
+  setExploreDimension: (dimension: ExploreDimension) => void;
+  /** Clears the active scope (with a toast) when its target no longer exists. */
+  validateActiveImageScope: () => void;
+  /** filteredImages intersected with the active scope (or filteredImages when no scope). */
+  getScopedFilteredImages: () => IndexedImage[];
+  /**
+   * Cards eligible for a new visual query before any prior semantic/text result
+   * is applied. Includes every grid scope/filter, including node and active scope.
+   */
+  getSemanticSearchScopeSnapshot: () => SemanticSearchScopeSnapshot;
+  /** Folder/directory scope used to calibrate text search before facet filters. */
+  getSemanticTextQueryScopeSnapshot: () => SemanticSearchScopeSnapshot;
   loadCollections: () => Promise<void>;
   loadAutomationRules: () => Promise<void>;
   createCollection: (collection: Omit<SmartCollection, 'id' | 'imageCount' | 'createdAt' | 'updatedAt'> & { id?: string }) => Promise<SmartCollection>;
@@ -970,6 +1095,7 @@ interface ImageState {
 
   // Annotations Actions
   loadAnnotations: () => Promise<void>;
+  hydrateAnnotationsForImages: (images: IndexedImage[]) => Promise<void>;
   toggleFavorite: (imageId: string) => Promise<void>;
   bulkToggleFavorite: (imageIds: string[], isFavorite: boolean) => Promise<void>;
   addTagToImage: (imageId: string, tag: string) => Promise<void>;
@@ -981,6 +1107,7 @@ interface ImageState {
   clearTag: (tag: string) => Promise<void>;
   deleteTag: (tag: string) => Promise<void>;
   purgeTag: (tag: string) => Promise<void>;
+  setSelectedNodes: (nodes: string[]) => void;
   setSelectedTags: (tags: string[]) => void;
   setExcludedTags: (tags: string[]) => void;
   setSelectedTagsMatchMode: (mode: TagMatchMode) => void;
@@ -1032,17 +1159,16 @@ export const useImageStore = create<ImageState>((set, get) => {
     const FORCE_FLUSH_PENDING_IMAGES_THRESHOLD = 2400;
     let pendingMergeQueue: IndexedImage[] = [];
     let pendingMergeTimer: ReturnType<typeof setTimeout> | null = null;
-    let pendingFilterRecomputeTimer: ReturnType<typeof setTimeout> | null = null;
     const MERGE_FLUSH_INTERVAL_MS = 250;
     const MERGE_FLUSH_INTERVAL_INDEXING_MS = 3000;
     const MERGE_FLUSH_INTERVAL_INDEXING_LARGE_MS = 15000;
     const MERGE_FLUSH_LARGE_THRESHOLD = 8000;
-    const FILTER_RECOMPUTE_INDEXING_MS = 5000;
     let searchWorker: Worker | null = null;
     let searchDatasetVersion = 0;
     let searchDatasetSourceImages: IndexedImage[] | null = null;
     let searchWorkerSyncedDatasetVersion = -1;
     let latestSearchCriteriaKey = '';
+    let stableUserDataUnsubscribe: (() => void) | null = null;
 
     const clearPendingQueue = () => {
         pendingImagesQueue = [];
@@ -1054,10 +1180,6 @@ export const useImageStore = create<ImageState>((set, get) => {
         if (pendingMergeTimer) {
             clearTimeout(pendingMergeTimer);
             pendingMergeTimer = null;
-        }
-        if (pendingFilterRecomputeTimer) {
-            clearTimeout(pendingFilterRecomputeTimer);
-            pendingFilterRecomputeTimer = null;
         }
     };
 
@@ -1144,18 +1266,23 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return state;
             }
             addedImages = uniqueNewImages;
-            const allImages = [...state.images, ...uniqueNewImages];
-            return _updateState(state, allImages);
+            return _updateStateIncremental(state, { added: uniqueNewImages });
         });
 
         // Import tags from metadata only after annotations are available.
         if (addedImages.length > 0) {
             if (get().isAnnotationsLoaded) {
-                void get().importMetadataTags(addedImages);
+                void get().hydrateAnnotationsForImages(addedImages)
+                    .then(() => get().importMetadataTags(addedImages));
             } else {
                 queueMetadataTagImports(addedImages);
             }
-            maybeQueueLineageBuild(700);
+            // Longer debounce here specifically: this path also carries the
+            // auto-watch drip-add flow, where images can land one at a time a
+            // few seconds apart. A longer window gives back-to-back generations
+            // a real chance to coalesce into a single lineage rebuild instead of
+            // paying a full images.map() + worker spawn per file.
+            maybeQueueLineageBuild(2500);
         }
 
         traceCacheDebug('store:flushPendingImages', () => ({
@@ -1181,7 +1308,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         }, FLUSH_INTERVAL_MS);
     };
 
-    const flushPendingMerges = (forceFullRecompute: boolean = false) => {
+    const flushPendingMerges = () => {
         if (pendingMergeQueue.length === 0) {
             return;
         }
@@ -1215,53 +1342,17 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return state;
             }
 
-            let hasChanges = false;
-            const merged = state.images.map(img => {
-                const updated = updates.get(img.id);
-                if (updated) {
-                    hasChanges = true;
-                    return updated;
-                }
-                return img;
-            });
-
-            if (!hasChanges) {
+            const hasAnyMatch = state.images.some(img => updates.has(img.id));
+            if (!hasAnyMatch) {
                 return state;
             }
 
-            const isIndexing = state.indexingState === 'indexing';
-            if (isIndexing && !forceFullRecompute) {
-                const filtersActive = isFilteringActive(state);
-                let nextFilteredImages = state.filteredImages;
-
-                if (!filtersActive) {
-                    nextFilteredImages = merged;
-                } else {
-                    nextFilteredImages = state.filteredImages.map(img => updates.get(img.id) ?? img);
-                    scheduleFilterRecompute();
-                }
-
-                const derivedFacets = recalculateAvailableFilters(getLibraryScopedImages({
-                    ...state,
-                    images: merged,
-                }));
-
-                return {
-                    ...state,
-                    images: merged,
-                    filteredImages: nextFilteredImages,
-                    selectionTotalImages: merged.length,
-                    selectionDirectoryCount: state.directories.length,
-                    lineageBuildState: markLineageBuildStateDirty(state.lineageBuildState),
-                    ...derivedFacets,
-                };
-            }
-
-            return _updateState(state, merged);
+            return _updateStateIncremental(state, { updated: Array.from(updates.values()) });
         });
 
         if (get().isAnnotationsLoaded) {
-            void get().importMetadataTags(updatesToMerge);
+            void get().hydrateAnnotationsForImages(updatesToMerge)
+                .then(() => get().importMetadataTags(updatesToMerge));
         }
         maybeQueueLineageBuild(700);
 
@@ -1269,7 +1360,7 @@ export const useImageStore = create<ImageState>((set, get) => {
             batchCount: updatesToMerge.length,
             details: {
                 remainingQueue: pendingMergeQueue.length,
-                forceFullRecompute,
+                incremental: true,
             },
             snapshot: createCacheDebugSnapshot(get()),
         }));
@@ -1288,26 +1379,6 @@ export const useImageStore = create<ImageState>((set, get) => {
         pendingMergeTimer = setTimeout(() => {
             flushPendingMerges();
         }, interval);
-    };
-
-    const isFilteringActive = (state: ImageState) => {
-        if (state.searchQuery) return true;
-        if (state.favoriteFilterMode !== 'neutral') return true;
-        if (state.selectedRatings?.length) return true;
-        if (state.selectedTags?.length) return true;
-        if (state.excludedTags?.length) return true;
-        if (state.selectedAutoTags?.length) return true;
-        if (state.excludedAutoTags?.length) return true;
-        if (state.selectedModels?.length || state.excludedModels?.length) return true;
-        if (state.selectedLoras?.length || state.excludedLoras?.length) return true;
-        if (state.selectedSamplers?.length || state.excludedSamplers?.length) return true;
-        if (state.selectedSchedulers?.length || state.excludedSchedulers?.length) return true;
-        if (state.selectedGenerators?.length || state.excludedGenerators?.length) return true;
-        if (state.selectedGpuDevices?.length || state.excludedGpuDevices?.length) return true;
-        if (state.advancedFilters && Object.keys(state.advancedFilters).length > 0) return true;
-        if (state.selectedFolders && state.selectedFolders.size > 0) return true;
-        if (state.directories.some(dir => dir.visible === false)) return true;
-        return false;
     };
 
     const buildSearchWorkerDataset = (state: ImageState): SearchWorkerImage[] => {
@@ -1393,6 +1464,11 @@ export const useImageStore = create<ImageState>((set, get) => {
             if (payload.criteriaKey !== buildSearchCriteriaKey(currentState)) {
                 return;
             }
+            // A visual search became active while this text query was in flight;
+            // its ranking owns filteredImages now, so drop the stale result.
+            if (currentState.semanticResult) {
+                return;
+            }
 
             // Optimization: Replaced `new Map(currentState.images.map(...))` with a `for` loop
             // to eliminate the O(N) allocation of an intermediate tuple array `[[id, image], ...]`.
@@ -1428,6 +1504,13 @@ export const useImageStore = create<ImageState>((set, get) => {
     };
 
     const runAsyncSearchRecompute = (state: ImageState) => {
+        // The search worker only understands the text/facet predicates; a visual
+        // search is ranked synchronously by filterAndSort. Routing through the
+        // worker here would clobber the relevance order with a text-only result.
+        if (state.semanticResult) {
+            set(prev => ({ ...prev, ...filterAndSort(state) }));
+            return;
+        }
         const worker = ensureSearchWorker();
         const datasetVersion = getSearchDatasetVersion(state);
         const criteria = buildSearchWorkerCriteria(state);
@@ -1455,23 +1538,6 @@ export const useImageStore = create<ImageState>((set, get) => {
                 criteria,
             },
         });
-    };
-
-    const scheduleFilterRecompute = () => {
-        if (pendingFilterRecomputeTimer) {
-            return;
-        }
-        pendingFilterRecomputeTimer = setTimeout(() => {
-            pendingFilterRecomputeTimer = null;
-            set(state => {
-                if (state.searchQuery) {
-                    runAsyncSearchRecompute(state);
-                    return state;
-                }
-                const filteredResult = filterAndSort(state);
-                return { ...state, ...filteredResult };
-            });
-        }, FILTER_RECOMPUTE_INDEXING_MS);
     };
 
     const getImageById = (state: ImageState, imageId: string): IndexedImage | undefined => {
@@ -1556,12 +1622,13 @@ export const useImageStore = create<ImageState>((set, get) => {
             }
 
             annotationsToPersist = result.updatedAnnotations;
-            rule.actions.addTags.forEach((tag) => {
-                const normalized = normalizeTagName(tag);
+            const addTags = rule.actions.addTags;
+            for (let i = 0; i < addTags.length; i++) {
+                const normalized = normalizeTagName(addTags[i]);
                 if (normalized) {
                     tagCatalogUpdates.add(normalized);
                 }
-            });
+            }
 
             const collectionAddMap = result.collectionImageAdds;
             collectionsToPersist = [];
@@ -1605,14 +1672,26 @@ export const useImageStore = create<ImageState>((set, get) => {
             return { ...newState, ...filterAndSort(newState) };
         });
 
+        let annotationPersistenceFailed = false;
         await Promise.all([
-            annotationsToPersist.length > 0 ? bulkSaveAnnotations(annotationsToPersist) : Promise.resolve(),
+            annotationsToPersist.length > 0
+                ? persistAnnotationSnapshots(annotationsToPersist)
+                : Promise.resolve(),
             ...Array.from(tagCatalogUpdates).map((tagName) => ensureManualTagExists(tagName)),
             ...collectionsToPersist.map((collection) => saveSmartCollection(collection)),
             updatedRule ? saveAutomationRule(updatedRule) : Promise.resolve(),
         ]).catch(error => {
             console.error('Failed to apply automation rule:', error);
+            annotationPersistenceFailed = annotationsToPersist.length > 0;
         });
+
+        if (annotationPersistenceFailed) {
+            await get().hydrateAnnotationsForImages(
+                annotationsToPersist
+                    .map((annotation) => getImageById(get(), annotation.imageId))
+                    .filter((image): image is IndexedImage => Boolean(image)),
+            );
+        }
 
         if (annotationsToPersist.length > 0 || tagCatalogUpdates.size > 0) {
             await get().refreshAvailableTags();
@@ -1646,17 +1725,61 @@ export const useImageStore = create<ImageState>((set, get) => {
         return buildLineageLibrarySignature(signatures, state.scanSubfolders);
     };
 
-    const persistLineageSnapshot = async (
-        snapshot: LineageRegistrySnapshot,
-        state: ImageState
-    ): Promise<void> => {
-        const directoryPaths = state.directories.map(directory => directory.path);
-        if (!snapshot.librarySignature || directoryPaths.length === 0) {
+    // Writing the snapshot ships the whole registry (one entry per image) across
+    // the Electron IPC boundary and rewrites the file. Measured at ~3s for a
+    // 17k-image library — and a single delete triggers two rebuilds (the local
+    // delete and the watcher echo), so it cost ~6-7s of frozen UI per deleted
+    // file. It's a disk cache that only has to be correct by the time the app is
+    // next opened, so it must never sit on the interactive path: coalesce to the
+    // newest snapshot and write it once the burst settles.
+    const LINEAGE_PERSIST_DEBOUNCE_MS = 5000;
+    let pendingLineagePersist: { snapshot: LineageRegistrySnapshot; state: ImageState } | null = null;
+    let lineagePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const writePendingLineageSnapshot = async (): Promise<void> => {
+        lineagePersistTimer = null;
+        const pending = pendingLineagePersist;
+        pendingLineagePersist = null;
+        if (!pending) {
             return;
         }
 
-        await saveLineageRegistrySnapshot(directoryPaths, state.scanSubfolders, snapshot);
+        const directoryPaths = pending.state.directories.map(directory => directory.path);
+        if (!pending.snapshot.librarySignature || directoryPaths.length === 0) {
+            return;
+        }
+
+        await saveLineageRegistrySnapshot(directoryPaths, pending.state.scanSubfolders, pending.snapshot);
     };
+
+    const persistLineageSnapshot = (
+        snapshot: LineageRegistrySnapshot,
+        state: ImageState
+    ): void => {
+        // Newest snapshot wins: an older one is always superseded by it.
+        pendingLineagePersist = { snapshot, state };
+        if (lineagePersistTimer !== null) {
+            clearTimeout(lineagePersistTimer);
+        }
+        lineagePersistTimer = setTimeout(() => {
+            void writePendingLineageSnapshot();
+        }, LINEAGE_PERSIST_DEBOUNCE_MS);
+    };
+
+    const flushPendingLineagePersist = (): void => {
+        if (lineagePersistTimer !== null) {
+            clearTimeout(lineagePersistTimer);
+            lineagePersistTimer = null;
+        }
+        void writePendingLineageSnapshot();
+    };
+
+    // Best-effort flush so a quit inside the debounce window doesn't drop the
+    // snapshot. Losing it is not a correctness problem — loadLineageRegistrySnapshot
+    // validates by librarySignature and a miss just costs one rebuild at startup.
+    if (typeof window !== 'undefined') {
+        window.addEventListener('beforeunload', flushPendingLineagePersist);
+    }
 
     const scheduleLineageBuildInternal = (delayMs: number = 600) => {
         if (typeof Worker === 'undefined') {
@@ -1795,7 +1918,8 @@ export const useImageStore = create<ImageState>((set, get) => {
                         },
                     }));
 
-                    void persistLineageSnapshot(payload.snapshot, get());
+                    // Debounced + coalesced: no longer on the interactive path.
+                    persistLineageSnapshot(payload.snapshot, get());
                     break;
 
                 case 'error':
@@ -1838,21 +1962,28 @@ export const useImageStore = create<ImageState>((set, get) => {
         const samplerFacetCounts = new Map<string, number>();
         const schedulerFacetCounts = new Map<string, number>();
 
-        for (const image of visibleImages) {
-            image.models?.forEach(model => {
-                const normalized = normalizeFacetValue(model);
-                if (normalized) {
-                    models.add(normalized);
-                    modelFacetCounts.set(normalized, (modelFacetCounts.get(normalized) ?? 0) + 1);
+        for (let i = 0; i < visibleImages.length; i++) {
+            const image = visibleImages[i];
+            const imageModels = image.models;
+            if (imageModels) {
+                for (let j = 0; j < imageModels.length; j++) {
+                    const normalized = normalizeFacetValue(imageModels[j]);
+                    if (normalized) {
+                        models.add(normalized);
+                        modelFacetCounts.set(normalized, (modelFacetCounts.get(normalized) ?? 0) + 1);
+                    }
                 }
-            });
-            image.loras?.forEach(lora => {
-                const normalized = normalizeFacetValue(lora);
-                if (normalized) {
-                    loras.add(normalized);
-                    loraFacetCounts.set(normalized, (loraFacetCounts.get(normalized) ?? 0) + 1);
+            }
+            const imageLoras = image.loras;
+            if (imageLoras) {
+                for (let j = 0; j < imageLoras.length; j++) {
+                    const normalized = normalizeFacetValue(imageLoras[j]);
+                    if (normalized) {
+                        loras.add(normalized);
+                        loraFacetCounts.set(normalized, (loraFacetCounts.get(normalized) ?? 0) + 1);
+                    }
                 }
-            });
+            }
             const sampler = normalizeFacetValue(image.sampler);
             if (sampler) {
                 samplers.add(sampler);
@@ -1872,7 +2003,7 @@ export const useImageStore = create<ImageState>((set, get) => {
 
         // Case-insensitive alphabetical comparator
         const caseInsensitiveSort = (a: string, b: string) => {
-            return a.localeCompare(b, undefined, { sensitivity: 'accent' });
+            return accentCollator.compare(a, b);
         };
 
         return {
@@ -1933,10 +2064,11 @@ export const useImageStore = create<ImageState>((set, get) => {
         }
 
         const directoryPathMap = new Map<string, string>();
-        directories.forEach(dir => {
+        for (let i = 0; i < directories.length; i++) {
+            const dir = directories[i];
             const normalized = normalizePath(dir.path);
             directoryPathMap.set(dir.id, normalized);
-        });
+        }
 
         const normalizedExcludedFolders: string[] = [];
         if (excludedFolders && excludedFolders.size > 0) {
@@ -1954,6 +2086,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         const hasSelectedFolders = normalizedSelectedFolders.length > 0;
         const selectedFoldersSet = new Set(normalizedSelectedFolders);
         const sensitiveTagSet = getHiddenSensitiveTagSet();
+        const hasExcludedFolders = normalizedExcludedFolders.length > 0;
 
         return images.filter((img) => {
             if (!visibleDirectoryIds.has(img.directoryId || '')) {
@@ -1965,9 +2098,14 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return false;
             }
 
-            const folderPath = normalizePath(getImageFolderPath(img, parentPath));
+            // Short-circuit: if no folder filters are active, skip path calculations
+            if (!hasExcludedFolders && !hasSelectedFolders) {
+                return isVisibleWithSafeMode(img, sensitiveTagSet);
+            }
 
-            if (normalizedExcludedFolders.length > 0) {
+            const folderPath = getImageFolderPath(img, parentPath);
+
+            if (hasExcludedFolders) {
                 for (let i = 0; i < normalizedExcludedFolders.length; i++) {
                     const normalizedExcluded = normalizedExcludedFolders[i];
                     if (folderPath === normalizedExcluded ||
@@ -2007,7 +2145,7 @@ export const useImageStore = create<ImageState>((set, get) => {
             if (annotation) {
                 // Check if annotation values are different from current image values
                 const isFavoriteChanged = img.isFavorite !== annotation.isFavorite;
-                const tagsChanged = JSON.stringify(img.tags || []) !== JSON.stringify(annotation.tags);
+                const tagsChanged = !areTagsEqual(img.tags, annotation.tags);
                 const ratingChanged = img.rating !== annotation.rating;
 
                 if (isFavoriteChanged || tagsChanged || ratingChanged) {
@@ -2027,8 +2165,572 @@ export const useImageStore = create<ImageState>((set, get) => {
         return hasChanges ? result : images;
     };
 
+    // --- Compile a single-image filter predicate from current state ---
+    // Precomputes all state-dependent values once, returns a function that
+    // checks one image against every active filter (scope + favorites + tags +
+    // search + facets + advanced). Same logic as filterAndSort's filter chain
+    // but without creating intermediate arrays.
+    const compileImageFilter = (state: ImageState): ((img: IndexedImage) => boolean) => {
+        const { directories, selectedFolders, excludedFolders, includeSubfolders } = state;
+
+        const visibleDirectoryIds = new Set<string>();
+        for (const dir of directories) {
+            if (dir.visible ?? true) visibleDirectoryIds.add(dir.id);
+        }
+        const directoryPathMap = new Map<string, string>();
+        for (const dir of directories) {
+            directoryPathMap.set(dir.id, normalizePath(dir.path));
+        }
+        const normalizedExcludedFolders: string[] = [];
+        if (excludedFolders?.size) {
+            for (const f of excludedFolders) normalizedExcludedFolders.push(normalizePath(f));
+        }
+        const normalizedSelectedFolders: string[] = [];
+        if (selectedFolders?.size) {
+            for (const f of selectedFolders) normalizedSelectedFolders.push(normalizePath(f));
+        }
+        const hasSelectedFolders = normalizedSelectedFolders.length > 0;
+        const selectedFoldersSet = new Set(normalizedSelectedFolders);
+        const hasExcludedFolders = normalizedExcludedFolders.length > 0;
+        const sensitiveTagSet = getHiddenSensitiveTagSet();
+
+        const {
+            searchQuery,
+            selectedModels,
+            selectedLoras,
+            selectedSamplers,
+            selectedSchedulers,
+            selectedGenerators,
+            selectedGpuDevices,
+            advancedFilters,
+            favoriteFilterMode,
+            selectedRatings,
+            selectedTags,
+            excludedTags,
+            selectedTagsMatchMode,
+            selectedAutoTags,
+            excludedAutoTags,
+        } = state;
+
+        // A visual search replaces the text predicate rather than layering on
+        // top of it: the query means "images that look like this", so matching
+        // the same words in the prompt is a different question.
+        const semanticScores = state.semanticResult?.scoreById ?? null;
+        const searchTerms = searchQuery && !semanticScores
+            ? searchQuery.toLowerCase().split(/\s+/).filter(Boolean)
+            : [];
+        const ratingsSet = selectedRatings?.length ? new Set(selectedRatings) : null;
+
+        return (img: IndexedImage): boolean => {
+            // --- Library scope ---
+            if (!visibleDirectoryIds.has(img.directoryId || '')) return false;
+            const parentPath = directoryPathMap.get(img.directoryId || '');
+            if (!parentPath) return false;
+            if (hasExcludedFolders || hasSelectedFolders) {
+                const folderPath = getImageFolderPath(img, parentPath);
+                if (hasExcludedFolders) {
+                    for (const ef of normalizedExcludedFolders) {
+                        if (folderPath === ef || folderPath.startsWith(ef + '/') || folderPath.startsWith(ef + '\\')) return false;
+                    }
+                }
+                if (hasSelectedFolders) {
+                    let inSelected = selectedFoldersSet.has(folderPath);
+                    if (!inSelected && includeSubfolders) {
+                        for (const sf of normalizedSelectedFolders) {
+                            if (folderPath.startsWith(sf + '/') || folderPath.startsWith(sf + '\\')) { inSelected = true; break; }
+                        }
+                    }
+                    if (!inSelected) return false;
+                }
+            }
+            if (!isVisibleWithSafeMode(img, sensitiveTagSet)) return false;
+
+            // --- Favorites ---
+            if (favoriteFilterMode === 'include' && img.isFavorite !== true) return false;
+            if (favoriteFilterMode === 'exclude' && img.isFavorite === true) return false;
+
+            // --- Ratings ---
+            if (ratingsSet && (img.rating === undefined || !ratingsSet.has(img.rating))) return false;
+
+            // --- Tags ---
+            if (selectedTags?.length) {
+                if (!img.tags?.length) return false;
+                if (selectedTagsMatchMode === 'all') {
+                    if (!selectedTags.every(tag => img.tags!.includes(tag))) return false;
+                } else {
+                    if (!selectedTags.some(tag => img.tags!.includes(tag))) return false;
+                }
+            }
+            if (excludedTags?.length && img.tags?.length) {
+                if (excludedTags.some(tag => img.tags!.includes(tag))) return false;
+            }
+
+            // --- Auto-tags ---
+            if (selectedAutoTags?.length) {
+                if (!img.autoTags?.length) return false;
+                if (!selectedAutoTags.some(tag => img.autoTags!.includes(tag))) return false;
+            }
+            if (excludedAutoTags?.length && img.autoTags?.length) {
+                if (excludedAutoTags.some(tag => img.autoTags!.includes(tag))) return false;
+            }
+
+            // --- Search ---
+            if (searchTerms.length > 0) {
+                const catalogText = buildCatalogSearchText(img);
+                const catalogMatch = searchTerms.every(term => catalogText.includes(term));
+                if (!catalogMatch) {
+                    const enrichedText = buildCompactSearchText(img);
+                    if (!enrichedText || !searchTerms.every(term => enrichedText.includes(term))) return false;
+                }
+            }
+
+            // --- Visual search ---
+            // An image with no score was not ranked: either it has no vector
+            // yet, or it fell below the relevance floor.
+            if (semanticScores && !semanticScores.has(img.id)) return false;
+
+            // --- Facet filters ---
+            if (selectedModels.length > 0) {
+                if (!img.models?.length || !selectedModels.some(sm => img.models.includes(sm))) return false;
+            }
+            if (state.excludedModels.length > 0) {
+                if (img.models?.length && state.excludedModels.some(sm => img.models.includes(sm))) return false;
+            }
+            if (selectedLoras.length > 0) {
+                if (!img.loras?.length) return false;
+                const loraNames = img.loras
+                    .map(lora => normalizeLoraName(typeof lora === 'string' ? lora : lora))
+                    .filter((l): l is string => Boolean(l));
+                if (!selectedLoras.some(sl => loraNames.includes(sl))) return false;
+            }
+            if (state.excludedLoras.length > 0 && img.loras?.length) {
+                const loraNames = img.loras
+                    .map(lora => normalizeLoraName(typeof lora === 'string' ? lora : lora))
+                    .filter((l): l is string => Boolean(l));
+                if (state.excludedLoras.some(sl => loraNames.includes(sl))) return false;
+            }
+            if (selectedSamplers.length > 0) {
+                if (!img.sampler || !selectedSamplers.includes(img.sampler)) return false;
+            }
+            if (state.excludedSamplers.length > 0) {
+                if (img.sampler && state.excludedSamplers.includes(img.sampler)) return false;
+            }
+            if (selectedSchedulers.length > 0) {
+                if (!selectedSchedulers.includes(img.scheduler)) return false;
+            }
+            if (state.excludedSchedulers.length > 0) {
+                if (state.excludedSchedulers.includes(img.scheduler)) return false;
+            }
+            if (selectedGenerators.length > 0) {
+                if (!selectedGenerators.includes(getImageGenerator(img))) return false;
+            }
+            if (state.excludedGenerators.length > 0) {
+                if (state.excludedGenerators.includes(getImageGenerator(img))) return false;
+            }
+            if (selectedGpuDevices.length > 0) {
+                const gpuDevice = getImageGpuDevice(img);
+                if (gpuDevice === null || !selectedGpuDevices.includes(gpuDevice)) return false;
+            }
+            if (state.excludedGpuDevices.length > 0) {
+                const gpuDevice = getImageGpuDevice(img);
+                if (gpuDevice !== null && state.excludedGpuDevices.includes(gpuDevice)) return false;
+            }
+
+            // --- Advanced filters ---
+            if (advancedFilters) {
+                if (advancedFilters.dimension) {
+                    if (!img.dimensions) return false;
+                    if (img.dimensions.replace(/\s+/g, '') !== advancedFilters.dimension.replace(/\s+/g, '')) return false;
+                }
+                if (advancedFilters.steps) {
+                    const steps = img.steps;
+                    if (steps === null || steps === undefined) return false;
+                    const hasMin = advancedFilters.steps.min !== null && advancedFilters.steps.min !== undefined;
+                    const hasMax = advancedFilters.steps.max !== null && advancedFilters.steps.max !== undefined;
+                    if (hasMin && steps < advancedFilters.steps.min) return false;
+                    if (hasMax && steps > advancedFilters.steps.max) return false;
+                }
+                if (advancedFilters.cfg) {
+                    const cfg = img.cfgScale;
+                    if (cfg === null || cfg === undefined) return false;
+                    const hasMin = advancedFilters.cfg.min !== null && advancedFilters.cfg.min !== undefined;
+                    const hasMax = advancedFilters.cfg.max !== null && advancedFilters.cfg.max !== undefined;
+                    if (hasMin && cfg < advancedFilters.cfg.min) return false;
+                    if (hasMax && cfg > advancedFilters.cfg.max) return false;
+                }
+                if (advancedFilters.date && (advancedFilters.date.from || advancedFilters.date.to)) {
+                    const imageTime = img.lastModified;
+                    if (advancedFilters.date.from) {
+                        if (imageTime < parseLocalDateFilterStart(advancedFilters.date.from)) return false;
+                    }
+                    if (advancedFilters.date.to) {
+                        if (imageTime >= parseLocalDateFilterEndExclusive(advancedFilters.date.to)) return false;
+                    }
+                }
+                if (Array.isArray(advancedFilters.generationModes) && advancedFilters.generationModes.length > 0) {
+                    const normalizedMetadata = img.metadata?.normalizedMetadata;
+                    const explicitGenerationType = normalizedMetadata?.generationType;
+                    if (explicitGenerationType === 'txt2img' || explicitGenerationType === 'img2img') {
+                        if (!advancedFilters.generationModes.includes(explicitGenerationType)) return false;
+                    } else {
+                        const mediaType = normalizedMetadata?.media_type ?? resolveMediaType(img.name, img.fileType);
+                        const isGeneratedImageCandidate = mediaType === 'image';
+                        if (!isGeneratedImageCandidate || !advancedFilters.generationModes.includes('txt2img')) return false;
+                    }
+                }
+                if (Array.isArray(advancedFilters.mediaTypes) && advancedFilters.mediaTypes.length > 0) {
+                    const metadataMediaType = img.metadata?.normalizedMetadata?.media_type;
+                    const inferredMediaType = resolveMediaType(img.name, img.fileType);
+                    const resolvedMediaType =
+                        metadataMediaType === 'video' || metadataMediaType === 'audio' || metadataMediaType === 'model3d' || metadataMediaType === 'image'
+                            ? metadataMediaType
+                            : inferredMediaType === 'video' || inferredMediaType === 'audio' || inferredMediaType === 'model3d'
+                                ? inferredMediaType
+                                : 'image';
+                    if (!advancedFilters.mediaTypes.includes(resolvedMediaType)) return false;
+                }
+                if (advancedFilters.telemetryState === 'present' && !hasTelemetryData(img)) return false;
+                if (advancedFilters.telemetryState === 'missing' && hasTelemetryData(img)) return false;
+                if (advancedFilters.hasVerifiedTelemetry === true && !hasVerifiedTelemetry(img)) return false;
+                if (advancedFilters.generationTimeMs) {
+                    const generationTimeMs =
+                        img.metadata?.normalizedMetadata?.analytics?.generation_time_ms ??
+                        (img.metadata?.normalizedMetadata as { _analytics?: { generation_time_ms?: number } } | undefined)?._analytics?.generation_time_ms;
+                    if (typeof generationTimeMs !== 'number') return false;
+                    const hasMin = advancedFilters.generationTimeMs.min !== null && advancedFilters.generationTimeMs.min !== undefined;
+                    const hasMax = advancedFilters.generationTimeMs.max !== null && advancedFilters.generationTimeMs.max !== undefined;
+                    if (hasMin && generationTimeMs < advancedFilters.generationTimeMs.min!) return false;
+                    if (hasMax && advancedFilters.generationTimeMs.maxExclusive === true && generationTimeMs >= advancedFilters.generationTimeMs.max!) return false;
+                    if (hasMax && advancedFilters.generationTimeMs.maxExclusive !== true && generationTimeMs > advancedFilters.generationTimeMs.max!) return false;
+                }
+                if (advancedFilters.stepsPerSecond) {
+                    const stepsPerSecond =
+                        img.metadata?.normalizedMetadata?.analytics?.steps_per_second ??
+                        (img.metadata?.normalizedMetadata as { _analytics?: { steps_per_second?: number } } | undefined)?._analytics?.steps_per_second;
+                    if (typeof stepsPerSecond !== 'number') return false;
+                    const hasMin = advancedFilters.stepsPerSecond.min !== null && advancedFilters.stepsPerSecond.min !== undefined;
+                    const hasMax = advancedFilters.stepsPerSecond.max !== null && advancedFilters.stepsPerSecond.max !== undefined;
+                    if (hasMin && stepsPerSecond < advancedFilters.stepsPerSecond.min!) return false;
+                    if (hasMax && advancedFilters.stepsPerSecond.maxExclusive === true && stepsPerSecond >= advancedFilters.stepsPerSecond.max!) return false;
+                    if (hasMax && advancedFilters.stepsPerSecond.maxExclusive !== true && stepsPerSecond > advancedFilters.stepsPerSecond.max!) return false;
+                }
+                if (advancedFilters.vramPeakMb) {
+                    const vramPeakMb =
+                        img.metadata?.normalizedMetadata?.analytics?.vram_peak_mb ??
+                        (img.metadata?.normalizedMetadata as { _analytics?: { vram_peak_mb?: number } } | undefined)?._analytics?.vram_peak_mb;
+                    if (typeof vramPeakMb !== 'number') return false;
+                    const hasMin = advancedFilters.vramPeakMb.min !== null && advancedFilters.vramPeakMb.min !== undefined;
+                    const hasMax = advancedFilters.vramPeakMb.max !== null && advancedFilters.vramPeakMb.max !== undefined;
+                    if (hasMin && vramPeakMb < advancedFilters.vramPeakMb.min!) return false;
+                    if (hasMax && advancedFilters.vramPeakMb.maxExclusive === true && vramPeakMb >= advancedFilters.vramPeakMb.max!) return false;
+                    if (hasMax && advancedFilters.vramPeakMb.maxExclusive !== true && vramPeakMb > advancedFilters.vramPeakMb.max!) return false;
+                }
+            }
+
+            return true;
+        };
+    };
+
+    // --- Sort comparator factory ---
+    const getActiveComparator = (
+        sortOrder: string,
+        randomSeed: number,
+        semanticScores?: Map<string, number> | null
+    ) => {
+        const compareById = (a: IndexedImage, b: IndexedImage) => accentCollator.compare(a.id, b.id);
+        const compareByNameAsc = (a: IndexedImage, b: IndexedImage) => {
+            const c = accentCollator.compare(a.name || '', b.name || '');
+            return c !== 0 ? c : compareById(a, b);
+        };
+
+        // Relevance reads a score map instead of a field, the same shape as the
+        // random order's derived key. It is a total order over the images the
+        // filter admits, because the visual-search predicate already rejects
+        // anything the ranker did not score.
+        if (sortOrder === 'relevance' && semanticScores) return (a: IndexedImage, b: IndexedImage) => {
+            const d = (semanticScores.get(b.id) ?? -1) - (semanticScores.get(a.id) ?? -1);
+            return d !== 0 ? d : compareById(a, b);
+        };
+
+        if (sortOrder === 'asc') return compareByNameAsc;
+        if (sortOrder === 'desc') return (a: IndexedImage, b: IndexedImage) => {
+            const c = accentCollator.compare(b.name || '', a.name || '');
+            return c !== 0 ? c : compareById(a, b);
+        };
+        if (sortOrder === 'date-asc') return (a: IndexedImage, b: IndexedImage) => {
+            const d = a.lastModified - b.lastModified;
+            return d !== 0 ? d : compareByNameAsc(a, b);
+        };
+        if (sortOrder === 'date-desc') return (a: IndexedImage, b: IndexedImage) => {
+            const d = b.lastModified - a.lastModified;
+            return d !== 0 ? d : compareByNameAsc(a, b);
+        };
+        if (sortOrder === 'random') {
+            const stringHash = (str: string) => {
+                let hash = 0;
+                for (let i = 0; i < str.length; i++) {
+                    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+                    hash = hash & hash;
+                }
+                return hash;
+            };
+            const seed = randomSeed || 0;
+            return (a: IndexedImage, b: IndexedImage) => {
+                const hA = stringHash(a.id + seed.toString());
+                const hB = stringHash(b.id + seed.toString());
+                return hA !== hB ? hA - hB : accentCollator.compare(a.id, b.id);
+            };
+        }
+        return compareById;
+    };
+
+    // --- Insert items into a sorted array ---
+    // Each splice is O(n), so per-item binary insert degrades to O(items * n).
+    // flushPendingImages can drain up to MAX_PENDING_IMAGES_PER_FLUSH (or the
+    // whole queue with drainAll) at once, so above a small batch size we sort
+    // the incoming items and do a single linear merge instead: O(n + m log m).
+    const BINARY_INSERT_MAX_ITEMS = 16;
+
+    const binaryInsertSorted = (
+        sorted: IndexedImage[],
+        items: IndexedImage[],
+        comparator: (a: IndexedImage, b: IndexedImage) => number,
+    ): IndexedImage[] => {
+        if (items.length === 0) return sorted;
+
+        if (items.length > BINARY_INSERT_MAX_ITEMS) {
+            const incoming = items.slice().sort(comparator);
+            const merged: IndexedImage[] = new Array(sorted.length + incoming.length);
+            let i = 0, j = 0, k = 0;
+            while (i < sorted.length && j < incoming.length) {
+                // `<= 0` keeps existing entries ahead of equal-comparing new
+                // ones, matching the upper-bound placement of the binary path.
+                merged[k++] = comparator(sorted[i], incoming[j]) <= 0 ? sorted[i++] : incoming[j++];
+            }
+            while (i < sorted.length) merged[k++] = sorted[i++];
+            while (j < incoming.length) merged[k++] = incoming[j++];
+            return merged;
+        }
+
+        const result = sorted.slice();
+        for (const item of items) {
+            let lo = 0, hi = result.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >>> 1;
+                if (comparator(result[mid], item) <= 0) lo = mid + 1;
+                else hi = mid;
+            }
+            result.splice(lo, 0, item);
+        }
+        return result;
+    };
+
+    // --- Sanitize + annotate a small batch of images ---
+    const processImageBatch = (batch: IndexedImage[], annotations: Map<string, ImageAnnotations>): IndexedImage[] =>
+        batch.map(img => {
+            let processed = sanitizeIndexedImageFacets(img);
+            const annotation = annotations.get(processed.id);
+            if (annotation) {
+                const isFavChanged = processed.isFavorite !== annotation.isFavorite;
+                const tagsChanged = !areTagsEqual(processed.tags, annotation.tags);
+                const ratingChanged = processed.rating !== annotation.rating;
+                if (isFavChanged || tagsChanged || ratingChanged) {
+                    processed = { ...processed, isFavorite: annotation.isFavorite, tags: annotation.tags, rating: annotation.rating };
+                }
+            }
+            return processed;
+        });
+
+    // --- Deferred reconciliation ---
+    const RECONCILIATION_DEBOUNCE_MS = 400;
+    // Hard cap on the debounce. Indexing flushes every FLUSH_INTERVAL_MS (100ms)
+    // and auto-watch bursts are similarly dense, so a pure debounce would be
+    // re-armed forever and never fire — leaving facet dropdowns and collection
+    // counts frozen for the whole run.
+    const RECONCILIATION_MAX_WAIT_MS = 2000;
+
+    let reconciliationTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconciliationFirstScheduledAt = 0;
+
+    const cancelDeferredReconciliation = () => {
+        if (reconciliationTimer !== null) {
+            clearTimeout(reconciliationTimer);
+            reconciliationTimer = null;
+        }
+        reconciliationFirstScheduledAt = 0;
+    };
+
+    const runDeferredReconciliation = () => {
+        reconciliationTimer = null;
+        reconciliationFirstScheduledAt = 0;
+
+        const state = useImageStore.getState();
+        const syncedCollections = syncCollectionCounts(state.collections, state.images);
+        const activeCollectionId = syncedCollections.some(c => c.id === state.activeCollectionId)
+            ? state.activeCollectionId
+            : null;
+
+        if (state.searchQuery) {
+            // Search-active recomputes are worker-offloaded everywhere else in
+            // this store (filterAndSortImages, setSearchQuery). Running
+            // filterAndSort here would rebuild the
+            // catalog/compact search text for the whole scoped library on the
+            // main thread — the exact freeze the incremental path avoids. The
+            // worker's completion handler writes filteredImages and facets.
+            useImageStore.setState({ collections: syncedCollections, activeCollectionId });
+            runAsyncSearchRecompute(useImageStore.getState());
+            return;
+        }
+
+        const fullResult = filterAndSort(state);
+
+        // Compare element-wise, not just by length: predicate drift between
+        // compileImageFilter and filterAndSort, or a misplaced binary insert,
+        // can diverge without changing the count. Every comparator ends in a
+        // compareById tie-break over unique ids, so a correct incremental
+        // result is reference-identical to the full one.
+        const nextFiltered = fullResult.filteredImages;
+        const prevFiltered = state.filteredImages;
+        let diverged = nextFiltered.length !== prevFiltered.length;
+        if (!diverged) {
+            for (let i = 0; i < nextFiltered.length; i++) {
+                if (nextFiltered[i] !== prevFiltered[i]) {
+                    diverged = true;
+                    break;
+                }
+            }
+        }
+
+        if (diverged && isPerformanceDiagnosticsEnabled()) {
+            recordPerformanceDuration('store.incremental-divergence', 0, {
+                incrementalCount: prevFiltered.length,
+                fullCount: nextFiltered.length,
+            });
+        }
+
+        useImageStore.setState({
+            ...(diverged ? { filteredImages: nextFiltered } : {}),
+            availableModels: fullResult.availableModels,
+            availableLoras: fullResult.availableLoras,
+            availableSamplers: fullResult.availableSamplers,
+            availableSchedulers: fullResult.availableSchedulers,
+            availableGenerators: fullResult.availableGenerators,
+            availableGpuDevices: fullResult.availableGpuDevices,
+            availableDimensions: fullResult.availableDimensions,
+            modelFacetCounts: fullResult.modelFacetCounts,
+            loraFacetCounts: fullResult.loraFacetCounts,
+            samplerFacetCounts: fullResult.samplerFacetCounts,
+            schedulerFacetCounts: fullResult.schedulerFacetCounts,
+            selectionTotalImages: fullResult.selectionTotalImages,
+            selectionDirectoryCount: fullResult.selectionDirectoryCount,
+            collections: syncedCollections,
+            activeCollectionId,
+        });
+    };
+
+    const scheduleDeferredReconciliation = () => {
+        const now = Date.now();
+        if (reconciliationFirstScheduledAt === 0) {
+            reconciliationFirstScheduledAt = now;
+        }
+        if (reconciliationTimer !== null) {
+            clearTimeout(reconciliationTimer);
+        }
+        const remainingMaxWait = RECONCILIATION_MAX_WAIT_MS - (now - reconciliationFirstScheduledAt);
+        const delay = Math.max(0, Math.min(RECONCILIATION_DEBOUNCE_MS, remainingMaxWait));
+        reconciliationTimer = setTimeout(runDeferredReconciliation, delay);
+    };
+
+    type IncrementalDelta = {
+        added?: IndexedImage[];
+        removed?: Set<string>;
+        updated?: IndexedImage[];
+    };
+
+    // --- Incremental state update (add/remove/merge only) ---
+    const _updateStateIncremental = (
+        currentState: ImageState,
+        delta: IncrementalDelta,
+    ): Partial<ImageState> => {
+        let images = currentState.images;
+        let filteredImages = currentState.filteredImages;
+        const comparator = getActiveComparator(
+            currentState.sortOrder,
+            currentState.randomSeed,
+            currentState.semanticResult?.scoreById ?? null
+        );
+        const accepts = compileImageFilter(currentState);
+
+        if (delta.removed && delta.removed.size > 0) {
+            const r = delta.removed;
+            images = images.filter(img => !r.has(img.id));
+            filteredImages = filteredImages.filter(img => !r.has(img.id));
+        }
+
+        if (delta.added && delta.added.length > 0) {
+            const processed = processImageBatch(delta.added, currentState.annotations);
+            images = [...images, ...processed];
+            const matching = processed.filter(accepts);
+            if (matching.length > 0) {
+                filteredImages = binaryInsertSorted(filteredImages, matching, comparator);
+            }
+        }
+
+        if (delta.updated && delta.updated.length > 0) {
+            const processed = processImageBatch(delta.updated, currentState.annotations);
+            const updatesMap = new Map<string, IndexedImage>();
+            for (const img of processed) updatesMap.set(img.id, img);
+
+            // Only images that actually replaced an existing entry should be
+            // reconsidered for filteredImages. An update whose id isn't in
+            // `images` (stale/removed id) or a duplicate id that got deduped
+            // by updatesMap must not still count as "matching" below — that
+            // used to insert phantom/duplicate rows into filteredImages.
+            const appliedUpdates: IndexedImage[] = [];
+            images = images.map(img => {
+                const updated = updatesMap.get(img.id);
+                if (updated) {
+                    appliedUpdates.push(updated);
+                    return updated;
+                }
+                return img;
+            });
+
+            if (appliedUpdates.length > 0) {
+                const appliedIds = new Set(appliedUpdates.map(img => img.id));
+                filteredImages = filteredImages.filter(img => !appliedIds.has(img.id));
+                const matching = appliedUpdates.filter(accepts);
+                if (matching.length > 0) {
+                    filteredImages = binaryInsertSorted(filteredImages, matching, comparator);
+                }
+            }
+        }
+
+        if (currentState.searchQuery) {
+            invalidateSearchWorkerDataset();
+        }
+
+        scheduleDeferredReconciliation();
+
+        return {
+            images,
+            filteredImages,
+            selectionTotalImages: images.length,
+            ...(images.length === 0
+                ? {
+                    lineageResolvedByImageId: {},
+                    lineageDerivedIdsBySourceId: {},
+                    lineageBuildState: { ...DEFAULT_LINEAGE_BUILD_STATE },
+                }
+                : {
+                    lineageBuildState: markLineageBuildStateDirty(currentState.lineageBuildState),
+                }),
+        };
+    };
+
     // --- Helper function for recalculating all derived state ---
     const _updateState = (currentState: ImageState, newImages: IndexedImage[]) => {
+        cancelDeferredReconciliation();
         const sanitizedImages = newImages.map(sanitizeIndexedImageFacets);
 
         // Apply annotations to new images
@@ -2165,7 +2867,10 @@ export const useImageStore = create<ImageState>((set, get) => {
             enrichedChars: 0,
             matchMs: 0,
         };
-        if (searchQuery) {
+        // Mirrors compileImageFilter: a visual query replaces the text predicate
+        // instead of being ANDed with it.
+        const semanticScores = state.semanticResult?.scoreById ?? null;
+        if (searchQuery && !semanticScores) {
             const searchTerms = searchQuery
                 .toLowerCase()
                 .split(/\s+/)
@@ -2216,6 +2921,10 @@ export const useImageStore = create<ImageState>((set, get) => {
                     return matched;
                 });
             }
+        }
+
+        if (semanticScores) {
+            results = results.filter(image => semanticScores.has(image.id));
         }
         closePhase('search');
 
@@ -2370,7 +3079,7 @@ export const useImageStore = create<ImageState>((set, get) => {
                     }
 
                     const mediaType = normalizedMetadata?.media_type ?? resolveMediaType(image.name, image.fileType);
-                    const isGeneratedImageCandidate = mediaType !== 'video' && mediaType !== 'audio';
+                    const isGeneratedImageCandidate = mediaType === 'image';
 
                     return isGeneratedImageCandidate && advancedFilters.generationModes.includes('txt2img');
                 });
@@ -2380,9 +3089,9 @@ export const useImageStore = create<ImageState>((set, get) => {
                     const metadataMediaType = image.metadata?.normalizedMetadata?.media_type;
                     const inferredMediaType = resolveMediaType(image.name, image.fileType);
                     const resolvedMediaType =
-                        metadataMediaType === 'video' || metadataMediaType === 'audio' || metadataMediaType === 'image'
+                        metadataMediaType === 'video' || metadataMediaType === 'audio' || metadataMediaType === 'model3d' || metadataMediaType === 'image'
                             ? metadataMediaType
-                            : inferredMediaType === 'video' || inferredMediaType === 'audio'
+                            : inferredMediaType === 'video' || inferredMediaType === 'audio' || inferredMediaType === 'model3d'
                                 ? inferredMediaType
                                 : 'image';
                     return advancedFilters.mediaTypes.includes(resolvedMediaType);
@@ -2451,16 +3160,16 @@ export const useImageStore = create<ImageState>((set, get) => {
         const totalInScope = images.length; // Total absoluto de imagens indexadas
         const selectionDirectoryCount = state.directories.length;
 
-        const compareById = (a: IndexedImage, b: IndexedImage) => a.id.localeCompare(b.id);
+        const compareById = (a: IndexedImage, b: IndexedImage) => accentCollator.compare(a.id, b.id);
         const compareByNameAsc = (a: IndexedImage, b: IndexedImage) => {
-            const nameComparison = (a.name || '').localeCompare(b.name || '');
+            const nameComparison = accentCollator.compare(a.name || '', b.name || '');
             if (nameComparison !== 0) {
                 return nameComparison;
             }
             return compareById(a, b);
         };
         const compareByNameDesc = (a: IndexedImage, b: IndexedImage) => {
-            const nameComparison = (b.name || '').localeCompare(a.name || '');
+            const nameComparison = accentCollator.compare(b.name || '', a.name || '');
             if (nameComparison !== 0) {
                 return nameComparison;
             }
@@ -2508,10 +3217,16 @@ export const useImageStore = create<ImageState>((set, get) => {
             if (hashA !== hashB) {
                 return hashA - hashB;
             }
-            return a.id.localeCompare(b.id);
+            return accentCollator.compare(a.id, b.id);
+        };
+
+        const compareByRelevance = (a: IndexedImage, b: IndexedImage) => {
+            const d = (semanticScores!.get(b.id) ?? -1) - (semanticScores!.get(a.id) ?? -1);
+            return d !== 0 ? d : compareById(a, b);
         };
 
         const sorted = [...results].sort((a, b) => {
+            if (sortOrder === 'relevance' && semanticScores) return compareByRelevance(a, b);
             if (sortOrder === 'asc') return compareByNameAsc(a, b);
             if (sortOrder === 'desc') return compareByNameDesc(a, b);
             if (sortOrder === 'date-asc') return compareByDateAsc(a, b);
@@ -2546,6 +3261,201 @@ export const useImageStore = create<ImageState>((set, get) => {
         };
     };
 
+    let semanticScopeCache: {
+        dependencies: readonly unknown[];
+        snapshot: SemanticSearchScopeSnapshot;
+    } | null = null;
+    let semanticTextQueryScopeCache: {
+        dependencies: readonly unknown[];
+        snapshot: SemanticSearchScopeSnapshot;
+    } | null = null;
+
+    const semanticTextQueryScopeDependencies = (state: ImageState): readonly unknown[] => {
+        const settings = useSettingsStore.getState();
+        return [
+            state.images,
+            state.directories,
+            state.selectedFolders,
+            state.excludedFolders,
+            state.includeSubfolders,
+            settings.enableSafeMode,
+            settings.blurSensitiveImages,
+            settings.sensitiveTags,
+        ];
+    };
+
+    const getSemanticTextQueryScopeSnapshot = (): SemanticSearchScopeSnapshot => {
+        const state = get();
+        const dependencies = semanticTextQueryScopeDependencies(state);
+        if (
+            semanticTextQueryScopeCache &&
+            semanticTextQueryScopeCache.dependencies.length === dependencies.length &&
+            semanticTextQueryScopeCache.dependencies.every(
+                (value, index) => Object.is(value, dependencies[index])
+            )
+        ) {
+            return semanticTextQueryScopeCache.snapshot;
+        }
+
+        const images = getLibraryScopedImages(state);
+        const snapshot: SemanticSearchScopeSnapshot = {
+            images,
+            imageIds: new Set(images.map((image) => image.id)),
+            revision: semanticSearchScopeRevision(images),
+        };
+        semanticTextQueryScopeCache = { dependencies, snapshot };
+        return snapshot;
+    };
+
+    const semanticScopeDependencies = (state: ImageState): readonly unknown[] => {
+        const settings = useSettingsStore.getState();
+        return [
+            state.images,
+            state.directories,
+            state.selectedFolders,
+            state.excludedFolders,
+            state.includeSubfolders,
+            state.favoriteFilterMode,
+            state.selectedRatings,
+            state.selectedTags,
+            state.excludedTags,
+            state.selectedTagsMatchMode,
+            state.selectedAutoTags,
+            state.excludedAutoTags,
+            state.selectedModels,
+            state.excludedModels,
+            state.selectedLoras,
+            state.excludedLoras,
+            state.selectedSamplers,
+            state.excludedSamplers,
+            state.selectedSchedulers,
+            state.excludedSchedulers,
+            state.selectedGenerators,
+            state.excludedGenerators,
+            state.selectedGpuDevices,
+            state.excludedGpuDevices,
+            state.advancedFilters,
+            state.selectedNodes,
+            state.activeImageScope,
+            state.clusters,
+            state.collections,
+            settings.enableSafeMode,
+            settings.blurSensitiveImages,
+            settings.sensitiveTags,
+        ];
+    };
+
+    const getSemanticSearchScopeSnapshot = (): SemanticSearchScopeSnapshot => {
+        const state = get();
+        const dependencies = semanticScopeDependencies(state);
+        if (
+            semanticScopeCache &&
+            semanticScopeCache.dependencies.length === dependencies.length &&
+            semanticScopeCache.dependencies.every((value, index) => Object.is(value, dependencies[index]))
+        ) {
+            return semanticScopeCache.snapshot;
+        }
+
+        // A visual query replaces ordinary text search and must never narrow
+        // itself to the previous semantic result. Every other grid filter stays.
+        const baseState: ImageState = {
+            ...state,
+            searchQuery: '',
+            semanticResult: null,
+        };
+        const matchesBaseFilters = compileImageFilter(baseState);
+        const baseFilteredImages = baseState.images.filter(matchesBaseFilters);
+        const images = resolveDisplayedImages({
+            ...baseState,
+            filteredImages: baseFilteredImages,
+        });
+        const snapshot: SemanticSearchScopeSnapshot = {
+            images,
+            imageIds: new Set(images.map((image) => image.id)),
+            revision: semanticSearchScopeRevision(images),
+        };
+        semanticScopeCache = { dependencies, snapshot };
+        return snapshot;
+    };
+
+    const applyConfirmedAnnotations = (confirmed: ImageAnnotations[]) => {
+        if (confirmed.length === 0) return;
+        set(state => {
+            const annotations = new Map(state.annotations);
+            for (const annotation of confirmed) annotations.set(annotation.imageId, annotation);
+            const images = applyAnnotationsToImages(state.images, annotations);
+            const newState = { ...state, annotations, images };
+            return { ...newState, ...filterAndSort(newState) };
+        });
+    };
+
+    const persistAnnotationPatchBatch = async (
+        updates: Array<{ imageId: string; patch: UserDataSemanticPatch }>,
+    ): Promise<ImageAnnotations[]> => {
+        const outcomes = await Promise.allSettled(
+            updates.map(({ imageId, patch }) => patchAnnotation(imageId, patch)),
+        );
+        const confirmed = outcomes
+            .filter((outcome): outcome is PromiseFulfilledResult<ImageAnnotations | null> => outcome.status === 'fulfilled')
+            .map((outcome) => outcome.value)
+            .filter((annotation): annotation is ImageAnnotations => Boolean(annotation));
+        applyConfirmedAnnotations(confirmed);
+        const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+        if (failures.length > 0) {
+            throw new AggregateError(
+                failures.map((failure) => failure.reason),
+                `${failures.length} annotation update${failures.length === 1 ? '' : 's'} failed.`,
+            );
+        }
+        return confirmed;
+    };
+
+    const persistAnnotationSnapshots = async (records: ImageAnnotations[]): Promise<ImageAnnotations[]> => {
+        try {
+            const confirmed = await saveAnnotations(records);
+            applyConfirmedAnnotations(confirmed);
+            return confirmed;
+        } catch (error) {
+            if (error instanceof UserDataBatchPersistenceError) applyConfirmedAnnotations(error.persisted);
+            throw error;
+        }
+    };
+
+    const ensureStableUserDataSubscription = () => {
+        if (stableUserDataUnsubscribe) return;
+        stableUserDataUnsubscribe = subscribeStableUserDataChanges((records) => {
+            const state = get();
+            const confirmed: ImageAnnotations[] = [];
+            const removedImageIds = new Set<string>();
+            for (const record of records) {
+                if (record.domain !== 'annotation') continue;
+                for (const image of state.images) {
+                    if (image.assetId !== record.assetId) continue;
+                    const annotation = annotationFromStableRecord(record, image.id);
+                    if (annotation) confirmed.push(annotation);
+                    else removedImageIds.add(image.id);
+                }
+            }
+            if (confirmed.length === 0 && removedImageIds.size === 0) return;
+            set(current => {
+                const annotations = new Map(current.annotations);
+                for (const imageId of removedImageIds) annotations.delete(imageId);
+                for (const annotation of confirmed) annotations.set(annotation.imageId, annotation);
+                const images = current.images.map((image) => {
+                    if (removedImageIds.has(image.id)) {
+                        return { ...image, isFavorite: false, tags: [], rating: undefined };
+                    }
+                    const annotation = annotations.get(image.id);
+                    return annotation
+                        ? { ...image, isFavorite: annotation.isFavorite, tags: annotation.tags, rating: annotation.rating }
+                        : image;
+                });
+                const newState = { ...current, annotations, images };
+                return { ...newState, ...filterAndSort(newState) };
+            });
+        });
+    };
+
 
     return {
         // Initial State
@@ -2576,6 +3486,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         clipboard: null,
         selectedImages: new Set(),
         activeImageScope: null,
+        exploreDimension: 'models',
         collections: [],
         automationRules: [],
         isAutomationRulesLoaded: false,
@@ -2599,6 +3510,8 @@ export const useImageStore = create<ImageState>((set, get) => {
         sortOrder: 'date-desc',
         randomSeed: Date.now(),
         advancedFilters: {},
+        semanticResult: null,
+        preSemanticSortOrder: null,
         scanSubfolders: localStorage.getItem('image-metahub-scan-subfolders') !== 'false', // Default to true
         viewingStackPrompt: null,
         isFullscreenMode: false,
@@ -2610,6 +3523,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         availableTags: [],
         availableAutoTags: [],
         recentTags: loadRecentTags(),
+        selectedNodes: [],
         selectedTags: [],
         excludedTags: [],
         selectedTagsMatchMode: 'any',
@@ -2879,7 +3793,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         }),
         setIndexingState: (indexingState) => {
             if (indexingState !== 'indexing') {
-                flushPendingMerges(true);
+                flushPendingMerges();
             }
             set({ indexingState });
             if (indexingState !== 'indexing' && indexingState !== 'paused') {
@@ -3027,8 +3941,7 @@ export const useImageStore = create<ImageState>((set, get) => {
                     return state;
                 }
 
-                const allImages = [...state.images, ...uniqueNewImages];
-                return _updateState(state, allImages);
+                return _updateStateIncremental(state, { added: uniqueNewImages });
             });
 
             maybeQueueLineageBuild(700);
@@ -3091,28 +4004,47 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return;
             }
 
-            const isIndexing = get().indexingState === 'indexing';
+            const state = get();
+            const isIndexing = state.indexingState === 'indexing';
             if (isIndexing) {
                 pendingMergeQueue.push(...updatedImages);
                 scheduleMergeFlush();
                 return;
             }
 
-            flushPendingImages(true);
-        flushPendingMerges();
-            set(state => {
-                // Optimization: Replace new Map(arr.map()) with a for loop
-                // Impact: Avoids O(N) allocation of intermediate array of tuples and reduces GC pressure
-                const updates = new Map<string, IndexedImage>();
-                for (const img of updatedImages) {
-                    updates.set(img.id, img);
+            let updatesToApply = updatedImages;
+            if (state.refreshingDirectories.size > 0) {
+                const deferredUpdates: IndexedImage[] = [];
+                const immediateUpdates: IndexedImage[] = [];
+                for (const image of updatedImages) {
+                    if (image.directoryId && state.refreshingDirectories.has(image.directoryId)) {
+                        deferredUpdates.push(image);
+                    } else {
+                        immediateUpdates.push(image);
+                    }
                 }
-                const merged = state.images.map(img => updates.get(img.id) ?? img);
-                return _updateState(state, merged);
-            });
+
+                // Startup reconciliation already has a catalog the user can browse.
+                // Keep only that directory's enrichment replacements out of React;
+                // edits and saves in other directories must remain immediately visible.
+                if (deferredUpdates.length > 0) {
+                    pendingMergeQueue.push(...deferredUpdates);
+                }
+                if (immediateUpdates.length === 0) {
+                    return;
+                }
+                updatesToApply = immediateUpdates;
+            }
+
+            flushPendingImages(true);
+            if (get().refreshingDirectories.size === 0) {
+                flushPendingMerges();
+            }
+            set(state => _updateStateIncremental(state, { updated: updatesToApply }));
 
             if (get().isAnnotationsLoaded) {
-                void get().importMetadataTags(updatedImages);
+                void get().hydrateAnnotationsForImages(updatesToApply)
+                    .then(() => get().importMetadataTags(updatesToApply));
             }
             maybeQueueLineageBuild(700);
         },
@@ -3132,12 +4064,18 @@ export const useImageStore = create<ImageState>((set, get) => {
         },
 
         removeImages: (imageIds) => {
+            if (!imageIds || imageIds.length === 0) {
+                return;
+            }
             const idsToRemove = new Set(imageIds);
             flushPendingImages(true);
-            set(state => {
-                const remainingImages = state.images.filter(img => !idsToRemove.has(img.id));
-                return _updateState(state, remainingImages);
-            });
+            // Callers (e.g. the watched-files-removed handler) may re-request removal
+            // of ids a manual delete already removed locally. Skip the full recompute
+            // entirely when none of the ids are actually present.
+            if (!get().images.some(img => idsToRemove.has(img.id))) {
+                return;
+            }
+            set(state => _updateStateIncremental(state, { removed: idsToRemove }));
             traceCacheDebug('store:removeImages', () => ({
                 imageIdsCount: imageIds.length,
                 snapshot: createCacheDebugSnapshot(get()),
@@ -3147,10 +4085,10 @@ export const useImageStore = create<ImageState>((set, get) => {
 
         removeImage: (imageId) => {
             flushPendingImages(true);
-            set(state => {
-                const remainingImages = state.images.filter(img => img.id !== imageId);
-                return _updateState(state, remainingImages);
-            });
+            if (!get().images.some(img => img.id === imageId)) {
+                return;
+            }
+            set(state => _updateStateIncremental(state, { removed: new Set([imageId]) }));
             maybeQueueLineageBuild(500);
         },
 
@@ -3212,7 +4150,6 @@ export const useImageStore = create<ImageState>((set, get) => {
                     annotations.set(nextImageId, {
                         ...annotation,
                         imageId: nextImageId,
-                        updatedAt: Date.now(),
                     });
                 }
 
@@ -3247,7 +4184,9 @@ export const useImageStore = create<ImageState>((set, get) => {
                     thumbnailEntries: remapThumbnailEntries(state.thumbnailEntries, imageId, nextImageId),
                     selectedImage: replaceImage(state.selectedImage),
                     previewImage: replaceImage(state.previewImage),
-                    activeImageScope: remapImageListReference(state.activeImageScope, imageId, nextImage),
+                    // activeImageScope is a descriptor (model/cluster/collection id), not image
+                    // references, so renames never invalidate it — cluster/collection membership
+                    // is remapped via remappedClusters / syncedCollections above.
                     clusterNavigationContext: remapImageListReference(state.clusterNavigationContext, imageId, nextImage),
                     comparisonImages: state.comparisonImages.map(image => image.id === imageId ? nextImage : image),
                     lineageBuildState: markLineageBuildStateDirty(state.lineageBuildState),
@@ -3464,7 +4403,39 @@ export const useImageStore = create<ImageState>((set, get) => {
         })),
 
         setSortOrder: (order) => set(state => ({ ...filterAndSort({ ...state, sortOrder: order }), sortOrder: order })),
-        
+
+        applySemanticResult: (result) => set(state => {
+            if (result) {
+                // Remember the sort to return to, but only the first time a
+                // visual search becomes active, so re-running a query does not
+                // overwrite it with 'relevance'.
+                const preSemanticSortOrder = state.semanticResult
+                    ? state.preSemanticSortOrder
+                    : state.sortOrder;
+                const changed = {
+                    semanticResult: result,
+                    preSemanticSortOrder,
+                    sortOrder: 'relevance' as SortOrder,
+                };
+                // Only re-add the fields that changed after filterAndSort —
+                // spreading the whole prior state back would clobber the freshly
+                // filtered filteredImages/facets with the stale ones.
+                return { ...filterAndSort({ ...state, ...changed }), ...changed };
+            }
+
+            if (!state.semanticResult) {
+                return state;
+            }
+            // Relevance only makes sense while a result is present; fall back to
+            // whatever the user had before, or a sane default.
+            const changed = {
+                semanticResult: null,
+                preSemanticSortOrder: null,
+                sortOrder: (state.preSemanticSortOrder ?? 'date-desc') as SortOrder,
+            };
+            return { ...filterAndSort({ ...state, ...changed }), ...changed };
+        }),
+
         reshuffle: () => set(state => {
             const newSeed = Date.now();
             return {
@@ -3475,12 +4446,33 @@ export const useImageStore = create<ImageState>((set, get) => {
 
         setPreviewImage: (image) => set({ previewImage: image }),
         setSelectedImage: (image) => set({ selectedImage: image }),
-        setActiveImageScope: (images) => set((state) => {
-            if (state.activeImageScope === images) {
+        setExploreDimension: (dimension) => set((state) => (
+            state.exploreDimension === dimension ? state : { exploreDimension: dimension }
+        )),
+        setActiveImageScope: (scope) => set((state) => {
+            const current = state.activeImageScope;
+            if (current === scope) {
                 return state;
             }
-            return { activeImageScope: images };
+            if (current && scope && current.type === scope.type && current.id === scope.id && current.label === scope.label) {
+                return state;
+            }
+            return { activeImageScope: scope };
         }),
+        validateActiveImageScope: () => set((state) => {
+            const scope = state.activeImageScope;
+            if (!scope) {
+                return state;
+            }
+            const resolved = resolveScopeImageIds(scope, state);
+            if (resolved && !resolved.valid) {
+                return { activeImageScope: null, success: getScopeToastMessage(scope), error: null };
+            }
+            return state;
+        }),
+        getScopedFilteredImages: () => resolveDisplayedImages(get()),
+        getSemanticSearchScopeSnapshot,
+        getSemanticTextQueryScopeSnapshot,
         loadCollections: async () => {
             const persistedCollections = await getAllSmartCollections();
             set((state) => {
@@ -3758,9 +4750,11 @@ export const useImageStore = create<ImageState>((set, get) => {
                 existingWorker.terminate();
             }
 
-            // Get clustering limits from license store directly (can't use hooks in Zustand actions)
+            // Get clustering limits from license store directly (can't use hooks in Zustand actions).
+            // Honor the dev Pro override too, so console-unlocked Pro reaches the generation path
+            // and not just the UI (matches useFeatureAccess).
             const licenseStore = useLicenseStore.getState();
-            const isPro = licenseStore.licenseStatus === 'pro' || licenseStore.licenseStatus === 'lifetime';
+            const isPro = isDevProLicenseOverride() || licenseStore.licenseStatus === 'pro' || licenseStore.licenseStatus === 'lifetime';
             const isTrialActive = licenseStore.licenseStatus === 'trial';
 
             // Filter images with prompts
@@ -4098,8 +5092,24 @@ export const useImageStore = create<ImageState>((set, get) => {
 
         // Annotations Actions
         loadAnnotations: async () => {
-            const annotationsMap = await loadAllAnnotations();
-            const tags = await getAllTags();
+            const images = get().images;
+            registerStableUserDataImages(images);
+            ensureStableUserDataSubscription();
+            let annotationsMap: Map<string, ImageAnnotations>;
+            let tags: TagInfo[];
+            try {
+                annotationsMap = await loadAnnotationsForImages(images);
+                tags = await getAllAuthoritativeTags();
+            } catch (error) {
+                console.error('Authoritative user data is unavailable:', error);
+                set({
+                    annotations: new Map(),
+                    availableTags: [],
+                    isAnnotationsLoaded: true,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                return;
+            }
             const queuedMetadataImports = drainPendingMetadataTagImports();
 
             set(state => {
@@ -4122,109 +5132,88 @@ export const useImageStore = create<ImageState>((set, get) => {
             }
         },
 
+        hydrateAnnotationsForImages: async (images) => {
+            if (images.length === 0) return;
+            const requestedIdentity = new Map(images.map((image) => [
+                image.id,
+                `${image.assetId ?? ''}\0${image.revisionId ?? ''}\0${image.provenanceLocationId ?? ''}`,
+            ]));
+            registerStableUserDataImages(images);
+            ensureStableUserDataSubscription();
+            try {
+                const hydrated = await hydrateUserDataForImages(images);
+                set(state => {
+                    const annotations = new Map(state.annotations);
+                    const currentHydratedIds = new Set(state.images
+                        .filter((image) => requestedIdentity.get(image.id) === `${image.assetId ?? ''}\0${image.revisionId ?? ''}\0${image.provenanceLocationId ?? ''}`)
+                        .map((image) => image.id));
+                    for (const imageId of currentHydratedIds) annotations.delete(imageId);
+                    for (const annotation of hydrated.annotations.values()) {
+                        if (currentHydratedIds.has(annotation.imageId)) annotations.set(annotation.imageId, annotation);
+                    }
+                    const nextImages = state.images.map((image) => {
+                        if (!currentHydratedIds.has(image.id)) return image;
+                        const annotation = annotations.get(image.id);
+                        return annotation
+                            ? { ...image, isFavorite: annotation.isFavorite, tags: annotation.tags, rating: annotation.rating }
+                            : { ...image, isFavorite: false, tags: [], rating: undefined };
+                    });
+                    const newState = { ...state, annotations, images: nextImages };
+                    return { ...newState, ...filterAndSort(newState) };
+                });
+            } catch (error) {
+                console.error('Failed to hydrate stable user data:', error);
+                set({ error: error instanceof Error ? error.message : String(error) });
+            }
+        },
+
         toggleFavorite: async (imageId) => {
             const { annotations } = get();
 
             const currentAnnotation = annotations.get(imageId);
             const newIsFavorite = !(currentAnnotation?.isFavorite ?? false);
 
-            const updatedAnnotation = buildAnnotationRecord(imageId, currentAnnotation, {
-                isFavorite: newIsFavorite,
-            });
-
-            // Update in-memory state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                newAnnotations.set(imageId, updatedAnnotation);
-
-                const updatedImages = state.images.map(img =>
-                    img.id === imageId ? { ...img, isFavorite: newIsFavorite, rating: updatedAnnotation.rating } : img
-                );
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            // Persist to IndexedDB (async, don't await)
-            saveAnnotation(updatedAnnotation).catch(error => {
+            try {
+                const updatedAnnotation = await patchAnnotation(imageId, { set: { isFavorite: newIsFavorite } });
+                if (updatedAnnotation) applyConfirmedAnnotations([updatedAnnotation]);
+            } catch (error) {
                 console.error('Failed to save annotation:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+                throw error;
+            }
         },
 
         bulkToggleFavorite: async (imageIds, isFavorite) => {
-            const { annotations } = get();
-            const updatedAnnotations: ImageAnnotations[] = [];
-
-            for (const imageId of imageIds) {
-                const current = annotations.get(imageId);
-                updatedAnnotations.push(buildAnnotationRecord(imageId, current, {
-                    isFavorite,
-                }));
-            }
-
-            // Update state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                for (const annotation of updatedAnnotations) {
-                    newAnnotations.set(annotation.imageId, annotation);
-                }
-
-                const updatedImages = state.images.map(img => {
-                    const annotation = newAnnotations.get(img.id);
-                    if (annotation && imageIds.includes(img.id)) {
-                        return { ...img, isFavorite: annotation.isFavorite, rating: annotation.rating };
-                    }
-                    return img;
-                });
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            // Persist to IndexedDB
-            bulkSaveAnnotations(updatedAnnotations).catch(error => {
+            try {
+                await persistAnnotationPatchBatch(imageIds.map((imageId) => ({
+                    imageId,
+                    patch: { set: { isFavorite } },
+                })));
+            } catch (error) {
                 console.error('Failed to bulk save annotations:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+            }
         },
 
         setImageRating: async (imageId, rating) => {
-            const { annotations } = get();
-            const currentAnnotation = annotations.get(imageId);
-            const normalizedRating = rating ?? undefined;
-            const updatedAnnotation = buildAnnotationRecord(imageId, currentAnnotation, {
-                rating: normalizedRating,
-            });
-
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                newAnnotations.set(imageId, updatedAnnotation);
-
-                const updatedImages = state.images.map(img =>
-                    img.id === imageId ? { ...img, rating: normalizedRating } : img
-                );
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
+            try {
+                const state = get();
+                const currentAnnotation = state.annotations.get(imageId);
+                const currentImage = getImageById(state, imageId);
+                const initialSet = currentAnnotation ? {} : {
+                    isFavorite: currentImage?.isFavorite === true,
+                    tags: [...(currentImage?.tags ?? [])],
+                    addedAt: Date.now(),
                 };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            saveAnnotation(updatedAnnotation).catch(error => {
+                const updatedAnnotation = await patchAnnotation(imageId, rating === null
+                    ? { set: initialSet, remove: ['rating'] }
+                    : { set: { ...initialSet, rating } });
+                if (updatedAnnotation) applyConfirmedAnnotations([updatedAnnotation]);
+            } catch (error) {
                 console.error('Failed to save image rating:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+                throw error;
+            }
         },
 
         bulkSetImageRating: async (imageIds, rating) => {
@@ -4232,37 +5221,27 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return;
             }
 
-            const { annotations } = get();
-            const normalizedRating = rating ?? undefined;
-            const updatedAnnotations = imageIds.map(imageId =>
-                buildAnnotationRecord(imageId, annotations.get(imageId), {
-                    rating: normalizedRating,
-                })
-            );
-
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                for (const annotation of updatedAnnotations) {
-                    newAnnotations.set(annotation.imageId, annotation);
-                }
-
-                const imageIdsSet = new Set(imageIds);
-                const updatedImages = state.images.map(img =>
-                    imageIdsSet.has(img.id) ? { ...img, rating: normalizedRating } : img
-                );
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            bulkSaveAnnotations(updatedAnnotations).catch(error => {
+            try {
+                await persistAnnotationPatchBatch(imageIds.map((imageId) => ({
+                    imageId,
+                    patch: (() => {
+                        const state = get();
+                        const currentAnnotation = state.annotations.get(imageId);
+                        const currentImage = getImageById(state, imageId);
+                        const initialSet = currentAnnotation ? {} : {
+                            isFavorite: currentImage?.isFavorite === true,
+                            tags: [...(currentImage?.tags ?? [])],
+                            addedAt: Date.now(),
+                        };
+                        return rating === null
+                            ? { set: initialSet, remove: ['rating'] }
+                            : { set: { ...initialSet, rating } };
+                    })(),
+                })));
+            } catch (error) {
                 console.error('Failed to bulk save image ratings:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+            }
         },
 
         addTagToImage: async (imageId, tag) => {
@@ -4277,41 +5256,21 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return;
             }
 
-            const updatedAnnotation = buildAnnotationRecord(imageId, currentAnnotation, {
-                tags: [...(currentAnnotation?.tags ?? []), normalizedTag],
-            });
-
-            let nextRecentTags = get().recentTags;
-
-            // Update state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                newAnnotations.set(imageId, updatedAnnotation);
-
-                const updatedImages = state.images.map(img =>
-                    img.id === imageId ? { ...img, tags: updatedAnnotation.tags, rating: updatedAnnotation.rating } : img
-                );
-
-                nextRecentTags = updateRecentTags(state.recentTags, normalizedTag);
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                    recentTags: nextRecentTags,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            persistRecentTags(nextRecentTags);
-
-            // Persist and refresh tags
-            await Promise.all([
-                saveAnnotation(updatedAnnotation),
-                ensureManualTagExists(normalizedTag),
-            ]).catch(error => {
+            try {
+                const updatedAnnotation = await patchAnnotation(imageId, {
+                    addTags: [normalizedTag],
+                    unsuppressTags: [normalizedTag],
+                });
+                if (updatedAnnotation) applyConfirmedAnnotations([updatedAnnotation]);
+                const nextRecentTags = updateRecentTags(get().recentTags, normalizedTag);
+                set({ recentTags: nextRecentTags });
+                persistRecentTags(nextRecentTags);
+                await ensureManualTagExists(normalizedTag);
+            } catch (error) {
                 console.error('Failed to save annotation:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+                throw error;
+            }
             await get().refreshAvailableTags();
         },
 
@@ -4323,35 +5282,18 @@ export const useImageStore = create<ImageState>((set, get) => {
                 return;
             }
 
-            const updatedAnnotation: ImageAnnotations = {
-                ...currentAnnotation,
-                tags: currentAnnotation.tags.filter(t => t !== tag),
-                updatedAt: Date.now(),
-            };
-
-            // Update state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                newAnnotations.set(imageId, updatedAnnotation);
-
-                const updatedImages = state.images.map(img =>
-                    img.id === imageId ? { ...img, tags: updatedAnnotation.tags, rating: updatedAnnotation.rating } : img
-                );
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            // Persist and refresh tags
-            saveAnnotation(updatedAnnotation).catch(error => {
+            try {
+                const updatedAnnotation = await patchAnnotation(imageId, {
+                    removeTags: [tag],
+                    suppressTags: [tag],
+                });
+                if (updatedAnnotation) applyConfirmedAnnotations([updatedAnnotation]);
+            } catch (error) {
                 console.error('Failed to save annotation:', error);
-            });
-            get().refreshAvailableTags();
+                set({ error: error instanceof Error ? error.message : String(error) });
+                throw error;
+            }
+            await get().refreshAvailableTags();
         },
 
         removeAutoTagFromImage: (imageId, tag) => {
@@ -4379,105 +5321,33 @@ export const useImageStore = create<ImageState>((set, get) => {
             const normalizedTag = normalizeTagName(tag);
             if (!normalizedTag || imageIds.length === 0) return;
 
-            const { annotations } = get();
-            const updatedAnnotations: ImageAnnotations[] = [];
-
-            for (const imageId of imageIds) {
-                const current = annotations.get(imageId);
-                if (current?.tags.includes(normalizedTag)) {
-                    continue; // Skip if already tagged
-                }
-
-                updatedAnnotations.push(buildAnnotationRecord(imageId, current, {
-                    tags: [...(current?.tags ?? []), normalizedTag],
-                }));
-            }
-
-            let nextRecentTags = get().recentTags;
-
-            // Update state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                for (const annotation of updatedAnnotations) {
-                    newAnnotations.set(annotation.imageId, annotation);
-                }
-
-                const updatedImages = state.images.map(img => {
-                    const annotation = newAnnotations.get(img.id);
-                    if (annotation && imageIds.includes(img.id)) {
-                        return { ...img, tags: annotation.tags, rating: annotation.rating };
-                    }
-                    return img;
-                });
-
-                nextRecentTags = updateRecentTags(state.recentTags, normalizedTag);
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                    recentTags: nextRecentTags,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            persistRecentTags(nextRecentTags);
-
-            // Persist and refresh tags
-            await Promise.all([
-                bulkSaveAnnotations(updatedAnnotations),
-                ensureManualTagExists(normalizedTag),
-            ]).catch(error => {
+            try {
+                await persistAnnotationPatchBatch(imageIds.map((imageId) => ({
+                    imageId,
+                    patch: { addTags: [normalizedTag], unsuppressTags: [normalizedTag] },
+                })));
+                const nextRecentTags = updateRecentTags(get().recentTags, normalizedTag);
+                set({ recentTags: nextRecentTags });
+                persistRecentTags(nextRecentTags);
+                await ensureManualTagExists(normalizedTag);
+            } catch (error) {
                 console.error('Failed to bulk save annotations:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+            }
             await get().refreshAvailableTags();
         },
 
         bulkRemoveTag: async (imageIds, tag) => {
-            const { annotations } = get();
-            const updatedAnnotations: ImageAnnotations[] = [];
-
-            for (const imageId of imageIds) {
-                const current = annotations.get(imageId);
-                if (!current || !current.tags.includes(tag)) {
-                    continue; // Skip if doesn't have this tag
-                }
-
-                updatedAnnotations.push({
-                    ...current,
-                    tags: current.tags.filter(t => t !== tag),
-                    updatedAt: Date.now(),
-                });
-            }
-
-            // Update state
-            set(state => {
-                const newAnnotations = new Map(state.annotations);
-                for (const annotation of updatedAnnotations) {
-                    newAnnotations.set(annotation.imageId, annotation);
-                }
-
-                const updatedImages = state.images.map(img => {
-                    const annotation = newAnnotations.get(img.id);
-                    if (annotation && imageIds.includes(img.id)) {
-                        return { ...img, tags: annotation.tags, rating: annotation.rating };
-                    }
-                    return img;
-                });
-
-                const newState = {
-                    ...state,
-                    annotations: newAnnotations,
-                    images: updatedImages,
-                };
-
-                return { ...newState, ...filterAndSort(newState) };
-            });
-
-            // Persist and refresh tags
-            await bulkSaveAnnotations(updatedAnnotations).catch(error => {
+            const targets = imageIds.filter((imageId) => get().annotations.get(imageId)?.tags.includes(tag));
+            try {
+                await persistAnnotationPatchBatch(targets.map((imageId) => ({
+                    imageId,
+                    patch: { removeTags: [tag], suppressTags: [tag] },
+                })));
+            } catch (error) {
                 console.error('Failed to bulk save annotations:', error);
-            });
+                set({ error: error instanceof Error ? error.message : String(error) });
+            }
             await get().refreshAvailableTags();
         },
 
@@ -4524,6 +5394,22 @@ export const useImageStore = create<ImageState>((set, get) => {
                 });
             }
 
+            try {
+                const stableRecords = await mutateAnnotationTagGlobally('rename', normalizedSource, normalizedTarget);
+                if (stableRecords) {
+                    updatedAnnotations.length = 0;
+                    const hydrated = await loadAnnotationsForImages(get().images);
+                    updatedAnnotations.push(...hydrated.values());
+                } else if (updatedAnnotations.length > 0) {
+                    const persisted = await persistAnnotationSnapshots(updatedAnnotations);
+                    updatedAnnotations.splice(0, updatedAnnotations.length, ...persisted);
+                }
+            } catch (error) {
+                console.error('Failed to persist renamed annotation tags:', error);
+                set({ error: error instanceof Error ? error.message : String(error) });
+                return;
+            }
+
             let nextRecentTags = get().recentTags;
 
             set(state => {
@@ -4563,7 +5449,6 @@ export const useImageStore = create<ImageState>((set, get) => {
             persistRecentTags(nextRecentTags);
 
             await Promise.all([
-                updatedAnnotations.length > 0 ? bulkSaveAnnotations(updatedAnnotations) : Promise.resolve(),
                 renameManualTag(normalizedSource, normalizedTarget),
                 ...updatedCollections.map((collection) => saveSmartCollection(collection)),
             ]).catch(error => {
@@ -4593,6 +5478,22 @@ export const useImageStore = create<ImageState>((set, get) => {
                 });
             }
 
+            try {
+                const stableRecords = await mutateAnnotationTagGlobally('remove', normalizedTag);
+                if (stableRecords) {
+                    updatedAnnotations.length = 0;
+                    const hydrated = await loadAnnotationsForImages(get().images);
+                    updatedAnnotations.push(...hydrated.values());
+                } else if (updatedAnnotations.length > 0) {
+                    const persisted = await persistAnnotationSnapshots(updatedAnnotations);
+                    updatedAnnotations.splice(0, updatedAnnotations.length, ...persisted);
+                }
+            } catch (error) {
+                console.error('Failed to persist cleared annotation tag:', error);
+                set({ error: error instanceof Error ? error.message : String(error) });
+                return;
+            }
+
             set(state => {
                 const newAnnotations = new Map(state.annotations);
                 for (const annotation of updatedAnnotations) {
@@ -4613,7 +5514,6 @@ export const useImageStore = create<ImageState>((set, get) => {
 
             await Promise.all([
                 ensureManualTagExists(normalizedTag),
-                updatedAnnotations.length > 0 ? bulkSaveAnnotations(updatedAnnotations) : Promise.resolve(),
             ]).catch(error => {
                 console.error('Failed to clear tag:', error);
             });
@@ -4676,6 +5576,22 @@ export const useImageStore = create<ImageState>((set, get) => {
                 });
             }
 
+            try {
+                const stableRecords = await mutateAnnotationTagGlobally('remove', normalizedTag);
+                if (stableRecords) {
+                    updatedAnnotations.length = 0;
+                    const hydrated = await loadAnnotationsForImages(get().images);
+                    updatedAnnotations.push(...hydrated.values());
+                } else if (updatedAnnotations.length > 0) {
+                    const persisted = await persistAnnotationSnapshots(updatedAnnotations);
+                    updatedAnnotations.splice(0, updatedAnnotations.length, ...persisted);
+                }
+            } catch (error) {
+                console.error('Failed to persist purged annotation tag:', error);
+                set({ error: error instanceof Error ? error.message : String(error) });
+                return;
+            }
+
             let nextRecentTags = get().recentTags;
 
             set(state => {
@@ -4701,13 +5617,18 @@ export const useImageStore = create<ImageState>((set, get) => {
             persistRecentTags(nextRecentTags);
 
             await Promise.all([
-                updatedAnnotations.length > 0 ? bulkSaveAnnotations(updatedAnnotations) : Promise.resolve(),
                 deleteManualTag(normalizedTag),
             ]).catch(error => {
                 console.error('Failed to purge tag:', error);
             });
             await get().refreshAvailableTags();
         },
+
+        // Node filtering is applied as a post-filter in App (like activeImageScope), so this
+        // is a plain setter — it does not run filterAndSort.
+        setSelectedNodes: (nodes) => set(state => (
+            state.selectedNodes === nodes ? state : { selectedNodes: nodes }
+        )),
 
         setSelectedTags: (tags) => set(state => {
             const newState = { ...state, selectedTags: tags };
@@ -4745,8 +5666,16 @@ export const useImageStore = create<ImageState>((set, get) => {
         },
 
         refreshAvailableTags: async () => {
-            const tags = await getAllTags();
-            set({ availableTags: tags });
+            try {
+                const tags = await getAllAuthoritativeTags();
+                set({ availableTags: tags });
+            } catch (error) {
+                console.error('Failed to load authoritative tags:', error);
+                set({
+                    availableTags: [],
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
         },
 
         refreshAvailableAutoTags: () => {
@@ -4755,13 +5684,16 @@ export const useImageStore = create<ImageState>((set, get) => {
             // Count frequency of each auto-tag
             const tagFrequency = new Map<string, number>();
 
-            images.forEach(img => {
-                if (img.autoTags && img.autoTags.length > 0) {
-                    img.autoTags.forEach(tag => {
+            for (let i = 0; i < images.length; i++) {
+                const img = images[i];
+                const imageAutoTags = img.autoTags;
+                if (imageAutoTags && imageAutoTags.length > 0) {
+                    for (let j = 0; j < imageAutoTags.length; j++) {
+                        const tag = imageAutoTags[j];
                         tagFrequency.set(tag, (tagFrequency.get(tag) || 0) + 1);
-                    });
+                    }
                 }
-            });
+            }
 
             // Convert to TagInfo array and sort by frequency
             const autoTags: TagInfo[] = Array.from(tagFrequency.entries())
@@ -4796,52 +5728,32 @@ export const useImageStore = create<ImageState>((set, get) => {
 
                 const currentAnnotation = annotations.get(image.id);
                 const existingTags = currentAnnotation?.tags ?? [];
+                const suppressedTags = currentAnnotation?.suppressedMetadataTags ?? [];
 
                 // Normalize and filter out duplicates
                 const newTags = metadataTags
                     .map(tag => normalizeTagName(tag))
-                    .filter(tag => tag && !existingTags.includes(tag));
+                    .filter(tag => tag && !existingTags.includes(tag) && !suppressedTags.includes(tag));
 
                 if (newTags.length === 0) continue;
 
-                const updatedAnnotation = buildAnnotationRecord(image.id, currentAnnotation, {
-                    tags: [...existingTags, ...newTags],
-                });
-
-                updatedAnnotations.push(updatedAnnotation);
+                try {
+                    const updatedAnnotation = await patchAnnotation(image.id, { importTags: newTags });
+                    if (updatedAnnotation) updatedAnnotations.push(updatedAnnotation);
+                } catch (error) {
+                    console.error(`Failed to import metadata tags for ${image.id}:`, error);
+                    set({ error: error instanceof Error ? error.message : String(error) });
+                }
             }
 
             if (updatedAnnotations.length > 0) {
-                // Update state
-                set(state => {
-                    const newAnnotations = new Map(state.annotations);
-                    for (const annotation of updatedAnnotations) {
-                        newAnnotations.set(annotation.imageId, annotation);
-                    }
-
-                    const updatedImages = state.images.map(img => {
-                        const annotation = newAnnotations.get(img.id);
-                        return annotation ? { ...img, tags: annotation.tags, rating: annotation.rating } : img;
-                    });
-
-                    const newState = {
-                        ...state,
-                        annotations: newAnnotations,
-                        images: updatedImages,
-                    };
-
-                    return { ...newState, ...filterAndSort(newState) };
-                });
+                applyConfirmedAnnotations(updatedAnnotations);
 
                 const importedTagNames = Array.from(new Set(
                     updatedAnnotations.flatMap(annotation => annotation.tags)
                 ));
 
-                // Persist annotations
-                await Promise.all([
-                    bulkSaveAnnotations(updatedAnnotations),
-                    ...importedTagNames.map(tagName => ensureManualTagExists(tagName)),
-                ]).catch(error => {
+                await Promise.all(importedTagNames.map(tagName => ensureManualTagExists(tagName))).catch(error => {
                     console.error('Failed to import metadata tags:', error);
                 });
 
@@ -4866,6 +5778,14 @@ export const useImageStore = create<ImageState>((set, get) => {
                 }
                 return { refreshingDirectories: next };
             });
+            if (!isRefreshing && get().refreshingDirectories.size === 0) {
+                // Catalog additions and their Phase B enrichment updates can both
+                // finish before the normal 100 ms add timer on a small refresh.
+                // Make the catalog records visible before applying replacements so
+                // an unmatched merge cannot be discarded for the current session.
+                flushPendingImages(true);
+                flushPendingMerges();
+            }
         },
 
         toggleImageSelection: (imageId) => {
@@ -4881,7 +5801,7 @@ export const useImageStore = create<ImageState>((set, get) => {
         },
 
         selectAllImages: () => set(state => {
-            const selectionScope = state.activeImageScope ?? state.filteredImages;
+            const selectionScope = resolveDisplayedImages(state);
             // Performance optimization: Avoid intermediate array allocation
             const allImageIds = new Set<string>();
             for (let i = 0; i < selectionScope.length; i++) {
@@ -4905,7 +5825,8 @@ export const useImageStore = create<ImageState>((set, get) => {
             const state = get();
             if (!state.selectedImage) return;
 
-            const imagesToNavigate = state.clusterNavigationContext || state.activeImageScope || state.filteredImages;
+            const scopedImages = resolveDisplayedImages(state);
+            const imagesToNavigate = state.clusterNavigationContext || scopedImages;
             const currentIndex = imagesToNavigate.findIndex(img => img.id === state.selectedImage!.id);
 
             if (currentIndex < imagesToNavigate.length - 1) {
@@ -4918,7 +5839,8 @@ export const useImageStore = create<ImageState>((set, get) => {
             const state = get();
             if (!state.selectedImage) return;
 
-            const imagesToNavigate = state.clusterNavigationContext || state.activeImageScope || state.filteredImages;
+            const scopedImages = resolveDisplayedImages(state);
+            const imagesToNavigate = state.clusterNavigationContext || scopedImages;
             const currentIndex = imagesToNavigate.findIndex(img => img.id === state.selectedImage!.id);
 
             if (currentIndex > 0) {
@@ -4928,6 +5850,8 @@ export const useImageStore = create<ImageState>((set, get) => {
         },
 
         resetState: () => {
+            // The pending snapshot belongs to the library being torn down.
+            flushPendingLineagePersist();
             pendingMetadataTagImportMap.clear();
             clearLineageBuildTimer();
             invalidateSearchWorkerDataset();
@@ -4957,6 +5881,7 @@ export const useImageStore = create<ImageState>((set, get) => {
             selectedImage: null,
             selectedImages: new Set(),
             activeImageScope: null,
+            exploreDimension: 'models',
             collections: [],
             automationRules: [],
             isAutomationRulesLoaded: false,
@@ -4989,6 +5914,7 @@ export const useImageStore = create<ImageState>((set, get) => {
             availableTags: [],
             availableAutoTags: [],
             recentTags: loadRecentTags(),
+            selectedNodes: [],
             selectedTags: [],
             excludedTags: [],
             selectedTagsMatchMode: 'any',

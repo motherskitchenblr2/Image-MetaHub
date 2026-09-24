@@ -2,16 +2,19 @@
 /// <reference lib="dom.iterable" />
 import { IncrementalCacheWriter, type CacheImageMetadata } from './cacheManager';
 
-import { type IndexedImage, type Directory, type ImageMetadata, type BaseMetadata, type VideoMetadata, type VideoInfo, type AudioInfo, isInvokeAIMetadata, isAutomatic1111Metadata, isComfyUIMetadata, isSwarmUIMetadata, isEasyDiffusionMetadata, isEasyDiffusionJson, isMidjourneyMetadata, isNijiMetadata, isForgeMetadata, isDalleMetadata, isFireflyMetadata, isDreamStudioMetadata, isDrawThingsMetadata, ComfyUIMetadata, InvokeAIMetadata, SwarmUIMetadata, EasyDiffusionMetadata, EasyDiffusionJson, MidjourneyMetadata, NijiMetadata, ForgeMetadata, DalleMetadata, FireflyMetadata, DrawThingsMetadata, FooocusMetadata } from '../types';
+import { type IndexedImage, type Directory, type ImageMetadata, type BaseMetadata, type VideoMetadata, type VideoInfo, type AudioInfo, isInvokeAIMetadata, isAutomatic1111Metadata, isComfyUIMetadata, hasUsableComfyGraphMetadata, isSwarmUIMetadata, isEasyDiffusionMetadata, isEasyDiffusionJson, isMidjourneyMetadata, isNijiMetadata, isForgeMetadata, isDalleMetadata, isFireflyMetadata, isDreamStudioMetadata, isDrawThingsMetadata, ComfyUIMetadata, InvokeAIMetadata, SwarmUIMetadata, EasyDiffusionMetadata, EasyDiffusionJson, MidjourneyMetadata, NijiMetadata, ForgeMetadata, DalleMetadata, FireflyMetadata, DrawThingsMetadata, FooocusMetadata } from '../types';
 import { getFilesystemPathComparisonKey, normalizeFilesystemPath } from '../utils/filesystemPath';
 import { parse } from 'exifr';
-import { resolvePromptFromGraph, parseComfyUIMetadataEnhanced } from './parsers/comfyUIParser';
+import { isLegacyKrea2FalsePromptPayload, isNonBlankPromptText, resolvePromptFromGraph, parseComfyUIMetadataEnhanced, resolveModel3DLineageFromGraph } from './parsers/comfyUIParser';
 import { parseVideoMetaHubMetadata } from './parsers/videoMetaHubParser';
 import { parseInvokeAIMetadata } from './parsers/invokeAIParser';
 import { parseA1111Metadata } from './parsers/automatic1111Parser';
 import { parseSwarmUIMetadata } from './parsers/swarmUIParser';
 import { traceCacheDebug } from '../utils/cacheDebugTrace';
-import { buildSupportedMediaRegex, inferMimeTypeFromName, isAudioFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { buildSupportedMediaRegex, getFileExtension, inferMimeTypeFromName, isAudioFileName, isModel3DFileName, isVideoFileName } from '../utils/mediaTypes.js';
+import { normalizeBirthtimeMs, resolveFileSortDate } from '../utils/fileTimestamps.js';
+import { getAvifDimensions, isAvifBuffer, parseAvifMetadata } from '../utils/avifMetadata.mjs';
+import { applyImageMetaHubAvifExtension } from '../utils/imageMetaHubAvifExtension.mjs';
 
 type ThrottledFunction<T extends (...args: any[]) => any> = T & {
   cancel: () => void;
@@ -116,6 +119,62 @@ function sanitizeJson(jsonString: string): string {
     return jsonString.replace(/:\s*NaN/g, ': null');
 }
 
+function parseComfyExifGraphValue(
+  value: unknown,
+  prefix?: 'workflow' | 'prompt',
+): ComfyUIMetadata['workflow'] | ComfyUIMetadata['prompt'] | undefined {
+  if (value && typeof value === 'object') {
+    return value as ComfyUIMetadata['workflow'] | ComfyUIMetadata['prompt'];
+  }
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  const marker = prefix ? `${prefix}:` : '';
+  if (marker && !trimmed.toLowerCase().startsWith(marker)) {
+    return undefined;
+  }
+
+  const json = marker ? trimmed.slice(marker.length).trim() : trimmed;
+  if (!json) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(sanitizeJson(json));
+    return parsed && typeof parsed === 'object'
+      ? parsed as ComfyUIMetadata['workflow'] | ComfyUIMetadata['prompt']
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function extractComfyUIExifGraphMetadata(
+  exifData: Record<string, unknown>,
+): ComfyUIMetadata | null {
+  const workflow = parseComfyExifGraphValue(exifData.workflow)
+    ?? parseComfyExifGraphValue(exifData.Workflow)
+    ?? parseComfyExifGraphValue(exifData.Make, 'workflow');
+  const prompt = parseComfyExifGraphValue(exifData.prompt)
+    ?? parseComfyExifGraphValue(exifData.Prompt)
+    ?? parseComfyExifGraphValue(exifData.Model, 'prompt');
+
+  const metadata = workflow || prompt ? { workflow, prompt } : null;
+  return metadata && hasUsableComfyGraphMetadata(metadata) ? metadata : null;
+}
+
+const trimJsonChunkPadding = (value: string): string => {
+  let end = value.length;
+  while (end > 0) {
+    const character = value[end - 1];
+    if (character.charCodeAt(0) !== 0 && character.trim() !== '') break;
+    end -= 1;
+  }
+  return value.slice(0, end);
+};
+
 // Electron detection for optimized batch reading
 const isElectron = typeof window !== 'undefined' && (window as any).electronAPI;
 const isProduction = Boolean(
@@ -152,17 +211,24 @@ function incrementCounter(counter: Record<string, number>, key: string) {
   counter[key] = (counter[key] ?? 0) + 1;
 }
 
+function resolveCatalogMimeType(fileName: string, ...declaredTypes: Array<string | undefined>): string {
+  return declaredTypes.find((value) => /^(image|video|audio|model)\//.test(value ?? ''))
+    ?? inferMimeTypeFromName(fileName);
+}
+
 function classifyFileType(source?: CatalogFileEntry): string {
   if (!source) {
     return 'unknown';
   }
 
-  const type = source.type ?? inferMimeTypeFromName(source.handle.name);
+  const type = resolveCatalogMimeType(source.handle.name, source.type);
   if (type === 'image/png') return 'png';
   if (type === 'image/webp') return 'webp';
+  if (type === 'image/avif') return 'avif';
   if (type === 'image/jpeg') return 'jpeg';
   if (type.startsWith('video/')) return 'video';
   if (type.startsWith('audio/')) return 'audio';
+  if (type.startsWith('model/') || isModel3DFileName(source.handle.name, type)) return 'model3d';
   return type || 'unknown';
 }
 
@@ -196,7 +262,7 @@ function readPngTextKeyword(
   };
 }
 
-function detectImageType(view: DataView): 'png' | 'jpeg' | 'webp' | null {
+function detectImageType(view: DataView): 'png' | 'jpeg' | 'webp' | 'avif' | null {
   if (view.byteLength < 12) {
     return null;
   }
@@ -211,6 +277,10 @@ function detectImageType(view: DataView): 'png' | 'jpeg' | 'webp' | null {
 
   if (view.getUint32(0) === 0x52494646 && view.getUint32(8) === 0x57454250) {
     return 'webp';
+  }
+
+  if (isAvifBuffer(view)) {
+    return 'avif';
   }
 
   return null;
@@ -417,7 +487,7 @@ async function tryReadEasyDiffusionSidecarJson(imagePath: string, absolutePath?:
       ? absolutePath
       : imagePath;
     // Generate JSON path by replacing extension with .json
-    const jsonPath = preferredPath.replace(/\.(png|jpg|jpeg|webp)$/i, '.json');
+    const jsonPath = preferredPath.replace(/\.(png|jpg|jpeg|webp|avif)$/i, '.json');
     
     // Check if path is absolute (has drive letter on Windows or starts with / on Unix)
     const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(jsonPath) || jsonPath.startsWith('/');
@@ -453,7 +523,19 @@ async function tryReadEasyDiffusionSidecarJson(imagePath: string, absolutePath?:
 }
 
 // Main parsing function for PNG files
-async function parsePNGMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | null> {
+//
+// `truncationInfo`, when provided, is populated with `truncated: true` if the chunk
+// walk had to stop early because a chunk's declared length ran past the end of the
+// buffer we were given — i.e. `buffer` is a partial ("head read") slice of a larger
+// file, not the whole PNG. This is distinct from a clean stop at IEND or from hitting
+// the `maxChunks` early-exit optimization, both of which are NOT truncation and leave
+// `truncated` as `false`. Callers use this to decide whether it's safe to trust a
+// "no relevant metadata found" (or incomplete) result, or whether they need to re-read
+// the full file to get chunks (e.g. a large ComfyUI `workflow` chunk) that were cut off.
+export async function parsePNGMetadata(
+  buffer: ArrayBuffer,
+  truncationInfo?: { truncated: boolean }
+): Promise<ImageMetadata | null> {
   const view = new DataView(buffer);
   let offset = 8;
   const decoder = new TextDecoder();
@@ -466,11 +548,29 @@ async function parsePNGMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | nu
 
   while (offset < view.byteLength && foundChunks < maxChunks) {
     if (offset + 8 > view.byteLength) {
+      // Not enough bytes left even for a chunk header. If this buffer is a partial
+      // head-read of a larger file, there could be more (unread) chunks beyond this
+      // point — flag it so the caller can decide to re-read the full file.
+      if (truncationInfo) truncationInfo.truncated = true;
       break;
     }
     const length = view.getUint32(offset, false);
     const type = view.getUint32(offset + 4, false);
     if (offset + 12 + length > view.byteLength) {
+      // This chunk's declared length extends past the end of our buffer, so it
+      // was never inspected. Only treat this as *metadata* truncation when the
+      // chunk is one that can carry the metadata we extract (tEXt/iTXt/eXIf).
+      // A truncated IDAT (image pixel data) or other ancillary chunk does not
+      // mean we lost metadata, and flagging it would force a needless full-file
+      // re-read on nearly every PNG (IDAT is large and usually follows the text
+      // chunks), defeating the head-read optimization. If metadata genuinely
+      // lives beyond a huge truncated IDAT, no relevant chunk will have been
+      // found and the caller's "no metadata" fallback still triggers a re-read.
+      const isMetadataChunk =
+        type === PNG_CHUNK_TYPE_tEXt ||
+        type === PNG_CHUNK_TYPE_iTXt ||
+        type === PNG_CHUNK_TYPE_eXIf;
+      if (truncationInfo && isMetadataChunk) truncationInfo.truncated = true;
       break;
     }
     
@@ -641,6 +741,11 @@ async function parseJPEGMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | n
       } catch {
         // Not JSON or not MetaHub metadata, continue with normal parsing
       }
+    }
+
+    const comfyExifGraph = extractComfyUIExifGraphMetadata(exifData);
+    if (comfyExifGraph) {
+      return comfyExifGraph;
     }
 
     // Check all possible field names for UserComment (A1111 and SwarmUI store metadata here in JPEGs)
@@ -864,7 +969,10 @@ async function parseJPEGMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | n
   }
 }
 
-async function parseWebPMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | null> {
+export async function parseWebPMetadata(
+  buffer: ArrayBuffer,
+  truncationInfo?: { truncated: boolean }
+): Promise<ImageMetadata | null> {
   try {
     // WebP stores EXIF in an 'EXIF' chunk within the RIFF container
     // We need to extract the EXIF chunk first, then parse it with exifr
@@ -931,6 +1039,12 @@ async function parseWebPMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | n
       if (chunkType === 'EXIF') {
         // Found EXIF chunk!
         const exifStart = offset + 8; // Skip chunk header (type + size)
+        // If the declared chunk runs past the (possibly head-read) buffer, the metadata
+        // was cut off mid-file. Signal truncation so Phase B forces a full-file re-read
+        // instead of caching a partial/garbled parse of a large workflow (#448).
+        if (truncationInfo && exifStart + chunkSize > view.byteLength) {
+          truncationInfo.truncated = true;
+        }
         const rawExifData = buffer.slice(exifStart, exifStart + chunkSize);
         const rawBytes = new Uint8Array(rawExifData);
         const tiffHeaderOffset = findExifTiffHeaderOffset(rawBytes);
@@ -1035,6 +1149,11 @@ async function parseWebPMetadata(buffer: ArrayBuffer): Promise<ImageMetadata | n
       } catch (e) {
         // Not JSON or not MetaHub metadata, continue with normal parsing
       }
+    }
+
+    const comfyExifGraph = extractComfyUIExifGraphMetadata(exifData);
+    if (comfyExifGraph) {
+      return comfyExifGraph;
     }
 
     // Fall back to regular JPEG parsing logic (UserComment, etc.)
@@ -1187,7 +1306,25 @@ function extractDimensionsFromBuffer(buffer: ArrayBuffer): { width: number; heig
     }
   }
 
+  if (type === 'avif') {
+    return getAvifDimensions(buffer);
+  }
+
   return null;
+}
+
+async function parseAvifForIndexing(
+  buffer: ArrayBuffer,
+  truncationInfo?: { truncated: boolean },
+): Promise<ImageMetadata | null> {
+  const result = await parseAvifMetadata(buffer);
+  if (truncationInfo) {
+    truncationInfo.truncated ||= result.metadataTruncated;
+  }
+  if (!isProduction && result.errors.length > 0) {
+    console.warn('[AVIF] Metadata carrier warnings:', result.errors);
+  }
+  return result.rawMetadata as ImageMetadata | null;
 }
 
 // Main image metadata parser
@@ -1203,6 +1340,7 @@ async function parseImageMetadata(file: File): Promise<{ metadata: ImageMetadata
       isPNG: detectedType === 'png',
       isJPEG: detectedType === 'jpeg',
       isWebP: detectedType === 'webp',
+      isAvif: detectedType === 'avif',
     });
   }
   
@@ -1223,15 +1361,25 @@ async function parseImageMetadata(file: File): Promise<{ metadata: ImageMetadata
   if (detectedType === 'webp') {
     return { metadata: await parseWebPMetadata(buffer), buffer };
   }
+  if (detectedType === 'avif') {
+    return { metadata: await parseAvifForIndexing(buffer), buffer };
+  }
   return { metadata: null, buffer };
 }
 
-const buildNormalizedMetadataFromMetaHubChunk = async (
+export const buildNormalizedMetadataFromMetaHubChunk = async (
   metaHubData: unknown,
   fallbackDims?: { width?: number; height?: number }
 ): Promise<BaseMetadata> => {
-  if (metaHubData && typeof metaHubData === 'object') {
-    const payload = metaHubData as Record<string, any>;
+  const payload = metaHubData && typeof metaHubData === 'object'
+    ? metaHubData as Record<string, any>
+    : null;
+  const mediaType = payload?.media_type === 'model3d' ? 'model3d' : undefined;
+  const model3DMetadata = payload?.model_3d && typeof payload.model_3d === 'object'
+    ? payload.model_3d
+    : undefined;
+
+  if (payload) {
     if (payload.generator === 'ComfyUI') {
       const rawTags = payload.imh_pro?.user_tags;
       // Optimization: Replace chained array methods with single loops
@@ -1270,13 +1418,19 @@ const buildNormalizedMetadataFromMetaHubChunk = async (
       let inferredGenerationType: BaseMetadata['generationType'] | undefined;
       let inferredLineage: BaseMetadata['lineage'] | undefined;
       let recoveredMetadata: Record<string, any> | undefined;
-      const hasPromptGraph = Boolean(payload.workflow || payload.prompt_api || payload.prompt);
+      const hasPromptGraph = Boolean(
+        (payload.workflow && typeof payload.workflow === 'object')
+        || (payload.prompt_api && typeof payload.prompt_api === 'object')
+        || (payload.prompt && typeof payload.prompt === 'object')
+      );
+      const hasLegacyKrea2FalsePrompt = isLegacyKrea2FalsePromptPayload(payload);
       const embeddedLorasAreValid = Array.isArray(payload.loras) && payload.loras.every((lora: unknown) =>
         typeof lora === 'string'
         || Boolean(lora && typeof lora === 'object' && typeof (lora as Record<string, unknown>).name === 'string')
       );
       const needsGraphRecovery = hasPromptGraph && (
-        !(typeof payload.prompt === 'string' && payload.prompt.trim())
+        hasLegacyKrea2FalsePrompt
+        || !isNonBlankPromptText(payload.prompt)
         || !embeddedLorasAreValid
         || !explicitGenerationType
       );
@@ -1287,11 +1441,15 @@ const buildNormalizedMetadataFromMetaHubChunk = async (
         inferredLineage = recoveredMetadata.lineage as BaseMetadata['lineage'] | undefined;
       }
 
+      let prompt = isNonBlankPromptText(payload.prompt) ? payload.prompt : recoveredMetadata?.prompt || '';
+      if (hasLegacyKrea2FalsePrompt) {
+        const recoveredPrompt = recoveredMetadata?.prompt;
+        prompt = isNonBlankPromptText(recoveredPrompt) ? recoveredPrompt : '';
+      }
+
       return {
-        prompt: typeof payload.prompt === 'string' && payload.prompt.trim()
-          ? payload.prompt
-          : recoveredMetadata?.prompt || '',
-        negativePrompt: typeof payload.negativePrompt === 'string' && payload.negativePrompt.trim()
+        prompt,
+        negativePrompt: isNonBlankPromptText(payload.negativePrompt)
           ? payload.negativePrompt
           : recoveredMetadata?.negativePrompt || '',
         model: typeof payload.model === 'string' ? payload.model : '',
@@ -1330,6 +1488,8 @@ const buildNormalizedMetadataFromMetaHubChunk = async (
         _metahub_pro: payload.imh_pro || null,
         _detection_method: 'metahub_chunk_direct',
         generator: 'ComfyUI',
+        media_type: mediaType,
+        model_3d: model3DMetadata,
       };
     }
   }
@@ -1363,7 +1523,67 @@ const buildNormalizedMetadataFromMetaHubChunk = async (
     _metahub_pro: enhancedResult._metahub_pro || null,
     _detection_method: enhancedResult._detection_method,
     generator: 'ComfyUI',
+    media_type: mediaType,
+    model_3d: model3DMetadata,
   };
+};
+
+const MODEL_3D_METADATA_MAX_BYTES = 16 * 1024 * 1024;
+
+const parseMaybeJson = (value: unknown): unknown => {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(sanitizeJson(value));
+  } catch {
+    return value;
+  }
+};
+
+const normalizeModel3DAssetExtras = (extras: unknown): ImageMetadata | null => {
+  if (!extras || typeof extras !== 'object' || Array.isArray(extras)) return null;
+  const record = extras as Record<string, unknown>;
+  const imageMetaHubData = parseMaybeJson(record.imagemetahub_data);
+  if (imageMetaHubData && typeof imageMetaHubData === 'object' && !Array.isArray(imageMetaHubData)) {
+    return { imagemetahub_data: imageMetaHubData } as ImageMetadata;
+  }
+  const workflow = parseMaybeJson(record.workflow);
+  const prompt = parseMaybeJson(record.prompt);
+  if ((workflow && typeof workflow === 'object') || (prompt && typeof prompt === 'object')) {
+    return {
+      ...(workflow && typeof workflow === 'object' ? { workflow } : {}),
+      ...(prompt && typeof prompt === 'object' ? { prompt } : {}),
+    } as ImageMetadata;
+  }
+  return null;
+};
+
+export const parseModel3DMetadataFromBuffer = (buffer: ArrayBuffer, extension: string): ImageMetadata | null => {
+  try {
+    if (buffer.byteLength > MODEL_3D_METADATA_MAX_BYTES + 20) return null;
+    if (extension !== '.glb' || buffer.byteLength < 20) return null;
+    const view = new DataView(buffer);
+    if (view.getUint32(0, false) !== 0x676c5446) return null;
+    const jsonLength = view.getUint32(12, true);
+    const jsonType = view.getUint32(16, true);
+    if (jsonType !== 0x4e4f534a || jsonLength <= 0 || jsonLength > MODEL_3D_METADATA_MAX_BYTES || 20 + jsonLength > buffer.byteLength) {
+      return null;
+    }
+    const text = trimJsonChunkPadding(new TextDecoder().decode(buffer.slice(20, 20 + jsonLength)));
+    const document = JSON.parse(text);
+    return normalizeModel3DAssetExtras(document?.asset?.extras);
+  } catch {
+    return null;
+  }
+};
+
+const readGlbMetadataFromFile = async (file: File): Promise<ImageMetadata | null> => {
+  const header = await file.slice(0, 20).arrayBuffer();
+  if (header.byteLength < 20) return null;
+  const view = new DataView(header);
+  if (view.getUint32(0, false) !== 0x676c5446 || view.getUint32(16, true) !== 0x4e4f534a) return null;
+  const jsonLength = view.getUint32(12, true);
+  if (jsonLength <= 0 || jsonLength > MODEL_3D_METADATA_MAX_BYTES || 20 + jsonLength > file.size) return null;
+  return parseModel3DMetadataFromBuffer(await file.slice(0, 20 + jsonLength).arrayBuffer(), '.glb');
 };
 
 /**
@@ -1384,13 +1604,42 @@ async function processSingleFileOptimized(
     let sidecarJson: EasyDiffusionJson | null = null;
     let bufferForDimensions: ArrayBuffer | undefined;
     let fileSizeValue: number | undefined = fileEntry.size;
-    const inferredType = fileEntry.type ?? inferMimeTypeFromName(fileEntry.handle.name);
+    // Set to true if a container metadata parser had to stop early because an
+    // item or chunk ran past the head-read buffer. Threaded through to the returned
+    // IndexedImage (`_metadataTruncated`) so the Phase B enrichment loop can tell
+    // "genuinely no metadata" apart from "metadata chunk was cut off mid-file" and
+    // decide whether a full-file re-read is needed.
+    const metadataTruncationInfo = { truncated: false };
+    const inferredType = resolveCatalogMimeType(fileEntry.handle.name, fileEntry.type);
     const isVideo = isVideoFileName(fileEntry.handle.name) || inferredType.startsWith('video/');
     const isAudio = isAudioFileName(fileEntry.handle.name) || inferredType.startsWith('audio/');
+    const isModel3D = isModel3DFileName(fileEntry.handle.name, inferredType);
+    const absolutePath = (fileEntry.handle as ElectronFileHandle)?._filePath;
     let videoInfo: VideoInfo | null = null;
     let audioInfo: AudioInfo | null = null;
 
-    if (isVideo || isAudio) {
+    if (isModel3D) {
+      const extension = getFileExtension(fileEntry.handle.name);
+      const readModel3DMetadata = (window as any).electronAPI?.readModel3DMetadata;
+      if (isElectron && absolutePath && readModel3DMetadata) {
+        const result = await readModel3DMetadata({ filePath: absolutePath });
+        const modelMetadata = result?.success && result.metadata
+          ? result.metadata as ImageMetadata
+          : null;
+        rawMetadata = modelMetadata && (result.source === 'sidecar' || result.source === 'embedded')
+          ? { ...modelMetadata, _provenanceMetadataSource: result.source } as ImageMetadata
+          : modelMetadata;
+      } else if (extension !== '.glb') {
+        rawMetadata = null;
+      } else {
+        const file = await fileEntry.handle.getFile();
+        const modelMetadata = await readGlbMetadataFromFile(file);
+        rawMetadata = modelMetadata
+          ? { ...modelMetadata, _provenanceMetadataSource: 'embedded' } as ImageMetadata
+          : null;
+        fileSizeValue = fileSizeValue ?? file.size;
+      }
+    } else if (isVideo || isAudio) {
       const mediaResult = await readMediaMetadataFromElectron(fileEntry);
       rawMetadata = mediaResult.rawMetadata;
       videoInfo = mediaResult.videoInfo ?? null;
@@ -1400,11 +1649,13 @@ async function processSingleFileOptimized(
       const view = new DataView(fileData);
       const detectedType = detectImageType(view);
       if (detectedType === 'png') {
-        rawMetadata = await parsePNGMetadata(fileData);
+        rawMetadata = await parsePNGMetadata(fileData, metadataTruncationInfo);
       } else if (detectedType === 'jpeg') {
         rawMetadata = await parseJPEGMetadata(fileData);
       } else if (detectedType === 'webp') {
-        rawMetadata = await parseWebPMetadata(fileData);
+        rawMetadata = await parseWebPMetadata(fileData, metadataTruncationInfo);
+      } else if (detectedType === 'avif') {
+        rawMetadata = await parseAvifForIndexing(fileData, metadataTruncationInfo);
       } else {
         rawMetadata = null;
       }
@@ -1430,11 +1681,13 @@ async function processSingleFileOptimized(
       const view = new DataView(fileData);
       const detectedType = detectImageType(view);
       if (detectedType === 'png') {
-        rawMetadata = await parsePNGMetadata(fileData);
+        rawMetadata = await parsePNGMetadata(fileData, metadataTruncationInfo);
       } else if (detectedType === 'jpeg') {
         rawMetadata = await parseJPEGMetadata(fileData);
       } else if (detectedType === 'webp') {
-        rawMetadata = await parseWebPMetadata(fileData);
+        rawMetadata = await parseWebPMetadata(fileData, metadataTruncationInfo);
+      } else if (detectedType === 'avif') {
+        rawMetadata = await parseAvifForIndexing(fileData, metadataTruncationInfo);
       } else {
         rawMetadata = null;
       }
@@ -1448,22 +1701,28 @@ async function processSingleFileOptimized(
       fileSizeValue = fileSizeValue ?? file.size;
     }
 
+    // Metadata acquired from the media carrier is embedded. Sidecar fallbacks below
+    // replace this source explicitly when the file itself has no usable metadata.
+    if (rawMetadata && !('_provenanceMetadataSource' in rawMetadata)) {
+      rawMetadata = { ...rawMetadata, _provenanceMetadataSource: 'embedded' } as ImageMetadata;
+    }
+
     // Try to read sidecar JSON for Easy Diffusion (fallback if no embedded metadata)
-    let absolutePath = (fileEntry.handle as ElectronFileHandle)?._filePath;
-    if (!absolutePath && isElectron && (window as any).electronAPI?.joinPaths) {
+    let resolvedAbsolutePath = absolutePath;
+    if (!resolvedAbsolutePath && isElectron && (window as any).electronAPI?.joinPaths) {
       try {
         const joinResult = await (window as any).electronAPI.joinPaths(directoryId, fileEntry.path);
         if (joinResult?.success && joinResult.path) {
-          absolutePath = joinResult.path;
+          resolvedAbsolutePath = joinResult.path;
         }
       } catch {
         // Ignore join failures and keep existing path.
       }
     }
     if (!rawMetadata) {
-      sidecarJson = await tryReadEasyDiffusionSidecarJson(fileEntry.path, absolutePath);
+      sidecarJson = await tryReadEasyDiffusionSidecarJson(fileEntry.path, resolvedAbsolutePath);
       if (sidecarJson) {
-        rawMetadata = sidecarJson;
+        rawMetadata = { ...sidecarJson, _provenanceMetadataSource: 'sidecar' } as ImageMetadata;
       }
     }
     if (profile) {
@@ -1480,10 +1739,14 @@ async function processSingleFileOptimized(
 
 let normalizedMetadata: BaseMetadata | undefined;
 if (rawMetadata) {
+  const rawMetadataRecord = rawMetadata as Record<string, unknown>;
+  const isAvifCarrier = rawMetadataRecord._carrierFormat === 'avif';
 
   // Priority 0: Check for MetaHub Save Node chunk (iTXt imagemetahub_data)
   // This has highest priority as it contains pre-extracted, validated metadata
-  if ('imagemetahub_data' in rawMetadata) {
+  // AVIF is the exception: its standalone standard XMP documents are canonical,
+  // while `imagemetahub_data` is retained only as a legacy fallback.
+  if ('imagemetahub_data' in rawMetadata && !isAvifCarrier) {
     try {
       const metaHubData = (rawMetadata as { imagemetahub_data: unknown }).imagemetahub_data;
       normalizedMetadata = await buildNormalizedMetadataFromMetaHubChunk(metaHubData);
@@ -1499,7 +1762,10 @@ if (rawMetadata) {
   }
 
   // Priority 1: Check for text-based formats (A1111, Forge, Fooocus all use 'parameters' string)
-  if (!normalizedMetadata && 'parameters' in rawMetadata && typeof rawMetadata.parameters === 'string') {
+  // ComfyUI save nodes can include an A1111-compatible `parameters` string beside
+  // their canonical prompt/workflow graph. Let the graph parser win in that case.
+  if (!normalizedMetadata && 'parameters' in rawMetadata && typeof rawMetadata.parameters === 'string'
+      && !hasUsableComfyGraphMetadata(rawMetadata)) {
     const params = rawMetadata.parameters;
     
     // Sub-priority 2.0: Check if parameters contains SwarmUI JSON format
@@ -1590,6 +1856,9 @@ if (rawMetadata) {
       prompt = rawMetadata as any;
     }
     const resolvedParams = resolvePromptFromGraph(workflow, prompt);
+    const model3DLineage = isModel3D
+      ? resolveModel3DLineageFromGraph(workflow, prompt)
+      : null;
     normalizedMetadata = {
       prompt: resolvedParams.prompt || '',
       negativePrompt: resolvedParams.negativePrompt || '',
@@ -1606,8 +1875,8 @@ if (rawMetadata) {
       loras: normalizeComfyLoras(resolvedParams),
       vae: resolvedParams.vae || resolvedParams.vaes?.[0]?.name,
       denoise: resolvedParams.denoise,
-      generationType: resolvedParams.generationType,
-      lineage: resolvedParams.lineage,
+      generationType: model3DLineage?.generationType || resolvedParams.generationType,
+      lineage: model3DLineage?.lineage || resolvedParams.lineage,
     };
   }
 
@@ -1671,9 +1940,16 @@ if (rawMetadata) {
       sidecarJson = await tryReadEasyDiffusionSidecarJson(fileEntry.path, absolutePath);
     }
     if (sidecarJson) {
-      rawMetadata = sidecarJson;
+      rawMetadata = { ...sidecarJson, _provenanceMetadataSource: 'sidecar' } as ImageMetadata;
       normalizedMetadata = parseEasyDiffusionJson(sidecarJson);
     }
+  }
+
+  if ('imagemetahub_extension' in rawMetadata) {
+    normalizedMetadata = applyImageMetaHubAvifExtension(
+      normalizedMetadata as Record<string, unknown> | undefined,
+      rawMetadataRecord.imagemetahub_extension,
+    ) as BaseMetadata | undefined;
   }
 }
 
@@ -1689,6 +1965,18 @@ if (!normalizedMetadata && isAudio) {
     audio: audioInfo,
   };
 }
+if (!normalizedMetadata && isModel3D) {
+  normalizedMetadata = {
+    prompt: '',
+    model: '',
+    width: 0,
+    height: 0,
+    steps: 0,
+    scheduler: '',
+    media_type: 'model3d',
+    model_3d: { format: getFileExtension(fileEntry.handle.name).slice(1) },
+  };
+}
 if (normalizedMetadata && isAudio) {
   normalizedMetadata.width = normalizedMetadata.width || 0;
   normalizedMetadata.height = normalizedMetadata.height || 0;
@@ -1701,6 +1989,14 @@ if (normalizedMetadata && isVideo) {
   normalizedMetadata.media_type = 'video';
   normalizedMetadata.video = normalizedMetadata.video ?? videoInfo;
   normalizedMetadata.audio = normalizedMetadata.audio ?? audioInfo;
+}
+if (normalizedMetadata && isModel3D) {
+  normalizedMetadata.width = 0;
+  normalizedMetadata.height = 0;
+  normalizedMetadata.media_type = 'model3d';
+  normalizedMetadata.model_3d = normalizedMetadata.model_3d ?? {
+    format: getFileExtension(fileEntry.handle.name).slice(1),
+  };
 }
 
 // ==============================================================================
@@ -1730,7 +2026,11 @@ if (normalizedMetadata && isVideo) {
     const workflowNodes = extractWorkflowNodeTypesFromMetadata(rawMetadata);
 
     // Determine the best date for sorting (generation date vs file date)
-    const sortDate = fileEntry.birthtimeMs ?? fileEntry.lastModified ?? Date.now();
+    const sortDate = resolveFileSortDate(
+      fileEntry.birthtimeMs,
+      fileEntry.contentModifiedMs,
+      fileEntry.lastModified
+    );
 
     if (profile) {
       profile.totalMs = performance.now() - totalStart;
@@ -1761,10 +2061,11 @@ if (normalizedMetadata && isVideo) {
       cfgScale: normalizedMetadata?.cfgScale ?? normalizedMetadata?.cfg_scale ?? null,
       steps: normalizedMetadata?.steps || null,
       seed: normalizedMetadata?.seed || null,
-      dimensions: normalizedMetadata?.dimensions || `${normalizedMetadata?.width || 0}x${normalizedMetadata?.height || 0}`,
+      dimensions: isModel3D ? undefined : (normalizedMetadata?.dimensions || `${normalizedMetadata?.width || 0}x${normalizedMetadata?.height || 0}`),
       workflowNodes,
       fileSize: normalizedFileSize,
       fileType: normalizedFileType,
+      _metadataTruncated: metadataTruncationInfo.truncated,
     } as IndexedImage;
   } catch (error) {
     console.error(`Skipping file ${fileEntry.handle.name} due to an error:`, error);
@@ -1777,7 +2078,14 @@ export async function reparseIndexedImage(
   directoryPath: string,
   options: { compactRawMetadata?: boolean } = {}
 ): Promise<IndexedImage | null> {
-  if (!window.electronAPI?.joinPaths || !window.electronAPI?.readFile) {
+  const isModel3D = isModel3DFileName(
+    image.name,
+    image.fileType ?? inferMimeTypeFromName(image.name)
+  );
+  if (
+    !window.electronAPI?.joinPaths
+    || (isModel3D ? !window.electronAPI.readModel3DMetadata : !window.electronAPI.readFile)
+  ) {
     throw new Error('Metadata reparsing is only available in the desktop app.');
   }
 
@@ -1788,17 +2096,20 @@ export async function reparseIndexedImage(
   }
 
   const absolutePath = joined.path;
-  const readResult = await window.electronAPI.readFile(absolutePath);
-  if (!readResult.success || !readResult.data) {
-    throw new Error(readResult.error || 'Failed to read the image file.');
+  let fileData: ArrayBuffer | undefined;
+  if (!isModel3D) {
+    const readResult = await window.electronAPI.readFile(absolutePath);
+    if (!readResult.success || !readResult.data) {
+      throw new Error(readResult.error || 'Failed to read the image file.');
+    }
+    const bytes = new Uint8Array(readResult.data);
+    fileData = bytes.slice().buffer;
   }
 
   const statsResult = window.electronAPI.getFileStats
     ? await window.electronAPI.getFileStats(absolutePath)
     : { success: false } as { success: boolean; stats?: any; error?: string };
   const stats = statsResult.success ? statsResult.stats : undefined;
-  const bytes = new Uint8Array(readResult.data);
-  const fileData = bytes.slice().buffer;
 
   const fileEntry: CatalogFileEntry = {
     handle: {
@@ -1813,7 +2124,7 @@ export async function reparseIndexedImage(
       : (image.contentModifiedMs ?? image.lastModified),
     size: typeof stats?.size === 'number' ? stats.size : image.fileSize,
     type: image.fileType ?? inferMimeTypeFromName(image.name),
-    birthtimeMs: typeof stats?.birthtimeMs === 'number' ? stats.birthtimeMs : undefined,
+    birthtimeMs: normalizeBirthtimeMs(stats?.birthtimeMs),
   };
 
   return processSingleFileOptimized(
@@ -1877,7 +2188,7 @@ export async function indexImageFileAtPath(
     contentModifiedMs: typeof stats?.mtimeMs === 'number' ? stats.mtimeMs : undefined,
     size: typeof stats?.size === 'number' ? stats.size : fileData.byteLength,
     type: inferMimeTypeFromName(fileName),
-    birthtimeMs: typeof stats?.birthtimeMs === 'number' ? stats.birthtimeMs : undefined,
+    birthtimeMs: normalizeBirthtimeMs(stats?.birthtimeMs),
   };
 
   const indexed = await processSingleFileOptimized(fileEntry, directory.id, fileData);
@@ -1949,6 +2260,7 @@ interface ProcessFilesOptions {
   enrichmentBatchSize?: number;
   onEnrichmentProgress?: (progress: { processed: number; total: number } | null) => void;
   hydratePreloadedImages?: boolean;
+  provenanceIdentityForPath?: (relativePath: string) => Pick<IndexedImage, 'assetId' | 'revisionId' | 'provenanceLocationId' | 'provenanceRootId'> | undefined;
 }
 
 export interface ProcessFilesResult {
@@ -2010,10 +2322,20 @@ function compactRawMetadataForRuntime(
     compactedRawMetadata.parametersPreview = rawMetadata.parameters.slice(0, RAW_METADATA_PREVIEW_BYTES);
   }
 
+  for (const key of ['_carrierFormat', '_carrierConflicts', '_provenanceMetadataSource', 'imagemetahub_extension'] as const) {
+    if (key in rawMetadata) {
+      compactedRawMetadata[key] = (rawMetadata as Record<string, unknown>)[key];
+    }
+  }
+
   if ('imagemetahub_data' in rawMetadata && rawMetadata.imagemetahub_data && typeof rawMetadata.imagemetahub_data === 'object') {
     const payload = rawMetadata.imagemetahub_data as Record<string, unknown>;
     compactedRawMetadata.imagemetahub_data = {
       generator: payload.generator,
+      source_generator: payload.source_generator,
+      edited_at: payload.edited_at,
+      exported_at: payload.exported_at,
+      edit: payload.edit,
       analytics: payload.analytics,
       _analytics: payload._analytics,
       imh_pro: payload.imh_pro,
@@ -2055,6 +2377,10 @@ function mapIndexedImageToCache(image: IndexedImage): CacheImageMetadata {
     enrichmentState: image.enrichmentState,
     fileSize: image.fileSize,
     fileType: image.fileType,
+    assetId: image.assetId,
+    revisionId: image.revisionId,
+    provenanceLocationId: image.provenanceLocationId,
+    provenanceRootId: image.provenanceRootId,
     clusterId: image.clusterId,
     clusterPosition: image.clusterPosition,
     autoTags: image.autoTags,
@@ -2369,8 +2695,12 @@ export async function processFiles(
   ): IndexedImage => {
     const stat = statsLookup.get(entry.path);
     const fileSize = entry.size ?? stat?.size;
-    const inferredType = entry.type ?? stat?.type ?? inferMimeTypeFromName(entry.handle.name);
-    const sortDate = entry.birthtimeMs ?? stat?.birthtimeMs ?? entry.lastModified;
+    const inferredType = resolveCatalogMimeType(entry.handle.name, entry.type, stat?.type);
+    const sortDate = resolveFileSortDate(
+      normalizeBirthtimeMs(entry.birthtimeMs) ?? normalizeBirthtimeMs(stat?.birthtimeMs),
+      entry.contentModifiedMs,
+      entry.lastModified
+    );
     const catalogMetadata = {
       phase: 'catalog',
       fileSize,
@@ -2385,6 +2715,7 @@ export async function processFiles(
       lastModified: sortDate,
     });
 
+    const provenanceIdentity = options.provenanceIdentityForPath?.(entry.path);
     return {
       id: `${directoryId}::${entry.path}`,
       name: entry.handle.name,
@@ -2412,6 +2743,7 @@ export async function processFiles(
       enrichmentState: needsEnrichment ? 'catalog' : 'enriched',
       fileSize,
       fileType: inferredType,
+      ...provenanceIdentity,
     };
   };
 
@@ -2419,8 +2751,14 @@ export async function processFiles(
   const preloadedImages = options.preloadedImages ?? [];
   const hydratePreloadedImages = options.hydratePreloadedImages ?? true;
   for (const image of preloadedImages) {
+    const idPrefix = `${directoryId}::`;
+    const originalRelativePath = image.id.startsWith(idPrefix)
+      ? image.id.slice(idPrefix.length)
+      : image.name;
+    const provenanceIdentity = options.provenanceIdentityForPath?.(originalRelativePath);
     const stub = {
       ...image,
+      ...provenanceIdentity,
       directoryId,
       directoryName,
       enrichmentState: image.enrichmentState ?? 'enriched',
@@ -2627,8 +2965,6 @@ export async function processFiles(
     const resultsBatch: IndexedImage[] = [];
     const touchedChunks = new Set<number>();
     const DIRTY_CHUNK_FLUSH_THRESHOLD = 12;
-    const DIRTY_FLUSH_INTERVAL_MS = 350;
-    let lastFlushTime = performance.now();
     const canWriteCache = Boolean(cacheWriter);
     const DEFER_CACHE_FLUSH_THRESHOLD = 5000;
     const deferCacheFlush = canWriteCache && totalEnrichment >= DEFER_CACHE_FLUSH_THRESHOLD;
@@ -2778,14 +3114,11 @@ export async function processFiles(
         detail: { depth: queueLength - phaseBStats.processed }
       });
 
-      const now = performance.now();
       if (
         resultsBatch.length >= enrichmentBatchSize ||
-        (canWriteCache && !deferCacheFlush && touchedChunks.size >= DIRTY_CHUNK_FLUSH_THRESHOLD) ||
-        now - lastFlushTime >= DIRTY_FLUSH_INTERVAL_MS
+        (canWriteCache && !deferCacheFlush && touchedChunks.size >= DIRTY_CHUNK_FLUSH_THRESHOLD)
       ) {
         await commitBatch();
-        lastFlushTime = now;
       }
 
       return merged;
@@ -2939,13 +3272,26 @@ export async function processFiles(
       if (!fileSize || fileSize <= buffer.byteLength) {
         return false;
       }
+      const fileType = resolveCatalogMimeType(entry.source.handle.name, entry.source.type);
+      // PNG, WebP, and AVIF can all reference metadata beyond a 64 KB head read.
+      // AVIF commonly places XMP near the end of the ISO-BMFF file.
+      if (fileType !== 'image/png' && fileType !== 'image/webp' && fileType !== 'image/avif') {
+        return false;
+      }
+      // Explicit signal: the head-read buffer cut a chunk off mid-file (e.g. a large
+      // ComfyUI `workflow`/`prompt` chunk). Whatever `enriched` we got from the partial
+      // buffer may look non-empty (another, smaller chunk may have parsed fine) but is
+      // still incomplete/wrong, so we must always re-read the full file in that case —
+      // regardless of whether metadata happens to be present.
+      if (enriched?._metadataTruncated) {
+        return true;
+      }
       const hasMetadata = Boolean(enriched?.metadataString) ||
         (enriched?.metadata && Object.keys(enriched.metadata).length > 0);
       if (hasMetadata) {
         return false;
       }
-      const fileType = entry.source.type ?? inferMimeTypeFromName(entry.source.handle.name);
-      return fileType === 'image/png';
+      return true;
     };
 
     const shouldCheckTailForMetaHub = (
@@ -2966,7 +3312,7 @@ export async function processFiles(
       if (!fileSize || fileSize <= buffer.byteLength) {
         return false;
       }
-      const fileType = entry.source.type ?? inferMimeTypeFromName(entry.source.handle.name);
+      const fileType = resolveCatalogMimeType(entry.source.handle.name, entry.source.type);
       if (fileType !== 'image/png') {
         return false;
       }
@@ -3066,6 +3412,13 @@ export async function processFiles(
             : undefined;
           const enriched = await processSingleFileOptimized(entry.source, directoryId, buffer, profile);
           if (shouldFallbackToFullRead(entry, buffer, enriched)) {
+            // Keep the partial head-read result as a floor. The full-read fallback
+            // overwrites this on success, but when the full read is skipped —
+            // e.g. the file is over FULL_READ_FALLBACK_MAX_FILE_BYTES — we still
+            // apply whatever metadata the head parse recovered (such as a small
+            // `prompt`/`parameters` chunk before a truncated `workflow` chunk)
+            // instead of dropping the image to catalog-only.
+            resultsById.set(entry.image.id, { enriched, profile });
             fallbackEntries.push(entry);
             return null;
           }
@@ -3181,7 +3534,15 @@ export async function processFiles(
             if (fullReadResult.success && Array.isArray(fullReadResult.files)) {
               for (const file of fullReadResult.files) {
                 if (!file.success || !file.data) {
-                  if (file.errorType === 'FILE_TOO_LARGE' || file.errorType === 'BATCH_BYTE_LIMIT') {
+                  // FILE_TOO_LARGE is a hard per-file cap: the file cannot be read via
+                  // the batch IPC at all, so block it and keep the partial head floor.
+                  // BATCH_BYTE_LIMIT is different — it only means this file didn't fit the
+                  // batch's rolling byte budget. The file is individually under the cap,
+                  // and which files overflow the budget is non-deterministic across scans
+                  // (fallback order comes from the concurrent head-parse). Leaving it
+                  // blocked cached a truncated parse for large ComfyUI workflows (#448).
+                  // Keep it unblocked so the per-file full-read fallback below re-reads it.
+                  if (file.errorType === 'FILE_TOO_LARGE') {
                     const imageId = fallbackPathToImageId.get(file.path);
                     if (imageId) {
                       blockedFromGenericFallback.add(imageId);
@@ -3232,6 +3593,15 @@ export async function processFiles(
           if (missingEntries.has(entry.image.id)) {
             if (!blockedFromGenericFallback.has(entry.image.id)) {
               await iterator(entry);
+            } else {
+              // Blocked from the full-read fallback (server reported the file/batch
+              // too large). We can't re-read, but a partial head-read floor may have
+              // been recorded before the fallback was attempted — apply it instead of
+              // dropping the image to catalog-only.
+              const result = resultsById.get(entry.image.id);
+              if (result) {
+                await applyMergedEntry(entry, result.enriched, result.profile, queue.length);
+              }
             }
             continue;
           }

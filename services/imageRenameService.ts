@@ -1,9 +1,15 @@
 import type { IndexedImage } from '../types';
 import cacheManager from './cacheManager';
 import { transferImagePersistence } from './imageAnnotationsStorage';
+import {
+  getUserDataPersistenceStatus,
+  prepareUserDataForImages,
+  registerStableUserDataImages,
+} from './userDataPersistenceAdapter';
 import { FileOperations } from './fileOperations';
 import { useImageStore } from '../store/useImageStore';
 import { getRelativeImagePath, splitRelativePath } from '../utils/imagePaths';
+import { getUnsupportedModel3DRenameError } from '../utils/model3DTransfer';
 
 export interface RenameImageResult {
   success: boolean;
@@ -52,6 +58,11 @@ export async function renameIndexedImage(
     return { success: true, newImageId: oldImageId, newRelativePath, image };
   }
 
+  const unsupportedModelRenameError = getUnsupportedModel3DRenameError(image);
+  if (unsupportedModelRenameError) {
+    return { success: false, error: unsupportedModelRenameError };
+  }
+
   if (image.directoryId) {
     const newImageId = `${image.directoryId}::${newRelativePath}`;
     const targetAlreadyIndexed = useImageStore
@@ -62,6 +73,15 @@ export async function renameIndexedImage(
     if (targetAlreadyIndexed) {
       return { success: false, error: 'An image with that filename already exists in this folder.' };
     }
+  }
+
+  try {
+    await prepareUserDataForImages([image]);
+  } catch (error) {
+    return {
+      success: false,
+      error: `The file was not renamed because its local user data could not be staged safely: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 
   const { fileName: newFileName } = splitRelativePath(newRelativePath);
@@ -75,7 +95,24 @@ export async function renameIndexedImage(
     return { success: false, error: 'Renamed file, but failed to update the library record.' };
   }
 
-  await transferImagePersistence(oldImageId, renamedImage.id, 'move');
+  registerStableUserDataImages([renamedImage]);
+  const userDataStatus = await getUserDataPersistenceStatus();
+  if (userDataStatus.authority !== 'sqlite') {
+    await transferImagePersistence(oldImageId, renamedImage.id, 'move');
+  }
+
+  // Move the visual-search vector to the new id. The embedding is unchanged, so
+  // this only rebinds the row; without it every rename would orphan a vector and
+  // force a re-embed. Best-effort: the index may not be open, and a failure here
+  // must not fail the rename.
+  try {
+    const { isOpen, applyRename } = await import('./embeddings/semanticSearchEngine');
+    if (isOpen()) {
+      await applyRename(oldImageId, renamedImage.id);
+    }
+  } catch {
+    // Visual search not in use; nothing to migrate.
+  }
 
   const directory = useImageStore.getState().directories.find((entry) => entry.id === renamedImage.directoryId);
   if (directory) {

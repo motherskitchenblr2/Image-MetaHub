@@ -1,6 +1,7 @@
 import React from 'react';
 import { Crown, Sparkles, TrendingUp } from 'lucide-react';
 import { useFeatureAccess } from '../hooks/useFeatureAccess';
+import { TRIAL_DURATION_DAYS } from '../store/useLicenseStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { buildProLicenseUrl } from '../utils/creatorAttribution';
 
@@ -17,7 +18,7 @@ const ClusterUpgradeBanner: React.FC<ClusterUpgradeBannerProps> = ({
 }) => {
   const { showProModal, canStartTrial } = useFeatureAccess();
   const creatorAttributionToken = useSettingsStore((state) => state.creatorAttributionToken);
-  const proLicenseUrl = buildProLicenseUrl(creatorAttributionToken);
+  const proLicenseUrl = buildProLicenseUrl(creatorAttributionToken, 'banner');
 
   return (
     <div className="mt-6 bg-gradient-to-r from-purple-900/30 to-blue-900/30 border border-purple-500/30 rounded-lg p-4">
@@ -58,7 +59,7 @@ const ClusterUpgradeBanner: React.FC<ClusterUpgradeBannerProps> = ({
 
           {canStartTrial && (
             <p className="text-xs text-gray-400 mt-2">
-              💡 Start your 3-day trial to test unlimited clustering
+              💡 Start your {TRIAL_DURATION_DAYS}-day trial to test unlimited clustering
             </p>
           )}
         </div>

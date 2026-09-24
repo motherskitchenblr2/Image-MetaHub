@@ -1,10 +1,10 @@
 import React, { useEffect, useLayoutEffect, useState, FC, useCallback, useMemo, useRef } from 'react';
-import { type IndexedImage, type BaseMetadata, type LoRAInfo, type SmartCollection, type ImageEditRecipe } from '../types';
+import { type IndexedImage, type BaseMetadata, type LoRAInfo, type SmartCollection, type ImageEditRecipe, type TagInfo } from '../types';
 import { FileOperations } from '../services/fileOperations';
 import { getRenameBasename, renameIndexedImage } from '../services/imageRenameService';
-import { copyImageToClipboard, showInExplorer } from '../utils/imageUtils';
+import { copyImageToClipboard, copyTextToClipboard, showInExplorer } from '../utils/imageUtils';
 import { motion } from 'framer-motion';
-import { AlertTriangle, Copy, Pencil, Trash2, ChevronDown, ChevronRight, Folder, Download, Clipboard, Sparkles, GitCompare, Heart, X, Zap, CheckCircle, ArrowUp, Play, Pause, Volume2, VolumeX, Repeat, Eye, EyeOff, Search, Minus, Maximize2, Minimize2, RefreshCw, SlidersHorizontal, Workflow, Image as ImageIcon, ExternalLink } from 'lucide-react';
+import { AlertTriangle, Copy, Pencil, Pin, Trash2, ChevronDown, ChevronRight, Folder, Download, Clipboard, Sparkles, GitCompare, Heart, X, Zap, CheckCircle, ArrowUp, Play, Pause, Volume2, VolumeX, Repeat, Repeat1, Shuffle, Eye, EyeOff, Search, Minus, Maximize2, Minimize2, RefreshCw, SlidersHorizontal, Workflow, Image as ImageIcon, ExternalLink, Bookmark } from 'lucide-react';
 import { useCopyToA1111 } from '../hooks/useCopyToA1111';
 import { useGenerateWithA1111 } from '../hooks/useGenerateWithA1111';
 import { useCopyToComfyUI } from '../hooks/useCopyToComfyUI';
@@ -17,14 +17,26 @@ import { A1111GenerateModal, type GenerationParams as A1111GenerationParams } fr
 import { type GenerationParams as ComfyUIGenerationParams } from './ComfyUIGenerateModal';
 import ComfyUIWorkflowWorkspace from './ComfyUIWorkflowWorkspace';
 import ProBadge from './ProBadge';
+import { CivitaiResourceLink } from './CivitaiResourceLink';
+import { extractResourceRefs, normalizeResourceName, type ResourceRef } from '../services/civitai/resourceExtraction';
 import hotkeyManager from '../services/hotkeyManager';
 import { useImageStore } from '../store/useImageStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { getElectronAbsoluteMediaPath, mediaSourceCache } from '../services/mediaSourceCache';
+import { mediaDecodeCache } from '../services/mediaDecodeCache';
 import { useResolvedThumbnail } from '../hooks/useResolvedThumbnail';
-import cacheManager from '../services/cacheManager';
-import { indexImageFileAtPath, reparseIndexedImage } from '../services/fileIndexer';
-import { hasCompactedRuntimeMetadata, hydrateImageRawMetadata } from '../services/rawMetadataHydration';
+import { hasCompactedRuntimeMetadata, hydrateImageRawMetadata, type RawMetadataHydrationOptions } from '../services/rawMetadataHydration';
+import {
+  toImageViewerMaskFileDTO,
+  type ImageViewerGenerateRequest,
+  type ImageViewerSaveRequest,
+  type ImageViewerSaveResult,
+} from '../services/imageViewerContracts';
+import {
+  indexSavedEditedImageCopy,
+  reindexOverwrittenEditedImage,
+} from '../services/editedImageIndexing';
+import { TEMPORARY_STATUS_TIMEOUT_MS } from '../utils/imageMetadata';
 import {
   DEFAULT_IMAGE_EDIT_RECIPE,
   clampImageEditCropRect,
@@ -36,15 +48,18 @@ import {
   renderEditedImageToPngBytes,
 } from '../services/imageEditingService';
 
-import { bulkSaveShadowMetadata } from '../services/imageAnnotationsStorage';
+import { prepareUserDataForImages, saveShadows } from '../services/userDataPersistenceAdapter';
 import { copyEditableMetadata, readEditableMetadataClipboard } from '../services/metadataClipboard';
 import { hasVerifiedTelemetry } from '../utils/telemetryDetection';
+import { getAvifCarrierConflicts } from '../utils/imageMetaHubAvifExtension.mjs';
 import { buildEffectiveMetadata, getEditableMetadataFields } from '../utils/editableMetadata';
 import { eventMatchesKeybinding, isTypingElement } from '../utils/hotkeyUtils';
 import { useShadowMetadata } from '../hooks/useShadowMetadata';
+import { useIsPromptSaved, useSavePrompt } from '../hooks/useSavePrompt';
 import { MetadataEditorModal, type MetadataEditorDraft } from './MetadataEditorModal';
 import BatchExportModal from './BatchExportModal';
 import ImageLineageSection from './ImageLineageSection';
+import ProvenanceSection from './ProvenanceSection';
 import { getGenerationTypeLabel } from '../utils/imageLineage';
 import RatingStars from './RatingStars';
 import TagInputCombobox from './TagInputCombobox';
@@ -52,8 +67,9 @@ import { getRecentTagChips } from '../utils/tagSuggestions';
 import CollectionFormModal, { CollectionFormValues } from './CollectionFormModal';
 import AudioPlayer from './AudioPlayer';
 import ImageAdjustmentPanel from './ImageAdjustmentPanel';
+import Model3DViewer from './Model3DViewer';
 import { getRelativeImagePath, splitRelativePath } from '../utils/imagePaths';
-import { getFileExtension, isAudioFileName, isVideoFileName, SUPPORTED_MEDIA_EXTENSIONS } from '../utils/mediaTypes.js';
+import { getFileExtension, isAudioFileName, isModel3DFileName, isVideoFileName, SUPPORTED_MEDIA_EXTENSIONS } from '../utils/mediaTypes.js';
 import { type MediaDiagnosticsContext, useMediaDiagnostics } from '../hooks/useMediaDiagnostics';
 import {
   createProfilerOnRender,
@@ -145,101 +161,35 @@ const getUsableNormalizedMetadata = (image: IndexedImage): BaseMetadata | undefi
   };
 };
 
-const firstNonBlankString = (...values: Array<string | undefined | null>): string | undefined => {
-  for (const value of values) {
-    if (typeof value === 'string' && value.trim().length > 0) {
-      return value;
-    }
-  }
-  return undefined;
-};
-
-const firstNonEmptyArray = <T,>(...values: Array<T[] | undefined | null>): T[] | undefined => {
-  for (const value of values) {
-    if (Array.isArray(value) && value.length > 0) {
-      return value;
-    }
-  }
-  return undefined;
-};
-
-const firstDefined = <T,>(...values: Array<T | undefined | null>): T | undefined => {
-  for (const value of values) {
-    if (value !== undefined && value !== null) {
-      return value;
-    }
-  }
-  return undefined;
-};
-
-const mergeEditedNormalizedMetadata = (
-  parsedMetadata?: BaseMetadata,
-  sourceMetadata?: BaseMetadata,
-): BaseMetadata | undefined => {
-  if (!parsedMetadata) {
-    return sourceMetadata;
-  }
-  if (!sourceMetadata) {
-    return parsedMetadata;
-  }
-
-  const merged: BaseMetadata = {
-    ...sourceMetadata,
-    ...parsedMetadata,
-    prompt: firstNonBlankString(parsedMetadata.prompt, sourceMetadata.prompt) || '',
-    negativePrompt: firstNonBlankString(parsedMetadata.negativePrompt, sourceMetadata.negativePrompt) || '',
-    model: firstNonBlankString(parsedMetadata.model, sourceMetadata.model) || '',
-    models: firstNonEmptyArray(parsedMetadata.models, sourceMetadata.models) || [],
-    loras: firstNonEmptyArray(parsedMetadata.loras, sourceMetadata.loras) || [],
-    sampler: firstNonBlankString(parsedMetadata.sampler, sourceMetadata.sampler) || '',
-    scheduler: firstNonBlankString(parsedMetadata.scheduler, sourceMetadata.scheduler) || '',
-    board: firstNonBlankString(parsedMetadata.board, sourceMetadata.board),
-    cfgScale: firstDefined(parsedMetadata.cfgScale, parsedMetadata.cfg_scale, sourceMetadata.cfgScale, sourceMetadata.cfg_scale),
-    cfg_scale: firstDefined(parsedMetadata.cfg_scale, parsedMetadata.cfgScale, sourceMetadata.cfg_scale, sourceMetadata.cfgScale),
-    steps: firstDefined(parsedMetadata.steps, sourceMetadata.steps) || 0,
-    seed: firstDefined(parsedMetadata.seed, sourceMetadata.seed),
-  };
-
-  return merged;
-};
-
-const scheduleEditedImageCacheUpsert = (
-  directory: { path: string; name: string },
-  image: IndexedImage,
-  scanSubfolders: boolean,
-) => {
-  window.setTimeout(() => {
-    const cacheModes = Array.from(new Set([scanSubfolders, !scanSubfolders]));
-    Promise.all(
-      cacheModes.map((scanSubfoldersMode) =>
-        cacheManager.applyChunkedCacheDelta(
-          directory.path,
-          directory.name,
-          [image],
-          [],
-          [],
-          scanSubfoldersMode,
-        )
-      )
-    ).catch((error) => {
-      console.error('Failed to update cache after edited image save:', error);
-    });
-  }, 0);
-};
-
 interface ImageModalProps {
+  hostMode?: 'inline' | 'native-window';
   modalId?: string;
   image: IndexedImage;
+  prefetchPrevious?: { image: IndexedImage; directoryPath: string } | null;
+  prefetchNext?: { image: IndexedImage; directoryPath: string } | null;
   onClose: () => void;
   onFindSimilar?: (image: IndexedImage) => void;
   onOpenComfyUIWorkflow?: (image: IndexedImage) => void;
   onOpenImageEditor?: (image: IndexedImage) => void;
   onImageDeleted?: (imageId: string) => void;
   onImageRenamed?: (oldImageId: string, newImageId: string, newRelativePath: string) => void;
+  onRequestDelete?: (imageId: string) => Promise<{ success: boolean; error?: string; handledNavigation?: boolean }>;
+  onRequestRename?: (imageId: string, newName: string) => Promise<{ success: boolean; error?: string; newImageId?: string; newRelativePath?: string }>;
+  onRequestReparse?: (imageId: string) => Promise<{ success: boolean; error?: string }>;
+  onRequestTagSuggestions?: (query: string) => Promise<TagInfo[]>;
+  onRequestGenerate?: (request: ImageViewerGenerateRequest) => Promise<{ success: boolean; error?: string }>;
+  onImageSaved?: (request: ImageViewerSaveRequest) => Promise<ImageViewerSaveResult>;
+  onRequestBatchExport?: (imageId: string) => Promise<{ success: boolean; error?: string }>;
+  isAlwaysOnTop?: boolean;
+  onToggleAlwaysOnTop?: () => void;
   currentIndex?: number;
   totalImages?: number;
   onNavigateNext?: () => void;
   onNavigatePrevious?: () => void;
+  /** Advance to the next item, wrapping back to the first one at the end of the list. */
+  onNavigateNextWrapping?: () => void;
+  /** Jump to a random item of the current navigation list. */
+  onNavigateRandom?: () => void;
   directoryPath?: string;
   isIndexing?: boolean;
   zIndex?: number;
@@ -571,7 +521,7 @@ const SUPPORTED_MEDIA_EXTENSION_REGEX = new RegExp(
   'i'
 );
 
-const MetadataItem: FC<{ label: string; value?: string | number | any[]; isPrompt?: boolean; onCopy?: (value: string) => void | Promise<void | boolean> }> = ({ label, value, isPrompt = false, onCopy }) => {
+const MetadataItem: FC<{ label: string; value?: string | number | any[]; isPrompt?: boolean; onCopy?: (value: string) => void | Promise<void | boolean>; renderValue?: (displayValue: string) => React.ReactNode }> = ({ label, value, isPrompt = false, onCopy, renderValue }) => {
   const [copied, setCopied] = useState(false);
 
   if (value === null || value === undefined || value === '' || (Array.isArray(value) && value.length === 0)) {
@@ -595,20 +545,21 @@ const MetadataItem: FC<{ label: string; value?: string | number | any[]; isPromp
       <div className="flex justify-between items-start">
         <p className="font-semibold text-gray-400 text-xs uppercase tracking-wider">{label}</p>
         {onCopy && (
-            <button
+            <motion.button
               onClick={handleCopy}
+              whileTap={{ scale: 0.85 }}
               className={`transition-all duration-200 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none rounded-sm ${copied ? 'opacity-100 text-green-400' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-gray-400 hover:text-white'}`}
               title={copied ? 'Copied!' : `Copy ${label}`}
               aria-label={copied ? 'Copied!' : `Copy ${label}`}
             >
                 {copied ? <CheckCircle className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            </button>
+            </motion.button>
         )}
       </div>
       {isPrompt ? (
         <pre className="text-gray-200 whitespace-pre-wrap break-words font-mono text-sm mt-1">{displayValue}</pre>
       ) : (
-        <p className="text-gray-200 break-words font-mono text-sm mt-1">{displayValue}</p>
+        <p className="text-gray-200 break-words font-mono text-sm mt-1">{renderValue ? renderValue(displayValue) : displayValue}</p>
       )}
     </div>
   );
@@ -624,6 +575,7 @@ const formatTime = (seconds: number) => {
 const VideoPlayer: React.FC<{
   src: string;
   poster?: string;
+  autoPlay?: boolean;
   onContextMenu?: React.MouseEventHandler;
   onLoadedMetadata?: React.ReactEventHandler<HTMLVideoElement>;
   onCanPlay?: React.ReactEventHandler<HTMLVideoElement>;
@@ -632,7 +584,7 @@ const VideoPlayer: React.FC<{
   externalPath?: string | null;
   diagnostics?: Omit<MediaDiagnosticsContext, 'mediaKind' | 'src'>;
   hasAudioTrack?: boolean;
-}> = ({ src, poster, onContextMenu, onLoadedMetadata, onCanPlay, onPlaying, onEnded, externalPath, diagnostics, hasAudioTrack = false }) => {
+}> = ({ src, poster, autoPlay = true, onContextMenu, onLoadedMetadata, onCanPlay, onPlaying, onEnded, externalPath, diagnostics, hasAudioTrack = false }) => {
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [audioRendererFailed, setAudioRendererFailed] = useState(false);
@@ -661,9 +613,11 @@ const VideoPlayer: React.FC<{
   const [isMuted, setIsMuted] = useState(() => {
     return localStorage.getItem('video_player_muted') === 'true';
   });
-  const [isLooping, setIsLooping] = useState(() => {
-    return localStorage.getItem('video_player_loop') === 'true';
-  });
+
+  const repeatMode = useSettingsStore((state) => state.videoRepeatMode);
+  const setRepeatMode = useSettingsStore((state) => state.setVideoRepeatMode);
+  const isShuffling = useSettingsStore((state) => state.videoShuffle);
+  const setVideoShuffle = useSettingsStore((state) => state.setVideoShuffle);
 
   useEffect(() => {
     setAudioRendererFailed(false);
@@ -674,15 +628,16 @@ const VideoPlayer: React.FC<{
     if (videoRef.current) {
       videoRef.current.volume = volume;
       videoRef.current.muted = isMuted;
-      videoRef.current.loop = isLooping;
+      // Native loop only covers "repeat one". It also suppresses the `ended` event, which is
+      // what the parent relies on to advance for "repeat all" / shuffle.
+      videoRef.current.loop = repeatMode === 'one';
     }
-  }, [volume, isMuted, isLooping]);
+  }, [volume, isMuted, repeatMode]);
 
   useEffect(() => {
      localStorage.setItem('video_player_volume', volume.toString());
      localStorage.setItem('video_player_muted', isMuted.toString());
-     localStorage.setItem('video_player_loop', isLooping.toString());
-  }, [volume, isMuted, isLooping]);
+  }, [volume, isMuted]);
 
   const togglePlay = useCallback((e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -700,10 +655,27 @@ const VideoPlayer: React.FC<{
     setIsMuted(prev => !prev);
   }, []);
 
-  const toggleLoop = useCallback((e: React.MouseEvent) => {
+  const cycleRepeatMode = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
-    setIsLooping(prev => !prev);
-  }, []);
+    setRepeatMode(repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off');
+  }, [repeatMode, setRepeatMode]);
+
+  const toggleShuffle = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    setVideoShuffle(!isShuffling);
+  }, [isShuffling, setVideoShuffle]);
+
+  const repeatModeLabel = repeatMode === 'one'
+    ? 'Repeat one'
+    : repeatMode === 'all'
+      ? 'Repeat all'
+      : 'Repeat off';
+  const repeatModeShortLabel = repeatMode === 'one' ? '1' : repeatMode === 'all' ? 'All' : 'Off';
+  const repeatModeTitle = repeatMode === 'one'
+    ? 'Repeat one: replay this file'
+    : repeatMode === 'all'
+      ? 'Repeat all: continue through the file list'
+      : 'Repeat off: stop when this file ends';
 
   const handleTimeUpdate = () => {
     if (videoRef.current) {
@@ -786,7 +758,8 @@ const VideoPlayer: React.FC<{
         src={src}
         className="max-w-full max-h-full object-contain"
         poster={poster}
-        autoPlay
+        autoPlay={autoPlay}
+        preload="metadata"
         playsInline
         onLoadStart={mediaDiagnostics.onLoadStart}
         onTimeUpdate={handleTimeUpdate}
@@ -821,7 +794,7 @@ const VideoPlayer: React.FC<{
 
       {/* Center Play Button Overlay (only when paused and not hovering controls) */}
       {!isPlaying && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
           <button
             type="button"
             aria-label="Play video"
@@ -835,8 +808,8 @@ const VideoPlayer: React.FC<{
       )}
 
       {/* Controls Overlay */}
-      <div 
-        className={`absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent transition-opacity duration-300 ${isHovering || !isPlaying ? 'opacity-100' : 'opacity-0'}`}
+      <div
+        className={`absolute bottom-0 left-0 right-0 z-30 p-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent transition-opacity duration-300 ${isHovering || !isPlaying ? 'opacity-100' : 'opacity-0'}`}
         onClick={(e) => e.stopPropagation()} // Prevent clicking controls from toggling play
       >
         {/* Progress Bar */}
@@ -889,13 +862,23 @@ const VideoPlayer: React.FC<{
             </div>
 
             <div className="flex items-center gap-4">
-                <button 
-                  onClick={toggleLoop} 
-                  className={`transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded ${isLooping ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}
-                  title={isLooping ? "Loop On" : "Loop Off"}
-                  aria-label={isLooping ? "Loop On" : "Loop Off"}
+                <button
+                  onClick={toggleShuffle}
+                  className={`transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded ${isShuffling ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}
+                  title={isShuffling ? "Shuffle on" : "Shuffle off"}
+                  aria-label={isShuffling ? "Shuffle on" : "Shuffle off"}
+                  aria-pressed={isShuffling}
                 >
-                    <Repeat size={18} />
+                    <Shuffle size={18} />
+                </button>
+                <button
+                  onClick={cycleRepeatMode}
+                  className={`inline-flex items-center gap-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded ${repeatMode === 'off' ? 'text-gray-400 hover:text-white' : 'text-blue-400'}`}
+                  title={repeatModeTitle}
+                  aria-label={repeatModeLabel}
+                >
+                    {repeatMode === 'one' ? <Repeat1 size={18} /> : <Repeat size={18} />}
+                    <span className="text-[10px] font-semibold">{repeatModeShortLabel}</span>
                 </button>
             </div>
         </div>
@@ -907,18 +890,32 @@ const VideoPlayer: React.FC<{
 
 
 const ImageModal: React.FC<ImageModalProps> = ({
+  hostMode = 'inline',
   modalId,
   image,
+  prefetchPrevious = null,
+  prefetchNext = null,
   onClose,
   onFindSimilar,
   onOpenComfyUIWorkflow,
   onOpenImageEditor,
   onImageDeleted,
   onImageRenamed,
+  onRequestDelete,
+  onRequestRename,
+  onRequestReparse,
+  onRequestTagSuggestions,
+  onRequestGenerate,
+  onImageSaved,
+  onRequestBatchExport,
+  isAlwaysOnTop = false,
+  onToggleAlwaysOnTop,
   currentIndex = 0,
   totalImages = 0,
   onNavigateNext,
   onNavigatePrevious,
+  onNavigateNextWrapping,
+  onNavigateRandom,
   directoryPath,
   isIndexing = false,
   zIndex = 50,
@@ -944,6 +941,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
   const [isSlideshowPlaying, setIsSlideshowPlaying] = useState(false);
   const [slideshowVideoDuration, setSlideshowVideoDuration] = useState<number | null>(null);
+  // Set when repeat-all/shuffle advanced us because a video ended: the item we land on must keep
+  // playing even if auto-play is off, otherwise those modes would just park on a paused video.
+  const [isChainedPlayback, setIsChainedPlayback] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     x: 0,
     y: 0,
@@ -1001,6 +1001,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const pendingKeyboardNavigationRef = useRef<'next' | 'previous' | null>(null);
   const keyboardNavigationIdleTimeoutRef = useRef<number | null>(null);
   const isRapidKeyboardNavigatingRef = useRef(false);
+  // Which way the user is travelling, so the neighbour prefetch can spend its budget ahead of
+  // them instead of splitting it evenly. Forward until they tell us otherwise.
+  const navigationDirectionRef = useRef<'next' | 'previous'>('next');
   const onWindowStateChangeRef = useRef(onWindowStateChange);
   const lastReportedWindowStateRef = useRef<ModalWindowState | null>(null);
   const slideshowTimeoutRef = useRef<number | null>(null);
@@ -1019,11 +1022,25 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const enableAnimations = useSettingsStore((state) => state.enableAnimations);
   const slideshowIntervalSeconds = useSettingsStore((state) => state.slideshowIntervalSeconds);
   const slideshowShowFilename = useSettingsStore((state) => state.slideshowShowFilename);
+  const autoPlayMedia = useSettingsStore((state) => state.autoPlayMedia);
+  const imageViewerDefaultZoom = useSettingsStore((state) => state.imageViewerDefaultZoom);
+  const setImageViewerDefaultZoom = useSettingsStore((state) => state.setImageViewerDefaultZoom);
+  // A running slideshow and a repeat-all/shuffle chain both imply continuous playback, so they
+  // start the media regardless of the auto-play preference.
+  const shouldAutoPlayMedia = autoPlayMedia || isChainedPlayback || (isSlideshowMode && isSlideshowPlaying);
   const modalProfilerOnRender = useMemo(() => createProfilerOnRender('ImageModal'), []);
   const hasMarkedModalShellRef = useRef(false);
   const hasMarkedPreviewVisibleRef = useRef(false);
   const hasMarkedFullMediaReadyRef = useRef(false);
+  const isNativeWindow = hostMode === 'native-window';
   const isFullViewportModal = isFullscreen || isSlideshowMode;
+
+  useEffect(() => {
+    if (!isNativeWindow) {
+      return;
+    }
+    document.title = `${image.name} — Image MetaHub`;
+  }, [image.name, isNativeWindow]);
 
   useEffect(() => {
     if (!isMinimized) {
@@ -1067,23 +1084,75 @@ const ImageModal: React.FC<ImageModalProps> = ({
   }, [enableAnimations, isMinimized, modalId, zIndex]);
 
   const [zoom, setZoom] = useState(1);
-  const [viewerZoomMode, setViewerZoomMode] = useState<ViewerZoomMode>('fit');
+  const [viewerZoomMode, setViewerZoomMode] = useState<ViewerZoomMode>(() => imageViewerDefaultZoom);
   const [windowZoomFactor, setWindowZoomFactor] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
   const { copyToA1111, isCopying, copyStatus } = useCopyToA1111();
-  const { generateWithA1111, isGenerating, generateStatus } = useGenerateWithA1111();
+  const { generateWithA1111, isGenerating: isGeneratingLocalA1111, generateStatus: localGenerateStatus } = useGenerateWithA1111();
 
   const { copyToComfyUI, isCopying: isCopyingComfyUI, copyStatus: copyStatusComfyUI } = useCopyToComfyUI();
-  const { generateWithComfyUI, isGenerating: isGeneratingComfyUI, generateStatus: generateStatusComfyUI } = useGenerateWithComfyUI();
+  const {
+    generateWithComfyUI,
+    isGenerating: isGeneratingLocalComfyUI,
+    generateStatus: localGenerateStatusComfyUI,
+  } = useGenerateWithComfyUI();
+
+  // The generation queue runner only lives in the main renderer. When this modal is
+  // hosted in a detached window, `onRequestGenerate` ships the request there instead
+  // of enqueueing into a local store that nothing would ever drain.
+  const [forwardedGenerate, setForwardedGenerate] = useState<{
+    provider: 'a1111' | 'comfyui';
+    isGenerating: boolean;
+    status: { success: boolean; message: string } | null;
+  } | null>(null);
+
+  const runGenerateRequest = useCallback(async (
+    provider: 'a1111' | 'comfyui',
+    // Built lazily so the inline host never pays for serializing the request.
+    buildRequest: () => Promise<ImageViewerGenerateRequest> | ImageViewerGenerateRequest,
+    runLocally: () => Promise<void>,
+  ) => {
+    if (!onRequestGenerate) {
+      await runLocally();
+      return;
+    }
+
+    setForwardedGenerate({ provider, isGenerating: true, status: null });
+    let status: { success: boolean; message: string };
+    try {
+      const result = await onRequestGenerate(await buildRequest());
+      status = result.success
+        ? { success: true, message: 'Generation queued.' }
+        : { success: false, message: result.error || 'Failed to queue generation.' };
+    } catch (error) {
+      status = {
+        success: false,
+        message: error instanceof Error ? error.message : 'Failed to queue generation.',
+      };
+    }
+    setForwardedGenerate({ provider, isGenerating: false, status });
+    setTimeout(() => setForwardedGenerate(null), TEMPORARY_STATUS_TIMEOUT_MS);
+  }, [onRequestGenerate]);
+
+  const isGenerating = isGeneratingLocalA1111
+    || Boolean(forwardedGenerate?.provider === 'a1111' && forwardedGenerate.isGenerating);
+  const generateStatus = forwardedGenerate?.provider === 'a1111'
+    ? forwardedGenerate.status
+    : localGenerateStatus;
+  const isGeneratingComfyUI = isGeneratingLocalComfyUI
+    || Boolean(forwardedGenerate?.provider === 'comfyui' && forwardedGenerate.isGenerating);
+  const generateStatusComfyUI = forwardedGenerate?.provider === 'comfyui'
+    ? forwardedGenerate.status
+    : localGenerateStatusComfyUI;
 
   const { addImage, comparisonCount } = useImageComparison();
   const { isReparsing, reparseImages } = useReparseMetadata();
 
   const { canUseA1111, canUseComfyUI, canUseComparison, canUseBatchExport, canUseImageEditor, canUseDuringTrialOrPro, showProModal, initialized } = useFeatureAccess();
-  const { a1111Enabled, comfyUIEnabled, visibleProviders, singleVisibleProvider } = useGenerationProviderAvailability();
+  const { a1111Enabled, comfyUIEnabled, singleVisibleProvider } = useGenerationProviderAvailability();
 
   const toggleFavorite = useImageStore((state) => state.toggleFavorite);
   const setImageRating = useImageStore((state) => state.setImageRating);
@@ -1109,9 +1178,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const allImages = useImageStore((state) => state.images);
   const selectedImages = useImageStore((state) => state.selectedImages);
   const activeImageScope = useImageStore((state) => state.activeImageScope);
+  const selectedNodes = useImageStore((state) => state.selectedNodes);
   const clusterNavigationContext = useImageStore((state) => state.clusterNavigationContext);
 
-  const { metadata: shadowMetadata, saveMetadata: saveShadowMetadata, deleteMetadata: deleteShadowMetadata } = useShadowMetadata(image.id);
   const [isMetadataEditorOpen, setIsMetadataEditorOpen] = useState(false);
   const [isBatchExportModalOpen, setIsBatchExportModalOpen] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
@@ -1123,15 +1192,18 @@ const ImageModal: React.FC<ImageModalProps> = ({
     )
   );
   const liveImage = imageFromStore ?? image;
+  const { metadata: shadowMetadata, isLoading: isShadowLoading, error: shadowError, saveMetadata: saveShadowMetadata, deleteMetadata: deleteShadowMetadata } = useShadowMetadata(liveImage);
+  const savePrompt = useSavePrompt();
   const thumbnail = useResolvedThumbnail(liveImage);
   const isVideo = isVideoFileName(image.name, image.fileType);
   const isAudio = isAudioFileName(image.name, image.fileType);
-  const isPlayableMedia = isVideo || isAudio;
+  const isModel3D = isModel3DFileName(image.name, image.fileType);
+  const isPlayableMedia = isVideo || isAudio || isModel3D;
   const canEditImage = !isPlayableMedia && getFileExtension(liveImage.name) !== '.gif';
   const canOverwriteEditedImage = canEditImage && getFileExtension(liveImage.name) === '.png';
   const showA1111Actions = !isPlayableMedia && a1111Enabled;
   const showComfyUIActions = !isPlayableMedia && comfyUIEnabled;
-  const showComfyUIHeading = showA1111Actions && visibleProviders.length > 1;
+  const showComfyUIContext = !isVideo && !isAudio && comfyUIEnabled;
   const a1111GenerateLabel = singleVisibleProvider?.id === 'a1111' ? 'Generate' : 'Generate with A1111';
   const currentTags = liveImage.tags || [];
   const currentAutoTags = liveImage.autoTags || [];
@@ -1148,9 +1220,10 @@ const ImageModal: React.FC<ImageModalProps> = ({
   }), [currentTags, recentTagChipLimit, recentTags]);
   const createdAtLabel = useMemo(() => new Date(image.lastModified).toLocaleString(), [image.lastModified]);
   const exportScopeImages = useMemo(() => {
+    const scopedImages = useImageStore.getState().getScopedFilteredImages();
     const candidateScopes = [
       clusterNavigationContext,
-      activeImageScope,
+      scopedImages,
       filteredImages,
     ].filter((scope): scope is IndexedImage[] => Array.isArray(scope) && scope.length > 0);
 
@@ -1161,7 +1234,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     }
 
     return [liveImage];
-  }, [activeImageScope, clusterNavigationContext, filteredImages, liveImage]);
+  }, [activeImageScope, selectedNodes, clusterNavigationContext, filteredImages, liveImage]);
   const exportSelectionIds = useMemo(() => {
     if (selectedImages.has(liveImage.id)) {
       return new Set(selectedImages);
@@ -1171,6 +1244,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
   }, [liveImage.id, selectedImages]);
 
   const [tagInput, setTagInput] = useState('');
+  const [remoteAvailableTags, setRemoteAvailableTags] = useState<TagInfo[]>([]);
   const [isMediaOverlayVisible, setIsMediaOverlayVisible] = useState(false);
   const tagInputRef = useRef<HTMLInputElement>(null);
   const imageContainerRef = useRef<HTMLDivElement>(null);
@@ -1201,7 +1275,24 @@ const ImageModal: React.FC<ImageModalProps> = ({
     hasImageEditChanges &&
     !isShowingOriginalForAdjustmentCompare &&
     !(imageEditorTab === 'crop' && normalizedImageEditRecipe.crop.enabled);
-  const displayedImageUrl = shouldShowEditedPreview && editedPreviewUrl ? editedPreviewUrl : imageUrl;
+  // Resolved during render, not in an effect: an effect runs after paint, which would cost the
+  // frame this whole path exists to save. When the neighbour prefetch already decoded this
+  // source, the <img> can swap straight to it in the same commit as the image id change.
+  const warmFullImageUrl = useMemo(() => {
+    if (isPlayableMedia) {
+      return null;
+    }
+
+    const cachedUrl = mediaSourceCache.peek(liveImage, directoryPath);
+    return cachedUrl && mediaDecodeCache.isWarm(cachedUrl) ? cachedUrl : null;
+  }, [liveImage, directoryPath, isPlayableMedia]);
+  const displayedImageUrl = shouldShowEditedPreview && editedPreviewUrl
+    ? editedPreviewUrl
+    : (warmFullImageUrl ?? imageUrl);
+
+  useLayoutEffect(() => {
+    setDisplayedImageNaturalSize(null);
+  }, [displayedImageUrl]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1257,17 +1348,19 @@ const ImageModal: React.FC<ImageModalProps> = ({
     cropOverlayStyle;
   const rawMetadataImage = hydratedRawMetadataImage?.id === liveImage.id ? hydratedRawMetadataImage : liveImage;
 
-  const ensureFullRawMetadata = useCallback(async (): Promise<IndexedImage> => {
-    if (hydratedRawMetadataImage?.id === liveImage.id) {
+  const ensureFullRawMetadata = useCallback(async (
+    options: RawMetadataHydrationOptions = {},
+  ): Promise<IndexedImage> => {
+    if (!options.force && hydratedRawMetadataImage?.id === liveImage.id) {
       return hydratedRawMetadataImage;
     }
-    if (!hasCompactedRuntimeMetadata(liveImage)) {
+    if (!options.force && !hasCompactedRuntimeMetadata(liveImage)) {
       return liveImage;
     }
 
     setIsHydratingRawMetadata(true);
     try {
-      const hydrated = await hydrateImageRawMetadata(liveImage, directoryPath);
+      const hydrated = await hydrateImageRawMetadata(liveImage, directoryPath, options);
       setHydratedRawMetadataImage(hydrated);
       return hydrated;
     } finally {
@@ -1275,11 +1368,34 @@ const ImageModal: React.FC<ImageModalProps> = ({
     }
   }, [directoryPath, hydratedRawMetadataImage, liveImage]);
 
+  // Checkpoint/LoRA references for on-demand Civitai links. Extraction is
+  // local-only (reads the raw metadata); the network lookup happens on click.
+  // Runtime metadata is compacted for large payloads (the params string, where
+  // hashes live, is stripped), so hydrate on demand before extracting.
+  const [resourceRefs, setResourceRefs] = useState<ResourceRef[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const immediate = extractResourceRefs(rawMetadataImage?.metadata);
+    if (immediate.length > 0) {
+      setResourceRefs(immediate);
+      return;
+    }
+    if (hasCompactedRuntimeMetadata(liveImage)) {
+      ensureFullRawMetadata().then((full) => {
+        if (!cancelled) setResourceRefs(extractResourceRefs(full.metadata));
+      });
+    } else {
+      setResourceRefs([]);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [liveImage.id, rawMetadataImage, ensureFullRawMetadata]);
+
   useEffect(() => {
     setImageEditRecipe(DEFAULT_IMAGE_EDIT_RECIPE);
     setImageEditorTab('adjust');
     setImageEditSourceDimensions(null);
-    setDisplayedImageNaturalSize(null);
     setCropImageBounds(null);
     setEditedPreviewUrl(null);
     setIsRenderingEditedPreview(false);
@@ -1385,7 +1501,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
   }, [contextMenu.visible]);
 
   const applyModalWindowStyles = useCallback((windowState: ModalWindowState) => {
-    if (isFullViewportModal || !modalShellRef.current) {
+    if (isFullViewportModal || isNativeWindow || !modalShellRef.current) {
       return;
     }
 
@@ -1393,7 +1509,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     modalShellRef.current.style.top = `${windowState.y}px`;
     modalShellRef.current.style.width = `${windowState.width}px`;
     modalShellRef.current.style.height = `${windowState.height}px`;
-  }, [isFullViewportModal]);
+  }, [isFullViewportModal, isNativeWindow]);
 
   const scheduleModalWindowPaint = useCallback((windowState: ModalWindowState) => {
     liveModalWindowRef.current = windowState;
@@ -1572,7 +1688,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
   }, []);
 
   useEffect(() => {
-    if (isFullViewportModal) {
+    if (isFullViewportModal || isNativeWindow) {
       return;
     }
 
@@ -1587,7 +1703,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [isFullViewportModal, isWindowMaximized]);
+  }, [isFullViewportModal, isNativeWindow, isWindowMaximized]);
 
   useEffect(() => {
     if (isFullViewportModal || modalInteraction.mode === 'idle') {
@@ -1711,6 +1827,23 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const nMeta: BaseMetadata | undefined = getUsableNormalizedMetadata(liveImage);
   const canFindSimilar = Boolean(nMeta?.prompt) && Boolean(onFindSimilar);
   const effectiveMetadata = buildEffectiveMetadata(nMeta, shadowMetadata, showOriginal);
+  const isPromptSaved = useIsPromptSaved(effectiveMetadata?.prompt, effectiveMetadata?.negativePrompt);
+
+  // The single checkpoint reference (if any) links the "Model" value.
+  const checkpointRef = useMemo(
+    () => resourceRefs.find((ref) => ref.type === 'checkpoint'),
+    [resourceRefs],
+  );
+  // LoRA refs keyed by normalized name so a displayed LoRA can be matched to its
+  // reference; unmatched LoRAs simply render as plain text.
+  const loraRefByName = useMemo(() => {
+    const map = new Map<string, ResourceRef>();
+    for (const ref of resourceRefs) {
+      if (ref.type === 'lora') map.set(normalizeResourceName(ref.name), ref);
+    }
+    return map;
+  }, [resourceRefs]);
+
   const generationImage = useMemo<IndexedImage>(() => (
     effectiveMetadata
       ? {
@@ -1738,10 +1871,10 @@ const ImageModal: React.FC<ImageModalProps> = ({
   const motionModel = (nMeta as any)?.motion_model;
 
   useEffect(() => {
-    if (!showComfyUIActions || !nMeta) {
+    if (!showComfyUIContext || !nMeta) {
       setSidebarTab('details');
     }
-  }, [nMeta, showComfyUIActions]);
+  }, [nMeta, showComfyUIContext]);
 
   const beginWindowDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (isFullViewportModal || isWindowMaximized || event.button !== 0) {
@@ -1837,36 +1970,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
         alert(`No ${type} to copy.`);
         return false;
     }
-    try {
-      await navigator.clipboard.writeText(text);
-      if (!silent) {
-        const notification = document.createElement('div');
-        notification.className = 'fixed top-4 right-4 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg z-50';
-        notification.textContent = `${type} copied to clipboard!`;
-        document.body.appendChild(notification);
-        setTimeout(() => {
-          if (document.body.contains(notification)) {
-            document.body.removeChild(notification);
-          }
-        }, 2000);
-      }
-      return true;
-    } catch (err) {
-      console.error(`Failed to copy ${type}:`, err);
+    const result = await copyTextToClipboard(text);
+    if (!result.success) {
+      console.error(`Failed to copy ${type}:`, result.error);
       alert(`Failed to copy ${type}.`);
       return false;
     }
-  };
-
-  const copyToClipboardElectron = async (text: string, type: string) => {
-    if (!text) {
-      alert(`No ${type} to copy.`);
-      return false;
-    }
-
-    try {
-      await navigator.clipboard.writeText(text);
-
+    if (!silent) {
       const notification = document.createElement('div');
       notification.className = 'fixed top-4 right-4 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg z-50';
       notification.textContent = `${type} copied to clipboard!`;
@@ -1876,13 +1986,11 @@ const ImageModal: React.FC<ImageModalProps> = ({
           document.body.removeChild(notification);
         }
       }, 2000);
-      return true;
-    } catch (err) {
-      console.error(`Failed to copy ${type}:`, err);
-      alert(`Failed to copy ${type}.`);
-      return false;
     }
+    return true;
   };
+
+  const copyToClipboardElectron = (text: string, type: string) => copyToClipboard(text, type);
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -2012,30 +2120,43 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
   const handleReparseMetadata = async () => {
     hideContextMenu();
+    if (onRequestReparse) {
+      const result = await onRequestReparse(liveImage.id);
+      if (!result.success) alert(result.error || 'Failed to reparse metadata.');
+      return;
+    }
     await reparseImages([liveImage]);
   };
 
   const openBatchExport = useCallback(() => {
+    // A detached window only mirrors the current image and its two neighbours, so
+    // its store cannot describe the real export scope, selection or directories.
+    // Hand the export to the main renderer, which owns the whole library.
+    if (onRequestBatchExport) {
+      void onRequestBatchExport(liveImage.id);
+      return;
+    }
+
     if (exportSelectionIds.size > 1 && !canUseBatchExport) {
       showProModal('batch_export');
       return;
     }
 
     setIsBatchExportModalOpen(true);
-  }, [canUseBatchExport, exportSelectionIds.size, showProModal]);
+  }, [canUseBatchExport, exportSelectionIds.size, liveImage.id, onRequestBatchExport, showProModal]);
 
   const exportImage = () => {
     hideContextMenu();
     openBatchExport();
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setZoom(1);
-    setViewerZoomMode('fit');
+    setViewerZoomMode(imageViewerDefaultZoom);
     setPan({ x: 0, y: 0 });
     setSlideshowVideoDuration(null);
     revealMediaOverlay();
-  }, [image.id, revealMediaOverlay]);
+  }, [image.id, imageViewerDefaultZoom, revealMediaOverlay]);
 
   useEffect(() => {
     if (!isSlideshowMode) {
@@ -2047,13 +2168,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
     setPan({ x: 0, y: 0 });
   }, [image.id, isSlideshowMode]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setZoom(1);
-    setViewerZoomMode('fit');
+    setViewerZoomMode(isSlideshowMode ? 'fit' : imageViewerDefaultZoom);
     setPan({ x: 0, y: 0 });
     setIsMediaOverlayVisible(false);
     clearMediaOverlayHideTimer();
-  }, [clearMediaOverlayHideTimer, isFullscreen]);
+  }, [clearMediaOverlayHideTimer, imageViewerDefaultZoom, isFullscreen, isSlideshowMode]);
 
   useEffect(() => {
     const applyWindowZoomFactor = (nextZoomFactor: number) => {
@@ -2095,17 +2216,19 @@ const ImageModal: React.FC<ImageModalProps> = ({
       return;
     }
 
-    const frameId = window.requestAnimationFrame(() => {
-      setZoom(getActualSizeZoom());
-    });
-
-    return () => window.cancelAnimationFrame(frameId);
+    setZoom(getActualSizeZoom());
   }, [getActualSizeZoom, viewerZoomMode, windowZoomFactor]);
 
   const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
 
-    const delta = e.deltaY * -0.01;
+    const deltaModeScale = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? 40
+      : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+        ? Math.max(window.innerHeight, 800)
+        : 1;
+    const normalizedDeltaY = e.deltaY * deltaModeScale;
+    const delta = Math.max(-0.1, Math.min(0.1, normalizedDeltaY * -0.001));
     const newZoom = Math.min(Math.max(minViewerZoom, zoom + delta), maxViewerZoom);
 
     setViewerZoomMode('manual');
@@ -2189,9 +2312,17 @@ const ImageModal: React.FC<ImageModalProps> = ({
     if (typeof window === 'undefined') {
       return;
     }
-    window.addEventListener('resize', updateCropImageBounds);
-    return () => window.removeEventListener('resize', updateCropImageBounds);
-  }, [updateCropImageBounds]);
+
+    const handleResize = () => {
+      updateCropImageBounds();
+      if (viewerZoomMode === 'actual') {
+        setZoom(getActualSizeZoom());
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [getActualSizeZoom, updateCropImageBounds, viewerZoomMode]);
 
   const handleCropDragStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (!imageEditSourceDimensions || !normalizedImageEditRecipe.crop.rect) {
@@ -2256,7 +2387,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'copy';
     }
-    window.electronAPI?.startFileDrag({ directoryPath, relativePath });
+    window.electronAPI?.startFileDrag({ directoryPath, relativePath, imageId: image.id });
   }, [canDragExternally, directoryPath, image.id, image.name]);
 
   useEffect(() => {
@@ -2290,6 +2421,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
   };
 
   const handleFitToScreen = () => {
+    setImageViewerDefaultZoom('fit');
     setViewerZoomMode('fit');
     setZoom(1);
     setPan({ x: 0, y: 0 });
@@ -2297,6 +2429,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
   const handleActualSize = () => {
     const nextZoom = getActualSizeZoom();
+    setImageViewerDefaultZoom('actual');
     setViewerZoomMode('actual');
     setZoom(nextZoom);
     if (Math.abs(nextZoom - 1) < 0.01) {
@@ -2335,13 +2468,21 @@ const ImageModal: React.FC<ImageModalProps> = ({
       return;
     }
 
-    await generateWithComfyUI(liveImage, {
-      workflowMode: 'upscale',
-      directoryPath,
-      customMetadata: {
-        prompt: liveImage.prompt || 'ComfyUI upscale',
-      },
-    });
+    const customMetadata = { prompt: liveImage.prompt || 'ComfyUI upscale' };
+    await runGenerateRequest(
+      'comfyui',
+      () => ({
+        provider: 'comfyui',
+        imageId: liveImage.id,
+        workflowMode: 'upscale',
+        customMetadata,
+      }),
+      () => generateWithComfyUI(liveImage, {
+        workflowMode: 'upscale',
+        directoryPath,
+        customMetadata,
+      }),
+    );
   }, [
     canUseComfyUI,
     comfyUIEnabled,
@@ -2349,6 +2490,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     generateWithComfyUI,
     directoryPath,
     liveImage,
+    runGenerateRequest,
     setError,
     showProModal,
   ]);
@@ -2364,6 +2506,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
   const writeEditedImage = useCallback(async (
     targetPath: string,
+    mode: 'save_as' | 'overwrite',
     sourceMetadata?: BaseMetadata,
     sourceRawMetadata?: Record<string, unknown>,
   ) => {
@@ -2390,7 +2533,19 @@ const ImageModal: React.FC<ImageModalProps> = ({
       sourceRawMetadata,
       imageEditOutputDimensions || undefined,
     );
-    const result = await window.electronAPI.writeFile(targetPath, outputBytes);
+    if (mode === 'overwrite') {
+      try {
+        await prepareUserDataForImages([liveImage]);
+      } catch (error) {
+        throw new Error(`The image was not overwritten because its local user data could not be staged safely: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const result = await window.electronAPI.writeFile(targetPath, outputBytes, {
+      kind: mode,
+      ...(mode === 'overwrite'
+        ? { sourcePath: targetPath, userDataContext: { legacyImageId: liveImage.id } }
+        : {}),
+    });
     if (!result.success) {
       throw new Error(result.error || 'Failed to write edited image.');
     }
@@ -2429,47 +2584,37 @@ const ImageModal: React.FC<ImageModalProps> = ({
       const sourceImageWithMetadata = await ensureFullRawMetadata();
       const sourceMetadata = getUsableNormalizedMetadata(sourceImageWithMetadata);
       const sourceRawMetadata = sourceImageWithMetadata.metadata as Record<string, unknown>;
-      await writeEditedImage(saveResult.path, sourceMetadata, sourceRawMetadata);
+      await writeEditedImage(saveResult.path, 'save_as', sourceMetadata, sourceRawMetadata);
+
+      // A detached window only holds a three-image slice of the library, so the
+      // authoritative indexing has to happen in the main renderer.
+      if (onImageSaved) {
+        const result = await onImageSaved({
+          mode: 'save-as',
+          savedPath: saveResult.path,
+          sourceImageId: liveImage.id,
+          sourceMetadata: sourceMetadata ?? null,
+        });
+        if (!result.success) {
+          throw new Error(result.error || 'Failed to index the saved image.');
+        }
+        setSuccess(result.savedImageName ? `Saved edited image as ${result.savedImageName}.` : 'Saved edited image.');
+        return;
+      }
 
       const targetDirectory = findDirectoryForAbsolutePath(saveResult.path);
       if (targetDirectory) {
-        const indexedImage = await indexImageFileAtPath(saveResult.path, targetDirectory);
-        if (indexedImage) {
-          const savedNormalizedMetadata = mergeEditedNormalizedMetadata(
-            indexedImage.metadata?.normalizedMetadata as BaseMetadata | undefined,
-            sourceMetadata,
-          );
-          const savedMetadata = savedNormalizedMetadata
-            ? { ...indexedImage.metadata, normalizedMetadata: savedNormalizedMetadata }
-            : indexedImage.metadata;
-          const savedImage: IndexedImage = {
-            ...indexedImage,
-            metadata: savedMetadata,
-            metadataString: savedNormalizedMetadata ? JSON.stringify(savedMetadata) : liveImage.metadataString,
-            models: savedNormalizedMetadata?.models || liveImage.models,
-            loras: savedNormalizedMetadata?.loras || liveImage.loras,
-            sampler: savedNormalizedMetadata?.sampler || liveImage.sampler,
-            scheduler: savedNormalizedMetadata?.scheduler || liveImage.scheduler,
-            board: savedNormalizedMetadata?.board || liveImage.board,
-            prompt: savedNormalizedMetadata?.prompt || liveImage.prompt,
-            negativePrompt: savedNormalizedMetadata?.negativePrompt || liveImage.negativePrompt,
-            cfgScale: savedNormalizedMetadata?.cfgScale ?? savedNormalizedMetadata?.cfg_scale ?? liveImage.cfgScale,
-            steps: savedNormalizedMetadata?.steps || liveImage.steps,
-            seed: savedNormalizedMetadata?.seed ?? liveImage.seed,
-            workflowNodes: liveImage.workflowNodes,
-            enrichmentState: 'enriched',
-          };
-          const targetAlreadyIndexed = allImages.some((candidate) => candidate.id === savedImage.id);
-          if (targetAlreadyIndexed) {
-            mergeImages([savedImage]);
-          } else {
-            addImages([savedImage]);
-          }
-          scheduleEditedImageCacheUpsert(targetDirectory, savedImage, scanSubfolders);
-          setSuccess(`Saved edited image as ${savedImage.name}.`);
-        } else {
-          setSuccess('Saved edited image.');
-        }
+        const savedImage = await indexSavedEditedImageCopy({
+          savedPath: saveResult.path,
+          targetDirectory,
+          sourceImage: liveImage,
+          sourceMetadata,
+          scanSubfolders,
+          allImages,
+          addImages,
+          mergeImages,
+        });
+        setSuccess(savedImage ? `Saved edited image as ${savedImage.name}.` : 'Saved edited image.');
       } else {
         setSuccess('Saved edited image.');
       }
@@ -2490,6 +2635,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     isSavingEditedImage,
     liveImage,
     mergeImages,
+    onImageSaved,
     scanSubfolders,
     setError,
     setSuccess,
@@ -2539,61 +2685,29 @@ const ImageModal: React.FC<ImageModalProps> = ({
       const sourceImageWithMetadata = await ensureFullRawMetadata();
       const sourceMetadata = getUsableNormalizedMetadata(sourceImageWithMetadata);
       const sourceRawMetadata = sourceImageWithMetadata.metadata as Record<string, unknown>;
-      await writeEditedImage(joined.path, sourceMetadata, sourceRawMetadata);
+      await writeEditedImage(joined.path, 'overwrite', sourceMetadata, sourceRawMetadata);
 
-      const reparsed = await reparseIndexedImage(liveImage, sourceDirectory.path);
-      if (!reparsed) {
-        throw new Error('The edited image was saved, but metadata reparsing returned no image.');
+      if (onImageSaved) {
+        // See Save As: the real library lives in the main renderer.
+        const result = await onImageSaved({
+          mode: 'overwrite',
+          savedPath: joined.path,
+          sourceImageId: liveImage.id,
+          sourceMetadata: sourceMetadata ?? null,
+        });
+        if (!result.success) {
+          throw new Error(result.error || 'Failed to reindex the overwritten image.');
+        }
+      } else {
+        await reindexOverwrittenEditedImage({
+          sourceImage: liveImage,
+          sourceDirectory,
+          sourceMetadata,
+          scanSubfolders,
+          mergeImages,
+          setImageThumbnail,
+        });
       }
-
-      const preservedNormalizedMetadata = mergeEditedNormalizedMetadata(
-        reparsed.metadata?.normalizedMetadata as BaseMetadata | undefined,
-        sourceMetadata,
-      );
-      const preservedMetadata = preservedNormalizedMetadata
-        ? { ...reparsed.metadata, normalizedMetadata: preservedNormalizedMetadata }
-        : reparsed.metadata;
-      const preservedMetadataImage: IndexedImage = {
-        ...liveImage,
-        ...reparsed,
-        metadata: preservedMetadata,
-        metadataString: preservedNormalizedMetadata ? JSON.stringify(preservedMetadata) : liveImage.metadataString,
-        models: preservedNormalizedMetadata?.models || liveImage.models,
-        loras: preservedNormalizedMetadata?.loras || liveImage.loras,
-        sampler: preservedNormalizedMetadata?.sampler || liveImage.sampler,
-        scheduler: preservedNormalizedMetadata?.scheduler || liveImage.scheduler,
-        board: preservedNormalizedMetadata?.board || liveImage.board,
-        prompt: preservedNormalizedMetadata?.prompt || liveImage.prompt,
-        negativePrompt: preservedNormalizedMetadata?.negativePrompt || liveImage.negativePrompt,
-        cfgScale: preservedNormalizedMetadata?.cfgScale ?? preservedNormalizedMetadata?.cfg_scale ?? liveImage.cfgScale,
-        steps: preservedNormalizedMetadata?.steps || liveImage.steps,
-        seed: preservedNormalizedMetadata?.seed ?? liveImage.seed,
-        workflowNodes: liveImage.workflowNodes,
-        handle: liveImage.handle,
-        thumbnailHandle: liveImage.thumbnailHandle,
-        thumbnailUrl: undefined,
-        thumbnailStatus: 'pending',
-        thumbnailError: null,
-        directoryId: liveImage.directoryId,
-        directoryName: liveImage.directoryName,
-        isFavorite: liveImage.isFavorite,
-        tags: liveImage.tags,
-        rating: liveImage.rating,
-        clusterId: liveImage.clusterId,
-        clusterPosition: liveImage.clusterPosition,
-        autoTags: liveImage.autoTags,
-        autoTagsGeneratedAt: liveImage.autoTagsGeneratedAt,
-        enrichmentState: 'enriched',
-      };
-
-      mergeImages([preservedMetadataImage]);
-      setImageThumbnail(liveImage.id, {
-        thumbnailUrl: null,
-        thumbnailHandle: null,
-        status: 'pending',
-        error: null,
-      });
-      scheduleEditedImageCacheUpsert(sourceDirectory, preservedMetadataImage, scanSubfolders);
       setImageEditRecipe(DEFAULT_IMAGE_EDIT_RECIPE);
       setSuccess('Overwrote original image with edits.');
     } catch (error) {
@@ -2611,6 +2725,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     isSavingEditedImage,
     liveImage,
     mergeImages,
+    onImageSaved,
     scanSubfolders,
     setError,
     setImageThumbnail,
@@ -2628,13 +2743,23 @@ const ImageModal: React.FC<ImageModalProps> = ({
     slideshowTimeoutRef.current = null;
   }, []);
 
+  const showImagePreviewWhileLoading = !isPlayableMedia && imageViewerDefaultZoom !== 'actual';
+
   useEffect(() => {
     let isMounted = true;
-    const hasPreview = Boolean(preferredThumbnailUrl);
+    const hasPreview = !isPlayableMedia && Boolean(preferredThumbnailUrl);
+    const showPreviewWhileLoading = showImagePreviewWhileLoading && hasPreview;
     const sourceLoadStartedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-    setIsFullImageSourceReady(false);
-    setImageUrl(isPlayableMedia ? null : (preferredThumbnailUrl ?? null));
+    if (warmFullImageUrl) {
+      // Already fetched and decoded by the neighbour prefetch. Showing the thumbnail first would
+      // only add a second decode and a visible resolution pop, so go straight to the full source.
+      setImageUrl(warmFullImageUrl);
+      setIsFullImageSourceReady(true);
+    } else {
+      setIsFullImageSourceReady(false);
+      setImageUrl(isPlayableMedia || !showPreviewWhileLoading ? null : preferredThumbnailUrl);
+    }
 
     const loadImage = async () => {
       if (!isMounted) return;
@@ -2643,9 +2768,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
       if (!directoryPath && window.electronAPI && !electronAbsoluteMediaPath) {
         console.error('Cannot load image: directoryPath is undefined');
-        if (isMounted && !hasPreview) {
-          setImageUrl(null);
-          alert('Failed to load image: Directory path is not available.');
+        if (isMounted) {
+          if (hasPreview) {
+            setImageUrl(preferredThumbnailUrl);
+          } else {
+            setImageUrl(null);
+            alert('Failed to load image: Directory path is not available.');
+          }
         }
         return;
       }
@@ -2660,26 +2789,19 @@ const ImageModal: React.FC<ImageModalProps> = ({
             isPlayableMedia,
           });
 
-          const state = useImageStore.getState();
-          const navigationImages = state.clusterNavigationContext || state.filteredImages;
-          const currentNavigationIndex = navigationImages.findIndex((candidate) => candidate.id === liveImage.id);
-          if (currentNavigationIndex !== -1) {
-            const directoryMap = new Map(state.directories.map((dir) => [dir.id, dir.path]));
-            const neighborCandidates = [
-              navigationImages[currentNavigationIndex - 1],
-              navigationImages[currentNavigationIndex + 1],
-            ].filter(Boolean) as IndexedImage[];
-
-            for (const neighbor of neighborCandidates) {
-              const neighborDirectoryPath = directoryMap.get(neighbor.directoryId || '');
-              mediaSourceCache.prefetch(neighbor, neighborDirectoryPath);
-            }
+          // Keep the image we are showing in the decode cache too, so stepping back onto it is
+          // as instant as stepping forward. Neighbours are warmed by their own effect below.
+          if (!isPlayableMedia) {
+            void mediaDecodeCache.warm(url);
           }
         }
       } catch (loadError) {
         console.error('Failed to load full image source:', loadError);
-        if (isMounted && !hasPreview) {
-          setImageUrl(null);
+        if (isMounted) {
+          // The warm branch above marks the source ready before this confirms it, so a failure
+          // here has to take that back: otherwise export and editing stay enabled over nothing.
+          setIsFullImageSourceReady(false);
+          setImageUrl(hasPreview ? preferredThumbnailUrl : null);
         }
       } finally {
         recordPerformanceDuration('modal.full-source-load', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - sourceLoadStartedAt, {
@@ -2695,7 +2817,113 @@ const ImageModal: React.FC<ImageModalProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [diagnosticsFlowId, liveImage.id, liveImage.handle, liveImage.thumbnailHandle, liveImage.name, liveImage.lastModified, directoryPath, preferredThumbnailUrl, isPlayableMedia, isVideo]);
+    // warmFullImageUrl is read from the closure on purpose. It is computed in the same render as
+    // the image id change, so the run that matters already sees the right value; adding it here
+    // would re-run the whole load when a later prefetch flips warmth for the image on screen.
+  }, [diagnosticsFlowId, liveImage.id, liveImage.handle, liveImage.thumbnailHandle, liveImage.name, liveImage.lastModified, directoryPath, preferredThumbnailUrl, showImagePreviewWhileLoading, isPlayableMedia, isVideo]);
+
+  // Decoded bitmaps are worth tens of megabytes, so they only stay alive while a modal is open.
+  useEffect(() => {
+    mediaDecodeCache.retain();
+    return () => {
+      mediaDecodeCache.release();
+    };
+  }, []);
+
+  // Warm the neighbours the user is most likely to land on next. Resolving a source only produces
+  // a URL string, so this decodes the bytes as well: that decode is the part that cannot fit in
+  // the frame where the <img> src changes.
+  useEffect(() => {
+    // Waiting on isFullImageSourceReady keeps the image on screen ahead of the ones that are not,
+    // without chaining this to the load promise. During a held-arrow burst the user outruns any
+    // decode we could start, so queueing work there would only compete with the image they stop on.
+    if (isPlayableMedia || !isFullImageSourceReady || isRapidKeyboardNavigating) {
+      return;
+    }
+
+    const primaryNeighbor = navigationDirectionRef.current === 'previous'
+      ? prefetchPrevious
+      : prefetchNext;
+    const secondaryNeighbor = navigationDirectionRef.current === 'previous'
+      ? prefetchNext
+      : prefetchPrevious;
+    const neighbors = [primaryNeighbor, secondaryNeighbor].filter(
+      (candidate): candidate is { image: IndexedImage; directoryPath: string } =>
+        Boolean(candidate)
+        && !isVideoFileName(candidate.image.name, candidate.image.fileType)
+        && !isAudioFileName(candidate.image.name, candidate.image.fileType)
+        && !isModel3DFileName(candidate.image.name, candidate.image.fileType)
+    );
+
+    if (neighbors.length === 0) {
+      return;
+    }
+
+    let isMounted = true;
+    let idleHandle: number | null = null;
+    let timeoutHandle: number | null = null;
+
+    const scheduleIdle = (callback: () => void) => {
+      if (typeof window.requestIdleCallback === 'function') {
+        idleHandle = window.requestIdleCallback(callback, { timeout: 500 });
+        return;
+      }
+
+      timeoutHandle = window.setTimeout(callback, 32);
+    };
+
+    let queueIndex = 0;
+    const warmNextNeighbor = () => {
+      if (!isMounted || queueIndex >= neighbors.length) {
+        return;
+      }
+
+      const neighbor = neighbors[queueIndex++]!;
+
+      void (async () => {
+        try {
+          // No prioritize here: this must not pause the grid's background thumbnail work.
+          const url = await mediaSourceCache.getOrLoad(neighbor.image, neighbor.directoryPath);
+          if (isMounted) {
+            await mediaDecodeCache.warm(url);
+          }
+        } catch {
+          // A neighbour that refuses to load is not worth surfacing: the user may never reach it,
+          // and opening it directly still reports the failure through the load effect.
+        }
+
+        // One at a time, so multiple multi-megabyte decodes never land on the main thread together.
+        if (isMounted && queueIndex < neighbors.length) {
+          scheduleIdle(warmNextNeighbor);
+        }
+      })();
+    };
+
+    scheduleIdle(warmNextNeighbor);
+
+    return () => {
+      isMounted = false;
+      if (idleHandle !== null && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(idleHandle);
+      }
+      if (timeoutHandle !== null) {
+        window.clearTimeout(timeoutHandle);
+      }
+    };
+  }, [
+    directoryPath,
+    isFullImageSourceReady,
+    isPlayableMedia,
+    isRapidKeyboardNavigating,
+    liveImage.id,
+    liveImage.lastModified,
+    prefetchNext?.directoryPath,
+    prefetchNext?.image.id,
+    prefetchNext?.image.lastModified,
+    prefetchPrevious?.directoryPath,
+    prefetchPrevious?.image.id,
+    prefetchPrevious?.image.lastModified,
+  ]);
 
   useEffect(() => {
     if (!preferredThumbnailUrl || hasMarkedPreviewVisibleRef.current) {
@@ -2814,19 +3042,46 @@ const ImageModal: React.FC<ImageModalProps> = ({
     totalImages,
   ]);
 
-  const handleSlideshowVideoEnded = useCallback(() => {
-    if (!isSlideshowMode || !isSlideshowPlaying) {
+  const handleVideoEnded = useCallback(() => {
+    // A running slideshow drives its own pacing, so it wins over the player's repeat/shuffle modes.
+    if (isSlideshowMode && isSlideshowPlaying) {
+      clearSlideshowTimer();
+      if (currentIndex >= totalImages - 1) {
+        setIsSlideshowPlaying(false);
+        return;
+      }
+
+      onNavigateNext?.();
       return;
     }
 
-    clearSlideshowTimer();
-    if (currentIndex >= totalImages - 1) {
-      setIsSlideshowPlaying(false);
+    // Repeat decides whether playback continues at all, shuffle only decides where it goes next --
+    // so repeat off stops here even with shuffle on. 'one' never reaches this handler: the native
+    // `loop` attribute restarts the video without firing `ended`.
+    const { videoRepeatMode, videoShuffle } = useSettingsStore.getState();
+
+    if (videoRepeatMode !== 'all') {
       return;
     }
 
-    onNavigateNext?.();
-  }, [clearSlideshowTimer, currentIndex, isSlideshowMode, isSlideshowPlaying, onNavigateNext, totalImages]);
+    setIsChainedPlayback(true);
+
+    if (videoShuffle) {
+      onNavigateRandom?.();
+      return;
+    }
+
+    onNavigateNextWrapping?.();
+  }, [
+    clearSlideshowTimer,
+    currentIndex,
+    isSlideshowMode,
+    isSlideshowPlaying,
+    onNavigateNext,
+    onNavigateNextWrapping,
+    onNavigateRandom,
+    totalImages,
+  ]);
 
   const handleDelete = useCallback(async () => {
     if (isIndexing) {
@@ -2834,7 +3089,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     }
 
     const { skipDeleteConfirmation } = useSettingsStore.getState();
-    if (skipDeleteConfirmation || window.confirm('Are you sure you want to delete this image? This action cannot be undone.')) {
+    if (skipDeleteConfirmation || window.confirm('Move this image to the Recycle Bin?')) {
       const idToDelete = image.id;
       const imageToDelete = image;
       const sourceDirectory = directories.find((directory) => directory.id === imageToDelete.directoryId);
@@ -2842,48 +3097,80 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
       const hasMoreImages = totalImages > 1;
       
-      if (hasMoreImages) {
-        if (currentIndex < totalImages - 1) {
-          onNavigateNext?.();
-        } else {
-          onNavigatePrevious?.();
-        }
-      }
-
-      const result = await FileOperations.deleteFile(imageToDelete);
+      const result = onRequestDelete
+        ? await onRequestDelete(imageToDelete.id)
+        : await FileOperations.deleteFile(imageToDelete);
       if (result.success) {
-        if (!shouldAwaitWatcherRemoval) {
+        const handledNavigation = 'handledNavigation' in result && result.handledNavigation === true;
+        if (hasMoreImages && !handledNavigation) {
+          if (currentIndex < totalImages - 1) {
+            onNavigateNext?.();
+          } else {
+            onNavigatePrevious?.();
+          }
+        }
+        if (!onRequestDelete && !shouldAwaitWatcherRemoval) {
           onImageDeleted?.(idToDelete);
         }
         
-        if (!hasMoreImages) {
+        if (!hasMoreImages && !handledNavigation) {
           onClose();
         }
       } else {
         alert(`Failed to delete file: ${result.error}`);
       }
     }
-  }, [currentIndex, directories, image, isIndexing, onClose, onImageDeleted, onNavigateNext, onNavigatePrevious, totalImages]);
+  }, [currentIndex, directories, image, isIndexing, onClose, onImageDeleted, onNavigateNext, onNavigatePrevious, onRequestDelete, totalImages]);
+
+  // Navigation the user asked for explicitly: it ends any repeat-all/shuffle chain, so the item we
+  // land on obeys the auto-play setting again.
+  const navigateManually = useCallback((direction: 'next' | 'previous') => {
+    setIsChainedPlayback(false);
+    navigationDirectionRef.current = direction;
+
+    if (direction === 'next') {
+      // Shuffle randomizes forward navigation as well, the way a shuffled playlist does. It only
+      // applies while a video is open, which is the only place its button exists to be turned off:
+      // browsing images stays sequential instead of obeying a control that isn't on screen.
+      if (isVideo && useSettingsStore.getState().videoShuffle && onNavigateRandom) {
+        onNavigateRandom();
+        return;
+      }
+
+      onNavigateNext?.();
+      return;
+    }
+
+    onNavigatePrevious?.();
+  }, [isVideo, onNavigateNext, onNavigatePrevious, onNavigateRandom]);
 
   const scheduleKeyboardNavigation = useCallback((direction: 'next' | 'previous', isRepeatedKey = false) => {
+    if (!isRepeatedKey) {
+      if (keyboardNavigationFrameRef.current !== null) {
+        window.cancelAnimationFrame(keyboardNavigationFrameRef.current);
+        keyboardNavigationFrameRef.current = null;
+      }
+      pendingKeyboardNavigationRef.current = null;
+      navigateManually(direction);
+      return;
+    }
+
     pendingKeyboardNavigationRef.current = direction;
 
-    if (isRepeatedKey) {
-      if (!isRapidKeyboardNavigatingRef.current) {
-        isRapidKeyboardNavigatingRef.current = true;
-        setIsRapidKeyboardNavigating(true);
-      }
-
-      if (keyboardNavigationIdleTimeoutRef.current !== null) {
-        window.clearTimeout(keyboardNavigationIdleTimeoutRef.current);
-      }
-
-      keyboardNavigationIdleTimeoutRef.current = window.setTimeout(() => {
-        keyboardNavigationIdleTimeoutRef.current = null;
-        isRapidKeyboardNavigatingRef.current = false;
-        setIsRapidKeyboardNavigating(false);
-      }, RAPID_KEYBOARD_NAVIGATION_IDLE_MS);
+    if (!isRapidKeyboardNavigatingRef.current) {
+      isRapidKeyboardNavigatingRef.current = true;
+      setIsRapidKeyboardNavigating(true);
     }
+
+    if (keyboardNavigationIdleTimeoutRef.current !== null) {
+      window.clearTimeout(keyboardNavigationIdleTimeoutRef.current);
+    }
+
+    keyboardNavigationIdleTimeoutRef.current = window.setTimeout(() => {
+      keyboardNavigationIdleTimeoutRef.current = null;
+      isRapidKeyboardNavigatingRef.current = false;
+      setIsRapidKeyboardNavigating(false);
+    }, RAPID_KEYBOARD_NAVIGATION_IDLE_MS);
 
     if (keyboardNavigationFrameRef.current !== null) {
       return;
@@ -2894,16 +3181,11 @@ const ImageModal: React.FC<ImageModalProps> = ({
       const nextDirection = pendingKeyboardNavigationRef.current;
       pendingKeyboardNavigationRef.current = null;
 
-      if (nextDirection === 'next') {
-        onNavigateNext?.();
-        return;
-      }
-
-      if (nextDirection === 'previous') {
-        onNavigatePrevious?.();
+      if (nextDirection === 'next' || nextDirection === 'previous') {
+        navigateManually(nextDirection);
       }
     });
-  }, [onNavigateNext, onNavigatePrevious]);
+  }, [navigateManually]);
 
   useEffect(() => {
     if (!isActive) {
@@ -3129,9 +3411,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
   const confirmRename = async () => {
     const oldImageId = image.id;
-    const result = await renameIndexedImage(image, newName);
+    const result = onRequestRename
+      ? await onRequestRename(image.id, newName)
+      : await renameIndexedImage(image, newName);
     if (result.success) {
-      onImageRenamed?.(oldImageId, result.newImageId || oldImageId, result.newRelativePath || image.name);
+      if (!onRequestRename) {
+        onImageRenamed?.(oldImageId, result.newImageId || oldImageId, result.newRelativePath || image.name);
+      }
       setIsRenaming(false);
     } else {
       alert(`Failed to rename file: ${result.error}`);
@@ -3196,7 +3482,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
     ? 'border-gray-800 bg-gray-950/95'
     : 'border-gray-700 bg-gray-800/95';
   const titleTextClass = isActive ? 'text-gray-100' : 'text-gray-400';
-  const titleMetaClass = isActive ? 'text-gray-500' : 'text-gray-600';
+  const titleMetaClass = isActive
+    ? 'text-gray-400 dark:text-gray-500'
+    : 'text-gray-500 dark:text-gray-600';
   const modalEntryAnimationClass = !enableAnimations || (wasMinimizedRef.current && !isMinimized)
     ? ''
     : 'animate-in fade-in zoom-in-95';
@@ -3205,7 +3493,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
     <React.Profiler id="ImageModal" onRender={modalProfilerOnRender}>
     <div
       className={`fixed inset-0 transition-all duration-300 ${
-        isFullViewportModal ? 'pointer-events-auto bg-black' : 'pointer-events-none'
+        isFullViewportModal || isNativeWindow ? 'pointer-events-auto bg-black' : 'pointer-events-none'
       }`}
       style={{ zIndex: isFullViewportModal ? Math.max(zIndex, 9999) : zIndex }}
       onClick={isFullscreen && !isSlideshowMode ? onClose : undefined}
@@ -3216,7 +3504,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
         aria-modal={isFullViewportModal ? 'true' : 'false'}
         aria-label={`Image viewer: ${image.name}`}
         className={`${
-          isFullViewportModal
+          isFullViewportModal || isNativeWindow
             ? 'fixed inset-0 z-[9999] h-screen w-screen rounded-none bg-black'
             : `fixed bg-gray-900 border rounded-2xl overflow-hidden ${modalShellStateClass}`
         } pointer-events-auto flex flex-col ${modalEntryAnimationClass} ${isWindowInteractionActive ? 'select-none' : ''}`}
@@ -3226,7 +3514,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
           hideContextMenu();
         }}
         style={
-          isFullViewportModal
+          isFullViewportModal || isNativeWindow
             ? undefined
             : {
                 left: `${modalWindow.x}px`,
@@ -3239,9 +3527,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
       >
         {!isFullViewportModal && (
           <div
-            className={`flex items-center justify-between gap-3 border-b px-4 py-1.5 backdrop-blur-sm cursor-move transition-colors duration-150 ${titleBarStateClass}`}
-            onPointerDown={handleWindowSurfacePointerDown}
-            onDoubleClick={toggleWindowMaximize}
+            className={`flex items-center justify-between gap-3 border-b px-4 py-1.5 backdrop-blur-sm transition-colors duration-150 ${isNativeWindow ? '' : 'cursor-move'} ${titleBarStateClass}`}
+            onPointerDown={isNativeWindow ? undefined : handleWindowSurfacePointerDown}
+            onDoubleClick={isNativeWindow ? undefined : toggleWindowMaximize}
           >
             <div className="min-w-0 flex-1">
               {isRenaming ? (
@@ -3284,75 +3572,109 @@ const ImageModal: React.FC<ImageModalProps> = ({
                     Cancel
                   </button>
                 </div>
-              ) : (
+              ) : !isNativeWindow ? (
                 <div className={`truncate text-sm font-semibold ${titleTextClass}`} title={image.name}>
                   {image.name}
                 </div>
-              )}
+              ) : null}
               <div className={`flex items-center gap-2 text-[11px] ${titleMetaClass}`}>
                 <span className="min-w-0 truncate" title={imageFullPath}>
-                  {imageFullPath}
+                  {isNativeWindow ? (directoryPath || imageFullPath) : imageFullPath}
                 </span>
                 {hasVerifiedTelemetry(liveImage) && (
                   <span
-                    className="shrink-0 rounded-full border border-green-500/20 bg-green-500/10 px-1.5 py-0.5 text-[10px] font-medium leading-none text-green-400"
+                    className="shrink-0 rounded-full border border-green-300 bg-green-100 px-1.5 py-0.5 text-[10px] font-medium leading-none text-green-700 dark:border-green-500/20 dark:bg-green-500/10 dark:text-green-400"
                     title="MetaHub Save Node"
                   >
                     MetaHub Save Node
                   </span>
                 )}
-                <span className="shrink-0 text-[10px] text-gray-500" title={createdAtLabel}>
+                {getAvifCarrierConflicts(liveImage.metadata).length > 0 && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-300"
+                    title="This AVIF contains conflicting prompt or workflow copies. Image MetaHub is using the standalone standard XMP value."
+                  >
+                    <AlertTriangle className="h-3 w-3" />
+                    Metadata conflict
+                  </span>
+                )}
+                <span className="shrink-0 text-[10px] text-gray-400 dark:text-gray-500" title={createdAtLabel}>
                   {createdAtLabel}
                 </span>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
-              <button
+              {isNativeWindow && onToggleAlwaysOnTop && (
+                <motion.button
+                  onClick={onToggleAlwaysOnTop}
+                  whileTap={{ scale: 0.9 }}
+                  className={`rounded-lg border p-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                    isAlwaysOnTop
+                      ? 'border-blue-400/50 bg-blue-500/20 text-blue-300'
+                      : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600 hover:bg-gray-700 hover:text-white'
+                  }`}
+                  aria-pressed={isAlwaysOnTop}
+                  aria-label={isAlwaysOnTop ? 'Disable always on top' : 'Enable always on top'}
+                  title={isAlwaysOnTop ? 'Stop keeping this window on top' : 'Keep this window on top'}
+                >
+                  <Pin className={`h-3.5 w-3.5 ${isAlwaysOnTop ? 'fill-current' : ''}`} />
+                </motion.button>
+              )}
+              <motion.button
                 onClick={handleDelete}
+                whileTap={{ scale: 0.9 }}
                 onPointerDown={(event) => event.stopPropagation()}
                 disabled={isIndexing}
-                className="rounded-lg border border-red-500/30 bg-red-500/10 p-1.5 text-red-400 transition-colors hover:border-red-500/50 hover:bg-red-500/15 hover:text-red-300 disabled:cursor-not-allowed disabled:border-gray-800 disabled:bg-gray-900 disabled:text-gray-600"
+                className="rounded-lg border border-red-300 bg-red-100 p-1.5 text-red-700 transition-colors hover:border-red-400 hover:bg-red-200 hover:text-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:border-gray-800 disabled:bg-gray-900 disabled:text-gray-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400 dark:hover:border-red-500/50 dark:hover:bg-red-500/15 dark:hover:text-red-300"
                 title={isIndexing ? 'Cannot delete during indexing' : 'Delete image'}
                 aria-label={isIndexing ? 'Cannot delete during indexing' : 'Delete image'}
               >
                 <Trash2 className="w-3.5 h-3.5" />
-              </button>
-              <button
+              </motion.button>
+              <motion.button
                 onClick={() => setIsRenaming(true)}
+                whileTap={{ scale: 0.9 }}
                 onPointerDown={(event) => event.stopPropagation()}
                 disabled={isIndexing}
-                className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-orange-300 disabled:cursor-not-allowed disabled:border-gray-800 disabled:bg-gray-900 disabled:text-gray-600"
+                className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-orange-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:border-gray-800 disabled:bg-gray-900 disabled:text-gray-600"
                 title={isIndexing ? 'Cannot rename during indexing' : 'Rename image'}
                 aria-label={isIndexing ? 'Cannot rename during indexing' : 'Rename image'}
               >
                 <Pencil className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={() => void handleMinimizeWithAnimation()}
-                onPointerDown={(event) => event.stopPropagation()}
-                className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white"
-                title="Minimize window"
-              >
-                <Minus className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={toggleWindowMaximize}
-                onPointerDown={(event) => event.stopPropagation()}
-                className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white"
-                title={isWindowMaximized ? 'Restore window' : 'Maximize window'}
-              >
-                {isWindowMaximized ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-              </button>
-              <button
-                onClick={onClose}
-                onPointerDown={(event) => event.stopPropagation()}
-                className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white"
-                aria-label="Close image"
-                title="Close (Esc)"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
+              </motion.button>
+              {!isNativeWindow && (
+                <>
+                  <motion.button
+                    onClick={() => void handleMinimizeWithAnimation()}
+                    whileTap={{ scale: 0.9 }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    title="Minimize window"
+                  >
+                    <Minus className="w-3.5 h-3.5" />
+                  </motion.button>
+                  <motion.button
+                    onClick={toggleWindowMaximize}
+                    whileTap={{ scale: 0.9 }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    title={isWindowMaximized ? 'Restore window' : 'Maximize window'}
+                  >
+                    {isWindowMaximized ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                  </motion.button>
+                  <motion.button
+                    onClick={onClose}
+                    whileTap={{ scale: 0.9 }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    className="rounded-lg border border-gray-700 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-700 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    aria-label="Close image"
+                    title="Close (Esc)"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </motion.button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -3369,7 +3691,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
               : showSidebarOnBottom
                 ? 'min-h-[280px] flex-1'
                 : 'h-full flex-1 min-w-0'
-          } bg-black flex items-center justify-center ${isFullViewportModal ? 'p-0' : 'p-2'} relative group overflow-hidden`}
+          } bg-black flex items-center justify-center ${isFullViewportModal || isNativeWindow ? 'p-0' : 'p-2'} relative group overflow-hidden`}
           onPointerDown={handleImageContainerPointerDown}
           onPointerMove={revealMediaOverlay}
           onMouseDown={isPlayableMedia ? undefined : handleMouseDown}
@@ -3378,14 +3700,27 @@ const ImageModal: React.FC<ImageModalProps> = ({
           onMouseLeave={isPlayableMedia ? undefined : handleMouseUp}
           style={{ cursor: !isPlayableMedia && zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
         >
-          {imageUrl ? (
+          {isModel3D ? (
+            <div data-no-window-drag="true" className="h-full min-h-0 w-full min-w-0">
+              <Model3DViewer
+                key={liveImage.id}
+                image={liveImage}
+                directoryPath={directoryPath}
+                modalControls
+                onOpenSourceImage={(targetImage) => {
+                  setPreviewImage(targetImage);
+                  setSelectedImage(targetImage);
+                }}
+              />
+            </div>
+          ) : imageUrl ? (
             isAudio ? (
               <div data-no-window-drag="true" className="h-full w-full" onContextMenu={handleContextMenu}>
                 <AudioPlayer
                   key={image.id}
                   src={imageUrl}
                   title={image.name}
-                  autoPlay
+                  autoPlay={shouldAutoPlayMedia}
                   externalPath={externalMediaPath}
                   diagnostics={{ fileName: image.name, surface: isSlideshowMode ? 'slideshow' : 'image-modal' }}
                   onContextMenu={handleContextMenu}
@@ -3410,6 +3745,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   key={image.id}
                   src={imageUrl}
                   poster={preferredThumbnailUrl ?? undefined}
+                  autoPlay={shouldAutoPlayMedia}
                   externalPath={externalMediaPath}
                   diagnostics={{ fileName: image.name, surface: isSlideshowMode ? 'slideshow' : 'image-modal' }}
                   hasAudioTrack={Boolean((image.metadata?.normalizedMetadata as any)?.audio)}
@@ -3431,7 +3767,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       });
                     }
                   }}
-                  onEnded={handleSlideshowVideoEnded}
+                  onEnded={handleVideoEnded}
                 />
               </div>
             ) : (
@@ -3472,7 +3808,8 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   onDragStart={handleDragStart}
                   style={{
                     transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                    transition: isDragging ? 'none' : 'transform 0.1s ease-out',
+                    transition: isDragging || viewerZoomMode !== 'manual' ? 'none' : 'transform 0.1s ease-out',
+                    opacity: viewerZoomMode === 'actual' && !displayedImageNaturalSize ? 0 : 1,
                   }}
                   title={hasImageEditChanges && editedPreviewUrl ? 'Hold to compare with the original image' : undefined}
                   draggable={canDragExternally && zoom === 1}
@@ -3512,7 +3849,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                onNavigatePrevious();
+                navigateManually('previous');
               }}
               className="absolute inset-y-0 left-0 z-20 w-16 cursor-pointer bg-gradient-to-r from-white/15 to-transparent opacity-0 transition-opacity duration-150 hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none sm:w-20 lg:w-24"
               aria-label="Previous image"
@@ -3526,7 +3863,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                onNavigateNext();
+                navigateManually('next');
               }}
               className="absolute inset-y-0 right-0 z-20 w-16 cursor-pointer bg-gradient-to-l from-white/15 to-transparent opacity-0 transition-opacity duration-150 hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none sm:w-20 lg:w-24"
               aria-label="Next image"
@@ -3545,7 +3882,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
             )}
           </div>
 
-          {!isPlayableMedia && (
+          {!isPlayableMedia && !isModel3D && (
             <div data-no-window-drag="true" className={`absolute bottom-4 left-4 z-30 flex flex-col gap-2 rounded-lg border border-white/10 bg-black/35 p-2 backdrop-blur-sm transition-opacity duration-300 ease-out ${mediaOverlayVisibilityClass}`}>
               <button
                 onClick={handleZoomIn}
@@ -3628,14 +3965,16 @@ const ImageModal: React.FC<ImageModalProps> = ({
                 >
                   <Minimize2 className="h-4 w-4" />
                 </button>
-                <button
-                  onClick={onClose}
-                  className="rounded-full border border-white/10 bg-black/35 p-2 text-white/90 transition-colors hover:bg-black/55"
-                  aria-label="Close image"
-                  title="Close (Esc)"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                {!isNativeWindow && (
+                  <button
+                    onClick={onClose}
+                    className="rounded-full border border-white/10 bg-black/35 p-2 text-white/90 transition-colors hover:bg-black/55"
+                    aria-label="Close image"
+                    title="Close (Esc)"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             ) : (
               <div className="flex flex-row items-center gap-2">
@@ -3649,7 +3988,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       onOpenImageEditor(liveImage);
                     }}
                     className="rounded-full border border-white/10 bg-black/35 p-2 text-white/90 backdrop-blur-sm transition-colors hover:bg-black/55"
-                    title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature) - start trial' : 'Open Image Editor'}
+                    title={!canUseImageEditor && initialized ? 'Image Editor (Pro Feature)' : 'Open Image Editor'}
                   >
                     <ImageIcon className="h-4 w-4" />
                   </button>
@@ -3670,8 +4009,8 @@ const ImageModal: React.FC<ImageModalProps> = ({
                         ? 'border-cyan-400/40 bg-cyan-500/25'
                         : 'border-white/10 bg-black/35 hover:bg-black/55'
                     }`}
-                    title={!canUseImageEditor && initialized ? 'Image adjustments (Pro Feature) - start trial' : isAdjustmentPanelOpen ? 'Hide image adjustments' : 'Edit image adjustments'}
-                    aria-label={!canUseImageEditor && initialized ? 'Image adjustments (Pro Feature) - start trial' : isAdjustmentPanelOpen ? 'Hide image adjustments' : 'Edit image adjustments'}
+                    title={!canUseImageEditor && initialized ? 'Image adjustments (Pro Feature)' : isAdjustmentPanelOpen ? 'Hide image adjustments' : 'Edit image adjustments'}
+                    aria-label={!canUseImageEditor && initialized ? 'Image adjustments (Pro Feature)' : isAdjustmentPanelOpen ? 'Hide image adjustments' : 'Edit image adjustments'}
                   >
                     <SlidersHorizontal className="h-4 w-4" />
                   </button>
@@ -3715,7 +4054,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
             showSidebarOnBottom
               ? `border-t border-gray-800/80 ${isResizingSidebar ? 'transition-none' : 'transition-[height] duration-300 ease-in-out'}`
               : `h-full border-l border-transparent ${isResizingSidebar ? 'transition-none' : 'transition-[width] duration-300 ease-in-out'}`
-          } relative flex flex-col`}
+          } relative flex flex-col bg-gray-900`}
           style={
             showSidebarOnBottom
               ? { height: sidebarHeight, minHeight: DETAILS_SIDEBAR_MIN_HEIGHT, maxHeight: `${DETAILS_SIDEBAR_MAX_RATIO * 100}%` }
@@ -3753,7 +4092,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                     }
                     onOpenImageEditor(liveImage);
                   }}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-sm font-medium text-indigo-100 transition-colors hover:border-indigo-400/50 hover:bg-indigo-500/20"
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-700 transition-colors hover:border-indigo-400 hover:bg-indigo-100 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-100 dark:hover:border-indigo-400/50 dark:hover:bg-indigo-500/20"
                 >
                   <ImageIcon className="h-4 w-4" />
                   Open Image Editor
@@ -3771,7 +4110,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                     }
                     setIsAdjustmentPanelOpen(true);
                   }}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/50 hover:bg-cyan-500/20"
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-cyan-300 bg-cyan-50 px-3 py-2 text-sm font-medium text-cyan-700 transition-colors hover:border-cyan-400 hover:bg-cyan-100 dark:border-cyan-500/30 dark:bg-cyan-500/10 dark:text-cyan-100 dark:hover:border-cyan-400/50 dark:hover:bg-cyan-500/20"
                 >
                   <SlidersHorizontal className="h-4 w-4" />
                   Adjust Image
@@ -3830,10 +4169,15 @@ const ImageModal: React.FC<ImageModalProps> = ({
                 <TagInputCombobox
                   ref={tagInputRef}
                   value={tagInput}
-                  onValueChange={setTagInput}
+                  onValueChange={(value) => {
+                    setTagInput(value);
+                    if (onRequestTagSuggestions && value.trim()) {
+                      void onRequestTagSuggestions(value).then(setRemoteAvailableTags);
+                    }
+                  }}
                   onSubmit={handleAddTag}
                   recentTags={recentTags}
-                  availableTags={availableTags}
+                  availableTags={onRequestTagSuggestions ? remoteAvailableTags : availableTags}
                   excludedTags={currentTags}
                   suggestionLimit={tagSuggestionLimit}
                   placeholder="Add tag..."
@@ -3910,7 +4254,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
             </div>
           </div>
 
-          {nMeta && showComfyUIActions && (
+          {nMeta && showComfyUIContext && (
             <div className="rounded-lg border border-gray-700/50 bg-gray-900/50 p-2">
               <div className="flex gap-2">
                 <button
@@ -3950,12 +4294,12 @@ const ImageModal: React.FC<ImageModalProps> = ({
             <div className="space-y-4">
           {/* MetaHub Save Node Notes - Only if present */}
           {nMeta?.notes && (
-            <div className="bg-gray-50 dark:bg-gray-900/50 p-3 rounded-lg border border-gray-200 dark:border-gray-700/50">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-xs font-semibold text-purple-600 dark:text-purple-300 uppercase tracking-wider">Notes (MetaHub Save Node)</span>
-              </div>
-              <pre className="text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words font-mono text-sm bg-white dark:bg-gray-800/50 p-2 rounded border border-gray-200 dark:border-gray-700/50">{nMeta.notes}</pre>
-            </div>
+            <MetadataItem
+              label="Notes (MetaHub Save Node)"
+              value={nMeta.notes}
+              isPrompt
+              onCopy={() => copyToClipboard(nMeta.notes || '', 'Notes', true)}
+            />
           )}
 
           {nMeta ? (
@@ -3971,6 +4315,29 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   }}
                 />
                 <MetadataItem label="Prompt" value={effectiveMetadata?.prompt} isPrompt onCopy={() => copyToClipboard(effectiveMetadata?.prompt || '', 'Prompt', true)} />
+                {effectiveMetadata?.prompt && (
+                  <button
+                    type="button"
+                    disabled={isShadowLoading || Boolean(shadowError)}
+                    onClick={async () => {
+                      try {
+                        const result = await savePrompt(liveImage, {
+                          directoryPath,
+                          showOriginal,
+                          shadowMetadata,
+                          shadowReady: !isShadowLoading && !shadowError,
+                        });
+                        setSuccess(result.status === 'already-saved' ? 'Already saved' : 'Prompt saved');
+                      } catch (cause) {
+                        setError(cause instanceof Error ? cause.message : 'Could not save prompt.');
+                      }
+                    }}
+                    className={`inline-flex w-full items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isPromptSaved ? 'border-accent bg-accent text-white hover:bg-accent/90' : 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'}`}
+                    aria-pressed={isPromptSaved}
+                  >
+                    <Bookmark size={14} fill={isPromptSaved ? 'currentColor' : 'none'} /> {isPromptSaved ? 'Saved' : 'Save Prompt'}
+                  </button>
+                )}
                 <MetadataItem label="Negative Prompt" value={effectiveMetadata?.negativePrompt} isPrompt onCopy={() => copyToClipboard(effectiveMetadata?.negativePrompt || '', 'Negative Prompt', true)} />
                 
                 {/* Shadow Resources List */}
@@ -3990,25 +4357,40 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
                 <div className="grid grid-cols-2 gap-3">
                   <MetadataItem label="Seed" value={effectiveMetadata?.seed} onCopy={() => copyToClipboard(String(effectiveMetadata?.seed || ''), 'Seed', true)} />
-                  <MetadataItem label="Model" value={effectiveMetadata?.model} onCopy={() => copyToClipboard(effectiveMetadata?.model || '', 'Model', true)} />
+                  <MetadataItem
+                    label="Model"
+                    value={effectiveMetadata?.model}
+                    onCopy={() => copyToClipboard(effectiveMetadata?.model || '', 'Model', true)}
+                    renderValue={checkpointRef
+                      ? (value) => <CivitaiResourceLink resource={checkpointRef}>{value}</CivitaiResourceLink>
+                      : undefined}
+                  />
                 </div>
               </div>
 
               {/* Details Section - Collapsible */}
               <div>
-                <button 
+                <motion.button
                   onClick={() => setShowDetails(!showDetails)} 
+                  whileTap={{ scale: 0.99 }}
                   className="text-gray-600 dark:text-gray-300 text-sm w-full text-left py-2 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between hover:text-gray-900 dark:hover:text-white transition-colors"
                 >
-                  <span className="font-semibold">Generation Details</span>
+                  <span className="font-semibold">{isModel3D ? '3D Generation' : 'Generation Details'}</span>
                   {showDetails ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                </button>
+                </motion.button>
                 {showDetails && (
                   <div className="space-y-3 mt-3">
                     {nMeta.generationType && (
                       <MetadataItem label="Generation Type" value={getGenerationTypeLabel(nMeta.generationType)} />
                     )}
-                    <MetadataItem label="Model" value={nMeta.model} onCopy={(v) => copyToClipboard(v, "Model", true)} />
+                    <MetadataItem
+                      label="Model"
+                      value={nMeta.model}
+                      onCopy={(v) => copyToClipboard(v, "Model", true)}
+                      renderValue={checkpointRef
+                        ? (value) => <CivitaiResourceLink resource={checkpointRef}>{value}</CivitaiResourceLink>
+                        : undefined}
+                    />
                     {nMeta.generator && (
                       <MetadataItem label="Generator" value={nMeta.generator} />
                     )}
@@ -4016,22 +4398,48 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       <MetadataItem label="VAE" value={(nMeta as any).vae || (nMeta as any).vaes?.[0]?.name} />
                     )}
                     {effectiveMetadata?.loras && effectiveMetadata.loras.length > 0 && (
-                      <MetadataItem label="LoRAs" value={effectiveMetadata.loras.map(formatLoRA).join(', ')} />
+                      <MetadataItem
+                        label="LoRAs"
+                        value={effectiveMetadata.loras.map(formatLoRA).join(', ')}
+                        renderValue={loraRefByName.size > 0
+                          ? () => effectiveMetadata.loras.map((lora, index) => {
+                              const display = formatLoRA(lora);
+                              const rawName = typeof lora === 'string' ? lora : (lora.name || lora.model_name || display);
+                              const ref = loraRefByName.get(normalizeResourceName(rawName));
+                              return (
+                                <React.Fragment key={index}>
+                                  {index > 0 && ', '}
+                                  {ref ? <CivitaiResourceLink resource={ref}>{display}</CivitaiResourceLink> : display}
+                                </React.Fragment>
+                              );
+                            })
+                          : undefined}
+                      />
                     )}
                     <div className="grid grid-cols-2 gap-2">
-                      <MetadataItem label="Steps" value={effectiveMetadata?.steps} />
-                      <MetadataItem label="CFG Scale" value={effectiveMetadata?.cfg_scale} />
+                      <MetadataItem label="Steps" value={effectiveMetadata?.steps} onCopy={(v) => copyToClipboard(v, "Steps", true)} />
+                      <MetadataItem label="CFG Scale" value={effectiveMetadata?.cfg_scale} onCopy={(v) => copyToClipboard(v, "CFG Scale", true)} />
                       {nMeta.clip_skip && nMeta.clip_skip > 1 && (
                         <MetadataItem label="Clip Skip" value={nMeta.clip_skip} />
                       )}
                       <MetadataItem label="Seed" value={effectiveMetadata?.seed} onCopy={(v) => copyToClipboard(v, "Seed", true)} />
-                      <MetadataItem label="Sampler" value={effectiveMetadata?.sampler} />
-                      <MetadataItem label="Scheduler" value={effectiveMetadata?.scheduler} />
-                      <MetadataItem label="Dimensions" value={effectiveMetadata?.width && effectiveMetadata?.height ? `${effectiveMetadata.width}x${effectiveMetadata.height}` : undefined} />
+                      <MetadataItem label="Sampler" value={effectiveMetadata?.sampler} onCopy={(v) => copyToClipboard(v, "Sampler", true)} />
+                      <MetadataItem label="Scheduler" value={effectiveMetadata?.scheduler} onCopy={(v) => copyToClipboard(v, "Scheduler", true)} />
+                      <MetadataItem label="Dimensions" value={effectiveMetadata?.width && effectiveMetadata?.height ? `${effectiveMetadata.width}x${effectiveMetadata.height}` : undefined} onCopy={(v) => copyToClipboard(v, "Dimensions", true)} />
                       {(nMeta as any).denoise != null && (nMeta as any).denoise < 1 && (
                         <MetadataItem label="Denoise" value={(nMeta as any).denoise} />
                       )}
                     </div>
+                    {nMeta.model_3d && (
+                      <div className="grid grid-cols-2 gap-2 border-t border-gray-700/50 pt-3">
+                        <MetadataItem label="3D Format" value={nMeta.model_3d.format?.toUpperCase()} />
+                        <MetadataItem label="Vertices" value={nMeta.model_3d.vertexCount} />
+                        <MetadataItem label="Faces" value={nMeta.model_3d.faceCount} />
+                        <MetadataItem label="Materials" value={nMeta.model_3d.materialCount} />
+                        <MetadataItem label="Textures" value={nMeta.model_3d.hasTextures == null ? undefined : (nMeta.model_3d.hasTextures ? 'Yes' : 'No')} />
+                        <MetadataItem label="Source Node" value={nMeta.model_3d.sourceNodeClass} />
+                      </div>
+                    )}
                     {videoInfo && (
                       <div className="grid grid-cols-2 gap-2">
                         <MetadataItem label="Frames" value={videoInfo.frame_count} />
@@ -4088,8 +4496,9 @@ const ImageModal: React.FC<ImageModalProps> = ({
               {/* Performance Section - Collapsible */}
               {nMeta && nMeta._analytics && (
                 <div>
-                  <button
+                  <motion.button
                     onClick={() => setShowPerformance(!showPerformance)}
+                    whileTap={{ scale: 0.99 }}
                     className="text-gray-600 dark:text-gray-300 text-sm w-full text-left py-2 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between hover:text-gray-900 dark:hover:text-white transition-colors"
                   >
                     <span className="font-semibold flex items-center gap-2">
@@ -4097,7 +4506,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       Performance
                     </span>
                     {showPerformance ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                  </button>
+                  </motion.button>
 
                   {showPerformance && (
                     <div className="space-y-3 mt-3">
@@ -4145,6 +4554,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   )}
                 </div>
               )}
+
             </div>
           ) : (
             <div className="bg-yellow-900/50 border border-yellow-700 text-yellow-300 px-4 py-3 rounded-lg text-sm">
@@ -4152,8 +4562,16 @@ const ImageModal: React.FC<ImageModalProps> = ({
             </div>
           )}
 
+          <ProvenanceSection
+            image={liveImage}
+            metadata={nMeta}
+            rawMetadata={rawMetadataImage.metadata}
+            loadFullRawMetadata={ensureFullRawMetadata}
+            displayMode="details-compact"
+          />
+
           <div className="grid grid-cols-2 gap-2 pt-2">
-            <button
+            <motion.button
               onClick={async () => {
                 const success = await copyToClipboard(nMeta?.prompt || '', 'Prompt', true);
                 if (success) {
@@ -4161,12 +4579,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   setTimeout(() => setCopiedPrompt(false), 2000);
                 }
               }}
-              className="w-full justify-center bg-blue-50 hover:bg-blue-100 dark:bg-blue-500/10 dark:hover:bg-blue-500/20 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-500/30 px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 flex items-center gap-2"
+              whileTap={{ scale: 0.97 }}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100"
             >
               {copiedPrompt ? <CheckCircle className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
               {copiedPrompt ? 'Copied!' : 'Copy Prompt'}
-            </button>
-            <button
+            </motion.button>
+            <motion.button
               onClick={async () => {
                 const metadataImage = await ensureFullRawMetadata();
                 const success = await copyToClipboard(JSON.stringify(metadataImage.metadata, null, 2), 'Raw Metadata', true);
@@ -4175,12 +4594,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   setTimeout(() => setCopiedRawMetadata(false), 2000);
                 }
               }}
-              className="w-full justify-center bg-blue-50 hover:bg-blue-100 dark:bg-blue-500/10 dark:hover:bg-blue-500/20 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-500/30 px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 flex items-center gap-2"
+              whileTap={{ scale: 0.97 }}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100"
             >
               {copiedRawMetadata ? <CheckCircle className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
               {copiedRawMetadata ? 'Copied!' : 'Copy Raw Metadata'}
-            </button>
-            <button
+            </motion.button>
+            <motion.button
               onClick={async () => {
                 if (!directoryPath) {
                   alert('Cannot determine file location: directory path is missing.');
@@ -4188,12 +4608,13 @@ const ImageModal: React.FC<ImageModalProps> = ({
                 }
                 await showInExplorer(`${directoryPath}/${image.name}`);
               }}
-              className="w-full justify-center bg-gray-100 hover:bg-gray-200 dark:bg-white/5 dark:hover:bg-white/10 text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-white/10 px-3 py-2 rounded-lg text-xs font-medium transition-colors flex items-center gap-2"
+              whileTap={{ scale: 0.97 }}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100"
             >
               <Folder className="w-3.5 h-3.5" />
               Show in Folder
-            </button>
-            <button
+            </motion.button>
+            <motion.button
               onClick={() => {
                 if (!canUseComparison) {
                   showProModal('comparison');
@@ -4204,23 +4625,25 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   onClose(); // Close ImageModal, ComparisonModal will auto-open
                 }
               }}
+              whileTap={{ scale: 0.97 }}
               disabled={canUseComparison && comparisonCount >= 4}
-              className="w-full justify-center bg-purple-50 hover:bg-purple-100 dark:bg-purple-500/10 dark:hover:bg-purple-500/20 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30 px-3 py-2 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5"
+              className="order-5 col-span-2 flex w-full items-center justify-center gap-1.5 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
               title={!canUseComparison ? "Comparison (Pro Feature)" : comparisonCount >= 4 ? "Comparison queue full" : "Add to comparison"}
             >
               <GitCompare className="w-3 h-3" />
               Add to Compare {canUseComparison && comparisonCount > 0 && `(${comparisonCount}/4)`}
               {!canUseComparison && initialized && <ProBadge size="sm" />}
-            </button>
-            <button
+            </motion.button>
+            <motion.button
               onClick={() => onFindSimilar?.(image)}
+              whileTap={{ scale: 0.97 }}
               disabled={!canFindSimilar}
-              className="w-full justify-center bg-teal-50 hover:bg-teal-100 dark:bg-teal-500/10 dark:hover:bg-teal-500/20 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-500/30 px-3 py-2 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5"
+              className="order-4 flex w-full items-center justify-center gap-1.5 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
               title={canFindSimilar ? 'Find images with matching prompt and metadata' : 'Requires prompt metadata'}
             >
               <Search className="w-3 h-3" />
-              Find similar...
-            </button>
+               Find by metadata...
+            </motion.button>
           </div>
 
           {/* A1111 Integration - Separate Buttons with Visual Hierarchy */}
@@ -4236,7 +4659,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   setIsGenerateModalOpen(true);
                 }}
                 disabled={canUseA1111 && !effectiveMetadata?.prompt}
-                className="w-full bg-blue-50 hover:bg-blue-100 dark:bg-blue-500/10 dark:hover:bg-blue-500/20 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed border border-blue-200 dark:border-blue-500/50 hover:border-blue-300 dark:hover:border-blue-400 text-blue-700 dark:text-blue-100 px-4 py-3 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 transition-all duration-200"
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-blue-500 bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isGenerating && canUseA1111 ? (
                   <>
@@ -4265,7 +4688,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   copyToA1111(generationImage, effectiveMetadata);
                 }}
                 disabled={canUseA1111 && (isCopying || !effectiveMetadata?.prompt)}
-                className="w-full bg-gray-50 hover:bg-gray-100 dark:bg-white/5 dark:hover:bg-white/10 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed border border-gray-200 dark:border-white/10 hover:border-gray-300 dark:hover:border-white/20 text-gray-700 dark:text-gray-300 px-3 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-all duration-200"
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isCopying && canUseA1111 ? (
                   <>
@@ -4315,7 +4738,16 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       model: params.model || effectiveMetadata?.model,
                       ...(params.sampler ? { sampler: params.sampler } : {}),
                     };
-                    await generateWithA1111(generationImage, customMetadata, params.numberOfImages);
+                    await runGenerateRequest(
+                      'a1111',
+                      () => ({
+                        provider: 'a1111',
+                        imageId: generationImage.id,
+                        customMetadata,
+                        numberOfImages: params.numberOfImages,
+                      }),
+                      () => generateWithA1111(generationImage, customMetadata, params.numberOfImages),
+                    );
                     setIsGenerateModalOpen(false);
                   }}
                   isGenerating={isGenerating}
@@ -4326,10 +4758,8 @@ const ImageModal: React.FC<ImageModalProps> = ({
 
           {/* ComfyUI Integration */}
           {effectiveMetadata && showComfyUIActions && (
-            <div className={`mt-3 ${showComfyUIHeading ? 'pt-3 border-t border-gray-700' : ''}`}>
-              {showComfyUIHeading && (
-                <h4 className="text-xs text-gray-400 uppercase tracking-wider mb-2">ComfyUI</h4>
-              )}
+            <div className="mt-3 border-t border-gray-700 pt-3">
+              <h4 className="mb-2 text-xs uppercase tracking-wider text-gray-400">ComfyUI</h4>
 
               {/* One-click ComfyUI handoff */}
               <button
@@ -4340,7 +4770,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   }
                   onOpenComfyUIWorkflow?.(generationImage);
                 }}
-                className="w-full bg-purple-50 hover:bg-purple-100 dark:bg-purple-500/10 dark:hover:bg-purple-500/20 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed border border-purple-200 dark:border-purple-500/50 hover:border-purple-300 dark:hover:border-purple-400 text-purple-700 dark:text-purple-100 px-4 py-3 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 transition-all duration-200 mb-2"
+                className="mb-2 flex w-full items-center justify-center gap-2 rounded-lg border border-blue-500 bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Workflow className="w-4 h-4" />
                 <span>Open Workflow in ComfyUI</span>
@@ -4357,7 +4787,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   copyToComfyUI(generationImage, effectiveMetadata);
                 }}
                 disabled={canUseComfyUI && (isCopyingComfyUI || !effectiveMetadata?.prompt)}
-                className="w-full bg-gray-50 hover:bg-gray-100 dark:bg-white/5 dark:hover:bg-white/10 disabled:bg-gray-100 dark:disabled:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed border border-gray-200 dark:border-white/10 hover:border-gray-300 dark:hover:border-white/20 text-gray-700 dark:text-gray-300 px-3 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-all duration-200"
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-gray-800 hover:text-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isCopyingComfyUI && canUseComfyUI ? (
                   <>
@@ -4443,8 +4873,8 @@ const ImageModal: React.FC<ImageModalProps> = ({
                   onClick={openBatchExport}
                   whileTap={{ scale: 0.95 }}
                   className="p-1.5 bg-gray-800 hover:bg-gray-700 rounded-md transition-colors text-gray-400 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
-                  title={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature - start trial' : 'Open export flow'}
-                  aria-label={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature - start trial' : 'Open export flow'}
+                  title={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature' : 'Open export flow'}
+                  aria-label={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature' : 'Open export flow'}
                 >
                   <Download size={14} />
                 </motion.button>
@@ -4471,7 +4901,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
             )}
           </div>
             </div>
-          ) : sidebarTab === 'workflow' && nMeta && showComfyUIActions ? (
+          ) : sidebarTab === 'workflow' && nMeta && showComfyUIContext ? (
             <div className="space-y-4">
               <ComfyUIWorkflowWorkspace
                 image={image}
@@ -4491,7 +4921,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       ...(params.scheduler ? { scheduler: params.scheduler } : {}),
                     };
 
-                    await generateWithComfyUI(generationImage, {
+                    const generateParams = {
                       customMetadata,
                       overrides: {
                         model: params.model || undefined,
@@ -4501,8 +4931,21 @@ const ImageModal: React.FC<ImageModalProps> = ({
                       sourceImagePolicy: params.sourceImagePolicy,
                       advancedPromptJson: params.advancedPromptJson,
                       advancedWorkflowJson: params.advancedWorkflowJson,
-                      maskFile: params.maskFile,
-                    });
+                    };
+
+                    await runGenerateRequest(
+                      'comfyui',
+                      async () => ({
+                        provider: 'comfyui',
+                        imageId: generationImage.id,
+                        ...generateParams,
+                        maskFile: await toImageViewerMaskFileDTO(params.maskFile),
+                      }),
+                      () => generateWithComfyUI(generationImage, {
+                        ...generateParams,
+                        maskFile: params.maskFile,
+                      }),
+                    );
                   }}
                   isGenerating={isGeneratingComfyUI}
                   status={generateStatusComfyUI}
@@ -4518,7 +4961,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
         )}
         </div>
 
-        {!isFullViewportModal && (
+        {!isFullViewportModal && !isNativeWindow && (
           <>
             <div
               className="absolute inset-x-5 top-0 h-1.5 cursor-ns-resize bg-transparent"
@@ -4582,11 +5025,12 @@ const ImageModal: React.FC<ImageModalProps> = ({
           onSave={async (metadata) => { await saveShadowMetadata(metadata); }}
           onExportEditedCopy={openBatchExport}
           onApplyToSelected={exportSelectionIds.size > 1 ? async (metadata) => {
-            await bulkSaveShadowMetadata(Array.from(exportSelectionIds).map((imageId) => ({
+            const imagesById = new Map(allImages.map((candidate) => [candidate.id, candidate]));
+            await saveShadows(Array.from(exportSelectionIds).map((imageId) => ({
               ...metadata,
               imageId,
               updatedAt: Date.now(),
-            })));
+            })), imagesById);
           } : null}
           selectedImageCount={exportSelectionIds.size}
           onCopyEditableMetadata={(metadata) => {
@@ -4646,7 +5090,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
       {/* Context Menu */}
       {contextMenu.visible && (
         <div
-          className="pointer-events-auto fixed z-[60] bg-gray-800 border border-gray-600 rounded-lg shadow-xl py-1 min-w-[160px]"
+          className="pointer-events-auto fixed z-[10000] bg-gray-800 border border-gray-600 rounded-lg shadow-xl py-1 min-w-[160px]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -4788,7 +5232,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
                 disabled={!canFindSimilar}
               >
                 <Search className="w-4 h-4" />
-                Find similar...
+                 Find by metadata...
               </button>
 
               <div className="border-t border-gray-600 my-1"></div>
@@ -4815,7 +5259,7 @@ const ImageModal: React.FC<ImageModalProps> = ({
               <button
                 onClick={exportImage}
                 className="w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-                title={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature - start trial' : undefined}
+                title={exportSelectionIds.size > 1 && !canUseBatchExport && initialized ? 'Pro feature' : undefined}
               >
                 <Download className="w-4 h-4" />
                 Export...
@@ -4856,6 +5300,9 @@ export default React.memo(ImageModal, (prevProps, nextProps) => {
     prevProps.initialWindowState?.width === nextProps.initialWindowState?.width &&
     prevProps.initialWindowState?.height === nextProps.initialWindowState?.height &&
     prevProps.isMinimized === nextProps.isMinimized &&
+    prevProps.hostMode === nextProps.hostMode &&
+    prevProps.isAlwaysOnTop === nextProps.isAlwaysOnTop &&
+    prevProps.onToggleAlwaysOnTop === nextProps.onToggleAlwaysOnTop &&
     prevProps.startSlideshow === nextProps.startSlideshow &&
     prevProps.closeOnSlideshowExit === nextProps.closeOnSlideshowExit &&
     prevProps.diagnosticsFlowId === nextProps.diagnosticsFlowId &&

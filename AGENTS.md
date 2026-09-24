@@ -211,6 +211,7 @@ Metadata sources:
 11. **Image Adjustments**: Brightness, contrast, saturation, and hue adjustments with metadata-preserving PNG Save As / Overwrite desktop workflows
 12. **ComfyUI Workspace**: Embedded ComfyUI browser in Electron with image context, library thumbnails, workflow metadata tabs, and direct grid/table/viewer entry points
 13. **External ComfyUI Queue Monitoring**: Optional detection of ComfyUI jobs started outside Image MetaHub in the shared generation queue
+14. **Local Visual Search**: Opt-in Find Similar for visually related files, including images without metadata. Experimental text-to-image queries are secondary; no model download occurs without a separate explicit action.
 
 ## Smart Library & Auto-Tags
 
@@ -218,6 +219,31 @@ Metadata sources:
 - **Auto-Tags (TF-IDF)**: `services/autoTaggingEngine.ts`, `services/workers/autoTaggingWorker.ts`, `components/TagsAndFavorites.tsx`, `components/ImageModal.tsx`, `components/ImagePreviewSidebar.tsx`
 - **Deduplication Helper**: `services/deduplicationEngine.ts`, `components/DeduplicationHelper.tsx`, `components/ImageGrid.tsx`
 - **Cluster Cache**: `services/clusterCacheManager.ts` (atomic writes, userData path resolution)
+
+## Local Visual Search
+
+Find Similar is the primary supported Local Visual Search workflow for v0.19 (`services/embeddings/`, `services/workers/embeddingWorker.ts`, `services/workers/vectorSearchWorker.ts`, `store/useSemanticStore.ts`). Text-to-image queries are experimental and must not be promoted as the main search experience without explicit authorization. Do not alter the traditional deterministic metadata, prompt, model, LoRA, or workflow search paths to accommodate CLIP.
+
+**Key pieces:**
+
+- **Vector format** (`services/embeddings/embeddingFormat.ts`): int8-quantized vectors with a per-vector scale, in append-only segment files (`${safeCacheId}_emb_seg_*.bin`) next to the metadata cache. A manifest (`${safeCacheId}_emb_manifest.json`) is the source of truth for how much of each segment is real — a segment longer than its declared row count holds bytes from an uncommitted flush and is discarded on load.
+- **On-disk store** (`services/embeddings/embeddingStore.ts`, `EmbeddingIndex`): owns append/flush/tombstone/rename for one library-wide index, keyed by the fixed id `SEMANTIC_CACHE_ID = 'imh-visual-search'` (not per-directory, since the store flattens every directory into one `images[]`).
+- **Backfill** (`services/embeddings/embeddingIndexer.ts`, `runBackfill`): resumable, newest-first, pause/cancel-able indexing job. This is the *only* place that reconciles the index against the live image set (tombstones vectors for images no longer present) — it is the only caller with the authoritative, fully-hydrated image array. Do not add reconciliation to a mount effect or anywhere else that can fire before the library has finished loading from cache: an empty/partial image list there reads as "every image left the library" and wipes the index.
+- **Search** (`services/embeddings/semanticSearchEngine.ts` + `services/workers/vectorSearchWorker.ts`): brute-force cosine over the in-memory matrix in a long-lived worker, top-K via a min-heap, relevance decided by a z-score cutoff over the query's own score distribution (CLIP text↔image cosines are compressed and query-dependent, so an absolute floor doesn't work).
+- **Embedding worker** (`services/workers/embeddingWorker.ts`, `services/embeddings/embeddingService.ts`): runs the CLIP towers via `@huggingface/transformers`. WASM/q8 is the always-present CPU baseline; an opt-in WebGPU/fp16 accelerator falls back to CPU automatically on adapter or `shader-f16` load failure.
+- **Model files**: served to the worker over a dedicated `imh-model://` protocol from `<userData>/models/`, registered in `electron.mjs` alongside the embedding sidecar IPC handlers (`read/write/append-embedding-*`, `*-embedding-model*`).
+- **UI**: `components/SemanticSearchBar.tsx` (sidebar toggle + query input), `components/settings/VisualSearchSettingsPanel.tsx` (model download, index build/pause/resume, GPU toggle), `components/VisualSearchOnboarding.tsx` (dismissible intro card).
+- **Store integration**: a visual query lives in `useImageStore.semanticResult.scoreById` (a `Map`, never on `IndexedImage`) and *replaces* the text-search predicate rather than combining with it, driving a `'relevance'` sort order.
+
+**Defaults and gating:** `settings.semanticSearchEnabled` is **off by default** — while off, no model status check, no index open, no file write. The onboarding card and the Settings tab stay visible regardless, so the feature is still discoverable; turning it on is what first opens the index. Free tier caps the backfill at `SEMANTIC_FREE_TIER_LIMIT` (2,000) most-recent images (`hooks/useFeatureAccess.ts`); Pro is unlimited.
+
+**Invariants for future changes:**
+
+- Model files must never download without an explicit user action, downloads must keep SHA-256 integrity verification, and all processing must remain local after the explicit download.
+- Embeddings and their index are derived, reconstructible cache data. Index format changes must not trigger a `PARSER_VERSION` bump unless parser output itself changed.
+- WebGPU initialization or runtime failures must preserve a functional WASM fallback.
+- Changes to model loading, workers, Electron boundaries, or packaging require a packaged-app smoke test.
+- UI and documentation must not promise retrieval precision that tests do not support. Find Similar stays the supported headline; text-to-image stays clearly experimental.
 
 ## A1111 Integration
 
@@ -722,10 +748,48 @@ For advanced manual workflows, users can:
 
 ### Fixing Performance Issues
 
-1. Check IndexedDB caching logic
-2. Review virtual scrolling implementation
-3. Profile with large image collections
-4. Consider lazy loading and background processing
+**Measure first.** Do not infer the bottleneck from reading code — this codebase
+has repeatedly punished that. A reported "delete is slow" was diagnosed as the
+store's filter pipeline and optimized across three PRs with zero effect; the
+actual cost was 326 MB of cache chunks being read and rewritten per deleted
+file, in the main process. Add instrumentation, reproduce, read the numbers,
+then fix what the numbers point at.
+
+**Then measure again, more than once.** Development happens on a machine with
+games, antivirus and external drives on it, and a single sample there is worth
+very little: the same delete has measured 3082 ms, 1395 ms and 145 ms across
+runs, and an IPC call that only hits `ENOENT` — no file, no work at all —
+measured 1227 ms in one run and 1.1 ms in another. Take two or three samples,
+treat a spread wider than about 2x as environmental until proven otherwise, and
+get a quiet-machine number before concluding that a change did nothing. One bad
+sample nearly buried a 155x improvement as "no difference".
+
+1. Instrument the suspect path with `recordPerformanceDuration` /
+   `beginPerformanceFlow` (`utils/performanceDiagnostics.ts`). Enable
+   Performance Diagnostics in Settings, or use `window.__IMH_PERF__` —
+   `printSummary()`, `getEvents()`, `setConsoleLogging(true)`. A long-task
+   observer is already attached.
+2. Check whether the freeze is even in the renderer. Work awaited over IPC does
+   not block the renderer's main thread, but it **does** occupy the Electron
+   main process, and every other IPC call queues behind it — including the image
+   reads that grid and modal navigation need. A UI that stutters during a
+   background write is usually main-process starvation, not a slow component.
+   Note that a timing taken around an `await` in the renderer cannot tell those
+   apart on its own: it charges the handler's own work, the main process being
+   busy when the message arrives, and this thread being too busy to run the
+   continuation, all to the same number. To split them, temporarily return the
+   handler's own elapsed time with the reply and queue a `setTimeout(0)`
+   alongside the call — if it fires late, the renderer was starved and the main
+   process is innocent.
+3. For anything touching the metadata cache, look at chunk file *sizes* before
+   anything else (`services/cacheManager.ts`). Chunks are read and rewritten
+   whole, so their size is the cost of every single-image edit. A ComfyUI
+   library carries a full workflow graph per entry, which makes per-entry costs
+   roughly 25x what an A1111 library shows.
+4. Anything that serializes a whole collection across the IPC boundary (registry
+   snapshots, worker datasets, cache records) belongs off the interactive path —
+   debounce and coalesce it.
+5. Profile with large collections, and prefer lazy loading and background work.
 
 ## Testing Strategy
 
@@ -755,12 +819,14 @@ Browser version uses File System Access API with limited capabilities.
 
 ## Performance Tips
 
-- Always test with large image collections (10,000+ images)
+- Always test with large image collections (10,000+ images), and on a ComfyUI library — entries there are far heavier than A1111 ones and are what surface per-entry costs
 - Use React.memo() for expensive components
 - Implement proper virtualization for lists
-- Cache metadata aggressively in IndexedDB
+- Cache metadata aggressively, but keep cached entries small: large raw metadata is compacted on write and rehydrated on demand (`services/rawMetadataHydration.ts`)
+- Prefer touching one cache chunk over rewriting a directory cache; the id→chunk index exists for exactly this, and any write that finalizes a cache record must also rewrite that index. Deletes touch no chunk at all — they tombstone the id in `{cacheId}_removed.json` and let a later rewrite compact it. If you add a path that writes a cache record, decide what it does to that sidecar (`finalize-cache-write` makes you say so) and read `utils/cacheTombstones.mjs` first: a record and a sidecar that disagree must be left disagreeing, never quietly reconciled
 - Process files in background threads when possible
 - Use synchronous I/O (`fs.openSync`) for header reads during indexing to prevent disk contention (Phase B optimization)
+- Viewer navigation latency is the full image's fetch and decode, not React work. A prefetch that only resolves a source warms nothing — `mediaSourceCache` hands back a URL string without reading a byte — so neighbours are decoded ahead of time through `services/mediaDecodeCache.ts`, and `ImageModal` reads that warmth during render to swap in a single commit. Assigning `src` twice (thumbnail, then full) costs a second decode and a visible resolution pop, so it is worth avoiding whenever the full source is already warm
 
 ## Common Pitfalls
 
@@ -804,7 +870,7 @@ Executes complete pipeline:
 - Runs `npm run build` (compile + test)
 - Updates `package.json` version
 - Updates `ARCHITECTURE.md` version
-- Generates release notes via `generate-release.js`
+- Generates release notes via `scripts/generate-release.js`
 - Creates git commit with standardized message
 - Creates git tag `v{VERSION}`
 - Pushes branch and tag to origin
@@ -827,7 +893,7 @@ Same as above but **skips build step** (safe for pre-tested changes):
 
 ```bash
 npm version 0.9.6
-node generate-release.js 0.9.6
+node scripts/generate-release.js 0.9.6
 git tag v0.9.6
 git push origin main v0.9.6
 ```
@@ -881,7 +947,7 @@ All jobs upload to the **same release draft**, ensuring single unified release w
 
 ### Release Notes Generation
 
-**Script:** `generate-release.js`
+**Script:** `scripts/generate-release.js`
 
 Reads `CHANGELOG.md` and generates `release-v{VERSION}.md` with:
 

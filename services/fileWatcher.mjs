@@ -1,7 +1,9 @@
 import chokidar from 'chokidar';
 import path from 'path';
 import fs from 'fs';
-import { SUPPORTED_MEDIA_EXTENSIONS } from '../utils/mediaTypes.js';
+import { SUPPORTED_MEDIA_EXTENSIONS, inferMimeTypeFromName } from '../utils/mediaTypes.js';
+import { normalizeBirthtimeMs, resolveFileSortDate } from '../utils/fileTimestamps.js';
+import { isRelativePathInsideRoot, pathApiForPlatform } from '../utils/pathContainment.mjs';
 
 // Active watchers: directoryId -> watcher instance
 const activeWatchers = new Map();
@@ -44,42 +46,61 @@ const isTransientVanishError = (error) => {
 
 const isMediaFile = (filePath) => SUPPORTED_MEDIA_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
 
-const findMediaFilesForSidecar = (sidecarPath) => {
-  const sidecarExt = path.extname(sidecarPath);
-  const sidecarBaseName = path.basename(sidecarPath, sidecarExt);
+const IMAGE_METAHUB_SIDECAR_SUFFIX = '.imagemetahub.json';
+
+export const sidecarMatchesMediaFile = (sidecarFileName, mediaFileName) => {
+  const mediaExt = path.extname(mediaFileName);
+  if (!SUPPORTED_MEDIA_EXTENSIONS.includes(mediaExt.toLowerCase())) {
+    return false;
+  }
+
+  if (sidecarFileName.toLowerCase().endsWith(IMAGE_METAHUB_SIDECAR_SUFFIX)) {
+    return mediaFileName === sidecarFileName.slice(0, -IMAGE_METAHUB_SIDECAR_SUFFIX.length);
+  }
+
+  const sidecarExt = path.extname(sidecarFileName);
+  const sidecarBaseName = path.basename(sidecarFileName, sidecarExt);
+  return mediaFileName.slice(0, -mediaExt.length) === sidecarBaseName;
+};
+
+export const findMediaFilesForSidecar = (sidecarPath) => {
+  const sidecarFileName = path.basename(sidecarPath);
   const sidecarDir = path.dirname(sidecarPath);
 
   try {
     return fs.readdirSync(sidecarDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() || entry.isSymbolicLink())
       .map((entry) => entry.name)
-      .filter((fileName) => {
-        const mediaExt = path.extname(fileName);
-        if (!SUPPORTED_MEDIA_EXTENSIONS.includes(mediaExt.toLowerCase())) {
-          return false;
-        }
-        return fileName.slice(0, -mediaExt.length) === sidecarBaseName;
-      })
+      .filter((fileName) => sidecarMatchesMediaFile(sidecarFileName, fileName))
       .map((fileName) => path.join(sidecarDir, fileName));
   } catch {
     return [];
   }
 };
 
-const toRelativePath = (rootPath, targetPath) => {
-  const relativePath = path.relative(rootPath, targetPath);
+export const toRelativePath = (rootPath, targetPath, platform = process.platform) => {
+  const pathApi = pathApiForPlatform(platform);
+  const relativePath = pathApi.relative(rootPath, targetPath);
   if (relativePath === '') {
     return '';
   }
-  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
-    return path.basename(targetPath);
+  if (!isRelativePathInsideRoot(relativePath, platform)) {
+    return pathApi.basename(targetPath);
   }
   return relativePath.replace(/\\/g, '/');
 };
 
-const sendWatcherDebug = (mainWindow, message) => {
+export const toProvenanceFileInfo = (fileInfo) => ({
+  ...fileInfo,
+  type: inferMimeTypeFromName(fileInfo.path || fileInfo.name, null),
+});
+
+// Nothing in the renderer subscribes to the 'watcher-debug' channel (checked:
+// no electronAPI.onWatcherDebug call anywhere in the app), so sending it was
+// a pure-waste IPC round-trip + structured clone on every watcher event
+// (multiple per added/removed file). Keep the main-process console.log only.
+const sendWatcherDebug = (_mainWindow, message) => {
   console.log(message);
-  sendToRenderer(mainWindow, 'watcher-debug', { message });
 };
 
 const sendToRenderer = (mainWindow, channel, payload) => {
@@ -103,7 +124,7 @@ const sendToRenderer = (mainWindow, channel, payload) => {
 /**
  * Start watching a directory.
  */
-export function startWatching(directoryId, dirPath, mainWindow) {
+export function startWatching(directoryId, dirPath, mainWindow, observers = {}) {
   if (activeWatchers.has(directoryId)) {
     return { success: true };
   }
@@ -149,7 +170,7 @@ export function startWatching(directoryId, dirPath, mainWindow) {
       sendWatcherDebug(mainWindow, `[FileWatcher] Watcher ready for ${directoryId} - monitoring: ${dirPath}`);
     });
 
-    const enqueueMedia = (mediaPath, forceReindex = false) => {
+    const enqueueMedia = (mediaPath, forceReindex = false, provenanceBytesChanged = true) => {
       sendWatcherDebug(mainWindow, `[FileWatcher] File detected: ${mediaPath}`);
       if (!pendingFiles.has(directoryId)) {
         pendingFiles.set(directoryId, new Map());
@@ -157,14 +178,17 @@ export function startWatching(directoryId, dirPath, mainWindow) {
       sendWatcherDebug(mainWindow, `[FileWatcher] Adding media to batch: ${mediaPath}`);
       const pendingMap = pendingFiles.get(directoryId);
       const existing = pendingMap.get(mediaPath);
-      pendingMap.set(mediaPath, { forceReindex: Boolean(existing?.forceReindex || forceReindex) });
+      pendingMap.set(mediaPath, {
+        forceReindex: Boolean(existing?.forceReindex || forceReindex),
+        provenanceBytesChanged: Boolean(existing?.provenanceBytesChanged || provenanceBytesChanged),
+      });
 
       if (processingTimeouts.has(directoryId)) {
         clearTimeout(processingTimeouts.get(directoryId));
       }
 
       processingTimeouts.set(directoryId, setTimeout(() => {
-        processBatch(directoryId, dirPath, mainWindow);
+        processBatch(directoryId, dirPath, mainWindow, observers);
       }, 500));
     };
 
@@ -176,7 +200,7 @@ export function startWatching(directoryId, dirPath, mainWindow) {
         if (matches.length === 0) {
           return;
         }
-        matches.forEach((match) => enqueueMedia(match, true));
+        matches.forEach((match) => enqueueMedia(match, true, false));
         return;
       }
 
@@ -191,7 +215,7 @@ export function startWatching(directoryId, dirPath, mainWindow) {
       const ext = path.extname(filePath).toLowerCase();
 
       if (ext === '.json') {
-        findMediaFilesForSidecar(filePath).forEach((match) => enqueueMedia(match, true));
+        findMediaFilesForSidecar(filePath).forEach((match) => enqueueMedia(match, true, false));
         return;
       }
 
@@ -224,11 +248,15 @@ export function startWatching(directoryId, dirPath, mainWindow) {
       }
 
       removalTimeouts.set(directoryId, setTimeout(() => {
-        processRemovalBatch(directoryId, mainWindow);
+        processRemovalBatch(directoryId, dirPath, mainWindow, observers);
       }, 500));
     };
 
     watcher.on('unlink', (filePath) => {
+      if (path.extname(filePath).toLowerCase() === '.json') {
+        findMediaFilesForSidecar(filePath).forEach((match) => enqueueMedia(match, true, false));
+        return;
+      }
       if (!isMediaFile(filePath)) {
         return;
       }
@@ -316,7 +344,7 @@ export function getWatcherStatus(directoryId) {
 /**
  * Process a batch of detected files.
  */
-function processBatch(directoryId, dirPath, mainWindow) {
+function processBatch(directoryId, dirPath, mainWindow, observers = {}) {
   const files = pendingFiles.get(directoryId);
 
   if (!files || files.size === 0) return;
@@ -332,11 +360,13 @@ function processBatch(directoryId, dirPath, mainWindow) {
       return {
         name: path.basename(filePath),
         path: filePath,
-        lastModified: stats.birthtimeMs ?? stats.mtimeMs,
+        lastModified: resolveFileSortDate(normalizeBirthtimeMs(stats.birthtimeMs), stats.mtimeMs),
         contentModifiedMs: stats.mtimeMs,
         size: stats.size,
         type: path.extname(filePath).slice(1),
-        forceReindex: pendingInfo.forceReindex === true
+        forceReindex: pendingInfo.forceReindex === true,
+        provenanceBytesChanged: pendingInfo.provenanceBytesChanged !== false,
+        relativePath: toRelativePath(dirPath, filePath),
       };
     } catch (err) {
       if (isTransientVanishError(err)) {
@@ -354,13 +384,16 @@ function processBatch(directoryId, dirPath, mainWindow) {
       directoryId,
       files: fileInfos
     });
+    const provenanceFileInfos = fileInfos.map(toProvenanceFileInfo);
+    void Promise.resolve(observers.onFilesObserved?.({ rootPath: dirPath, files: provenanceFileInfos }))
+      .catch((error) => console.warn('[FileWatcher] Provenance observation failed:', error));
   }
 
   pendingFiles.delete(directoryId);
   processingTimeouts.delete(directoryId);
 }
 
-function processRemovalBatch(directoryId, mainWindow) {
+function processRemovalBatch(directoryId, dirPath, mainWindow, observers = {}) {
   const removals = pendingRemovals.get(directoryId);
 
   if (!removals || (removals.files.size === 0 && removals.folders.size === 0)) return;
@@ -374,6 +407,8 @@ function processRemovalBatch(directoryId, mainWindow) {
     files,
     folders,
   });
+  void Promise.resolve(observers.onPathsRemoved?.({ rootPath: dirPath, files, folders }))
+    .catch((error) => console.warn('[FileWatcher] Provenance removal observation failed:', error));
 
   pendingRemovals.delete(directoryId);
   removalTimeouts.delete(directoryId);

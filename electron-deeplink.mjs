@@ -1,11 +1,41 @@
 import electron from 'electron';
+import fs from 'node:fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  configurePortableAppPaths,
+  resolvePortableRuntime,
+} from './utils/portableRuntime.mjs';
 
-const { app, BrowserWindow } = electron;
+const { app, BrowserWindow, dialog } = electron;
 const SCHEME = 'imagemetahub';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const portableRuntime = resolvePortableRuntime();
+const packagedProvenanceSmokeEnabled = app.isPackaged
+  && process.env.IMH_PACKAGED_PROVENANCE_FILE_OPERATIONS_SMOKE === '1';
+const packagedSavedPromptSmokeEnabled = app.isPackaged
+  && process.env.IMH_PACKAGED_SAVED_PROMPT_SMOKE === '1';
+let portableStartupError = null;
+
+try {
+  configurePortableAppPaths(app, portableRuntime);
+} catch (error) {
+  portableStartupError = error;
+  const detail = error?.cause?.message || error?.message || String(error);
+  console.error('[Portable] Failed to initialize the portable profile:', error);
+  dialog.showErrorBox(
+    'Image MetaHub Portable could not start',
+    [
+      `Image MetaHub could not write to:\n${portableRuntime.userDataPath}`,
+      '',
+      'Move the portable app to a writable folder or allow write access, then try again.',
+      '',
+      detail,
+    ].join('\n'),
+  );
+  app.exit(1);
+}
 
 function isDeepLink(value) {
   return typeof value === 'string' && value.toLowerCase().startsWith(`${SCHEME}://`);
@@ -116,36 +146,63 @@ function registerProtocol() {
   }
 }
 
-const lock = app.requestSingleInstanceLock();
+if (!portableStartupError) {
+  const lock = packagedProvenanceSmokeEnabled || packagedSavedPromptSmokeEnabled || app.requestSingleInstanceLock();
 
-if (!lock) {
-  app.quit();
-} else {
-  registerProtocol();
-
-  const startupTarget = getTargetFromLink(findDeepLink(process.argv));
-  const startupDirectory = startupTarget?.type === 'file' ? null : getDirectoryFromArgs(process.argv);
-  if (startupDirectory) {
-    process.argv.push('--dir', startupDirectory);
-  }
-
-  app.on('second-instance', (_event, argv) => {
-    const target = getTargetFromLink(findDeepLink(argv));
-    if (target) {
-      dispatchTarget(target);
-      return;
+  if (!lock) {
+    app.quit();
+  } else {
+    if (!portableRuntime.isPortable) {
+      registerProtocol();
     }
-    focusMainWindow();
-    sendDirectoryToRenderer(getDirectoryFromArgs(argv));
-  });
 
-  app.on('open-url', (event, url) => {
-    event.preventDefault();
-    dispatchTarget(getTargetFromLink(url));
-  });
+    const startupTarget = getTargetFromLink(findDeepLink(process.argv));
+    const startupDirectory = startupTarget?.type === 'file' ? null : getDirectoryFromArgs(process.argv);
+    if (startupDirectory) {
+      process.argv.push('--dir', startupDirectory);
+    }
 
-  await import('./electron.mjs');
-  if (startupTarget?.type === 'file') {
-    sendFileToRenderer(startupTarget.path);
+    app.on('second-instance', (_event, argv) => {
+      const target = getTargetFromLink(findDeepLink(argv));
+      if (target) {
+        dispatchTarget(target);
+        return;
+      }
+      focusMainWindow();
+      sendDirectoryToRenderer(getDirectoryFromArgs(argv));
+    });
+
+    app.on('open-url', (event, url) => {
+      event.preventDefault();
+      dispatchTarget(getTargetFromLink(url));
+    });
+
+    try {
+      await import('./electron.mjs');
+    } catch (error) {
+      console.error('[Electron bootstrap] Failed to import the main process:', error);
+      if (packagedProvenanceSmokeEnabled || packagedSavedPromptSmokeEnabled) {
+        const resultPath = (
+          process.env.IMH_PACKAGED_PROVENANCE_FILE_OPERATIONS_SMOKE_RESULT
+          || process.env.IMH_PACKAGED_SAVED_PROMPT_SMOKE_RESULT
+        )?.trim();
+        if (resultPath) {
+          try {
+            fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+            fs.writeFileSync(resultPath, JSON.stringify({
+              success: false,
+              error: error?.message || String(error),
+              stack: error?.stack || null,
+            }, null, 2), 'utf8');
+          } catch { /* stderr remains the fallback */ }
+        }
+        app.exit(1);
+      } else {
+        throw error;
+      }
+    }
+    if (startupTarget?.type === 'file') {
+      sendFileToRenderer(startupTarget.path);
+    }
   }
 }
